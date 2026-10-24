@@ -66,6 +66,9 @@ USER_AGENT = "FajerwerkiPriceBot/1.0" + (f" (+kontakt: {env('SCRAPER_CONTACT')})
 # Kontakt (e-mail) idzie z sekretu SCRAPER_CONTACT - nie wpisuj go w kod.
 DELAY = float(env('SCRAPER_DELAY', 0.5))   # min. odstęp (s) między ZAPYTANIAMI do jednego hosta (wspólny dla wszystkich wątków)
 WORKERS = int(env('SCRAPER_WORKERS', 12))   # równoległe wątki -> max ok. 1/DELAY zapytań na sekundę do sklepu
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36")
+BROWSER_UA_SPEC = (env("SCRAPER_BROWSER_UA", "") or "").lower()  # "" = nikt, "1" = wszystkie, albo lista sklepów
 NONPRODUCT_TTL_DAYS = 14  # tyle dni pamiętamy, że dany adres NIE jest produktem
 
 # ---------------------------------------------------------------------------
@@ -284,6 +287,7 @@ _tls = threading.local()
 _lock = threading.RLock()
 _stats_lock = threading.Lock()
 _robots, _crawl_delay, _next_slot = {}, {}, {}
+_robots_note = {}
 _proxies, _proxy_i, _proxy_fail, _proxy_dead = [], 0, Counter(), set()
 _min_delay, _proxy_hosts = {}, set()   # netloc -> min. odstęp (crawl-delay / 'delay' sklepu); hosty z use_proxy
 PROXY_ALL = env('SCRAPER_PROXY_ALL') == '1'  # 1 = proxy dla wszystkich sklepów, nie tylko z use_proxy
@@ -389,6 +393,7 @@ def allowed(url):
                 break
             if reason:  # robots.txt niedostępny z winy serwera -> ostrożnie wstrzymujemy
                 log.warning("robots.txt dla %s niedostępny (%s) - pomijam ten host w tym przebiegu", host, reason)
+                _robots_note[urlparse(url).netloc] = f"robots.txt niedostępny ({reason}) - sprawdź proxy/blokadę"
                 rp = RobotFileParser()
                 rp.disallow_all = True
             _robots[host] = rp
@@ -421,8 +426,10 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     if not allowed(url):
         bump("robots_zablokowane")
         log.debug("robots.txt zabrania: %s", url)
+        _tls.last_fail = _robots_note.get(urlparse(url).netloc, "robots.txt zabrania tej ścieżki")
         return None
     host = urlparse(url).netloc
+    last_err = "?"
     for attempt in range(retries):
         throttle(host)
         px = None
@@ -436,6 +443,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                 return r
             if code in (403, 404, 410):
                 bump(f"http_{code}")
+                _tls.last_fail = f"HTTP {code}" + (f" (server: {r.headers.get('server', '?')})" if code == 403 else "")
                 n = stats[f"http_{code}"] if stats is not None else 1
                 if code == 403 and n <= 3:
                     log.warning("HTTP 403 (blokada / Cloudflare / bramka 18+?): %s", url)
@@ -443,16 +451,19 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                     log.debug("HTTP %s: %s", code, url)
                 return None
             log.warning("HTTP %s (próba %d/%d): %s", code, attempt + 1, retries, url)
+            last_err = f"HTTP {code}"
             if code == 429 or code >= 500:
                 pause = 10 * (attempt + 1)
                 with _lock:  # spowalniamy WSZYSTKIE wątki dla tego hosta
                     _next_slot[host] = max(_next_slot.get(host, 0.0), time.time() + pause)
         except requests.RequestException as e:
             report_proxy(px, False)
+            last_err = e.__class__.__name__
             log.warning("błąd sieci %s przez %s (próba %d/%d): %s", e.__class__.__name__,
                         mask(px), attempt + 1, retries, url)
         time.sleep(2 ** attempt)
     bump("nieudane")
+    _tls.last_fail = f"nieudane po {retries} próbach ({last_err})"
     return None
 
 
@@ -727,21 +738,45 @@ def parse_listing(html, page_url, cfg):
     return len(tiles), products
 
 
+def site_headers(name, site):
+    """Nagłówki sklepu. User-Agent przeglądarki tylko, gdy włączony: SCRAPER_BROWSER_UA=1 / lista sklepów,
+    albo "browser_ua": True w konfiguracji sklepu."""
+    h = dict(site.get("headers") or {})
+    wanted = {x.strip() for x in BROWSER_UA_SPEC.split(",") if x.strip()}
+    if site.get("browser_ua") or "1" in wanted or name.lower() in wanted:
+        h.setdefault("User-Agent", BROWSER_UA)
+        h.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        h.setdefault("Accept-Language", "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7")
+    return h or None
+
+
+def diag(r):
+    """Krótki opis odpowiedzi, gdy strona ma 0 kafelków: tytuł, serwer, czy to ochrona anty-botowa."""
+    m = re.search(rb"<title[^>]*>(.*?)</title>", r.content[:20000], re.I | re.S)
+    title = re.sub(r"\s+", " ", m.group(1).decode("utf-8", "replace")).strip()[:80] if m else "?"
+    hdr = r.headers
+    guard = "Cloudflare" if ("cf-ray" in hdr or "cloudflare" in hdr.get("server", "").lower()) else hdr.get("server", "?")
+    return f"HTTP {r.status_code}, {len(r.content)} B, title={title!r}, serwer/ochrona={guard}"
+
+
 def listing_category(name, site, cfg, cat_url, q, stats):
     """Wątek roboczy: przechodzi strony jednej kategorii i wrzuca produkty do kolejki."""
     start = cfg.get("start", 1)
     nxt = cfg.get("next", "{url}?page={page}")
     first = cfg.get("first")
     max_pages = cfg.get("max_pages", 400)
-    seen, page, total = set(), start, 0
+    hdrs = site_headers(name, site)
+    seen, page, total, reason = set(), start, 0, None
     try:
         while page < start + max_pages:
             pattern = first if (first and page == start) else nxt
             url = pattern.format(url=cat_url, page=page)
-            r = get(url, stats, cookies=site.get("cookies"), headers=site.get("headers"))
+            _tls.last_fail = "?"
+            r = get(url, stats, cookies=site.get("cookies"), headers=hdrs)
             if not r:
                 if page == start:
-                    log.warning("[%s] kategoria niedostępna (403/404/robots/błąd sieci): %s", name, url)
+                    reason = _tls.last_fail
+                    log.warning("[%s] kategoria niedostępna (%s): %s", name, reason, url)
                 break
             n_tiles, items = parse_listing(r.content, url, cfg)
             new, on_page = [], set()
@@ -750,11 +785,11 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                     new.append(it)
                     on_page.add(it["url"])
             if page == start and n_tiles == 0:
-                log.warning("[%s] 0 kafelków na pierwszej stronie %s - zmienił się szablon sklepu "
-                            "albo to blokada/bramka? Sprawdź selektor 'item'.", name, url)
+                reason = "0 kafelków: " + diag(r)
+                log.warning("[%s] %s | %s", name, reason, url)
             elif page == start and n_tiles and not items:
-                log.warning("[%s] znaleziono %d kafelków, ale selektory name/link nic nie wyciągają: %s",
-                            name, n_tiles, url)
+                reason = f"{n_tiles} kafelków, ale selektory name/link nic nie wyciągają"
+                log.warning("[%s] %s: %s", name, reason, url)
             if not new:
                 break  # pusta strona albo ta sama co poprzednia (koniec paginacji)
             seen.update(it["url"] for it in new)
@@ -762,9 +797,10 @@ def listing_category(name, site, cfg, cat_url, q, stats):
             q.put(("items", name, cat_url, page, new))
             page += 1
     except Exception as e:  # nigdy nie wieszamy głównego wątku
+        reason = f"wyjątek: {e}"
         log.warning("[%s] błąd w kategorii %s: %s", name, cat_url, e)
     finally:
-        q.put(("done", name, cat_url, page - start, total))
+        q.put(("done", name, cat_url, page - start, total, reason))
 
 
 def run_listing(con, names, args):
@@ -777,10 +813,14 @@ def run_listing(con, names, args):
             if per_shop[n]:
                 tasks.append((n, per_shop[n].pop(0)))
     stats = {n: Counter() for n in names}
+    problems = {n: [] for n in names}
     cats_total = {n: len(SITES[n]["listing"]["categories"]) for n in names}
     q = queue.Queue()
     log.info("TRYB LISTING: %d sklepów, %d kategorii, wątki: %d, odstęp: %.2fs",
              len(names), len(tasks), args.workers, DELAY)
+    ua_shops = [n for n in names if site_headers(n, SITES[n]) and "User-Agent" in site_headers(n, SITES[n])]
+    if ua_shops:
+        log.info("User-Agent przeglądarki włączony dla: %s", ", ".join(ua_shops))
     pool = ThreadPoolExecutor(max_workers=args.workers)
     for n, cat in tasks:
         cfg = dict(SITES[n]["listing"])
@@ -806,7 +846,9 @@ def run_listing(con, names, args):
                         st["zmiany_w_historii"] += 1
                         log.debug("zapisano: %s | %s | %s", d["name"], d["price"], d["availability"])
             elif msg:
-                _, n, cat, pages, total = msg
+                _, n, cat, pages, total, reason = msg
+                if reason:
+                    problems[n].append((cat, reason))
                 pending -= 1
                 stats[n]["kategorie_gotowe"] += 1
                 con.commit()
@@ -827,6 +869,11 @@ def run_listing(con, names, args):
         log.info("[%s] KONIEC | %s", n, ", ".join(f"{k}={v}" for k, v in sorted(st.items())) or "brak danych")
         if st["produkty"] == 0:
             log.error("[%s] 0 produktów - sprawdź selektory/blokadę (uruchom z SCRAPER_VERBOSE=1)", n)
+    if any(problems.values()):
+        log.warning("===== PROBLEMY: kategorie bez produktów (skopiuj ten blok, gdy chcesz poprawek) =====")
+        for n in names:
+            for cat, reason in problems[n]:
+                log.warning("[%s] %s -> %s", n, cat, reason)
     log.info("TRYB LISTING zakończony w %s", fmt_dur(time.time() - t0))
     return [(n, stats[n]["strony"], stats[n]) for n in names]
 
@@ -842,9 +889,9 @@ def resolve_sites(args):
     return [lookup[w] for w in wanted]
 
 
-def fetch_one(url, site, stats):
+def fetch_one(url, site, stats, hdrs=None):
     """Praca wątku roboczego: pobierz + sparsuj. Zwraca (url, dane, status)."""
-    r = get(url, stats)
+    r = get(url, stats, cookies=site.get("cookies"), headers=hdrs)
     if not r:
         return url, None, "fetch"
     try:
@@ -914,7 +961,7 @@ def cmd_scrape(args):
         last_beat = time.time()
         pool = ThreadPoolExecutor(max_workers=args.workers)
         try:
-            for i, (url, d, status) in enumerate(pool.map(lambda u: fetch_one(u, site, stats), urls), 1):
+            for i, (url, d, status) in enumerate(pool.map(lambda u, h=site_headers(name, site): fetch_one(u, site, stats, h), urls), 1):
                 if status == "ok":
                     stats["produkty"] += 1
                     if d.get("price") is None:

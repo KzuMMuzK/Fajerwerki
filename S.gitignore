@@ -1,0 +1,9 @@
+# lokalne sekrety i śmieci - nigdy do repo
+.env
+*.env
+proxies.txt
+*.log
+__pycache__/
+*.pyc
+.venv/
+# UWAGA: fajerwerki.db i latest.csv CELOWO nie są ignorowane - workflow je commituje

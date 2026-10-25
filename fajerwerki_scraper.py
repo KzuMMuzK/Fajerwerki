@@ -18,7 +18,7 @@ Zmienne środowiskowe (GitHub Actions: Settings > Secrets and variables > Action
     DATA_REPO, DATA_REPO_TOKEN   (tylko workflow) prywatne repo na bazę i CSV oraz token do niego
   USTAWIENIA (opcjonalne):
     SCRAPER_ONLY=pirohit,lider   SCRAPER_MAX=2   SCRAPER_WORKERS=12   SCRAPER_DELAY=0.5
-    SCRAPER_VERBOSE=1   SCRAPER_RECHECK=1   SCRAPER_PROXY_ALL=1   SCRAPER_DB=sciezka/do/bazy.db
+    SCRAPER_MODE=sitemap|listing|auto   SCRAPER_VERBOSE=1   SCRAPER_RECHECK=1   SCRAPER_PROXY_ALL=1   SCRAPER_DB=sciezka/do/bazy.db
 
 Jak to działa (tryb sitemap; tryb listing czyta strony kategorii - patrz SITES):
   1. Adresy produktów bierze z sitemap.xml sklepu (robots.txt -> Sitemap:).
@@ -499,8 +499,14 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
 
 
 # ----------------------------- sitemap --------------------------------------
-def read_xml(url):
-    r = get(url)
+SITEMAP_FALLBACKS = ("/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml", "/sitemap-index.xml",
+                     "/sitemap/sitemap_index.xml", "/sitemap/sitemap.xml", "/sitemaps/sitemap.xml",
+                     "/product-sitemap.xml", "/sitemap_products_1.xml")
+_ASSET_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg|ico|pdf|mp4|webm|css|js|zip|xml)(?:\?|$)", re.I)
+
+
+def read_xml(url, headers=None):
+    r = get(url, headers=headers)
     if not r:
         return None
     data = r.content
@@ -515,40 +521,64 @@ def read_xml(url):
         return None
 
 
-def sitemap_urls(site):
-    base = site["base"].rstrip("/")
-    roots = list(site.get("sitemaps", []))
-    if not roots:
-        r = get(base + "/robots.txt")
-        if r:
-            roots = re.findall(r"(?im)^sitemap:\s*(\S+)", r.text)
-        if not roots:
-            roots = [base + "/sitemap.xml"]
-            log.info("  brak wpisu Sitemap w robots.txt, próbuję %s", roots[0])
-    seen, out, stack = set(), [], roots[:]
-    while stack:
+def _is_loc(tag):
+    """<loc> ze standardowej przestrzeni sitemap; pomija <image:loc>, <video:loc> itp."""
+    return tag == "loc" or (tag.endswith("}loc") and "sitemaps.org" in tag)
+
+
+def _walk_sitemaps(roots, site, hdrs, info):
+    seen, out, stack = set(), [], list(reversed(roots))
+    flt = site.get("sitemap_filter")
+    while stack and len(seen) < 300:
         sm = stack.pop()
         if sm in seen:
             continue
         seen.add(sm)
-        tree = read_xml(sm)
+        tree = read_xml(sm, hdrs)
         if tree is None:
-            log.warning("  sitemapa niedostępna lub nieczytelna: %s", sm)
+            log.warning("  sitemapa niedostępna lub nieczytelna: %s (%s)", sm, getattr(_tls, "last_fail", "?"))
+            info["failed"].append(sm)
             continue
-        found = child = 0
-        for el in tree.iter():
-            if el.tag.endswith("loc") and el.text:
-                loc = el.text.strip()
-                if re.search(r"\.xml(\.gz)?(\?|$)", loc):
-                    stack.append(loc)
-                    child += 1
-                else:
-                    out.append(loc)
-                    found += 1
-        log.info("  sitemapa %s: %d adresów, %d podsitemap", sm, found, child)
-    before = len(out)
+        locs = [el.text.strip() for el in tree.iter() if _is_loc(el.tag) and el.text]
+        if tree.tag.endswith("sitemapindex"):
+            kids = [u for u in locs if not flt or re.search(flt, u)]
+            stack.extend(reversed(kids))
+            info["children"] += len(kids)
+            log.info("  indeks sitemap %s: %d podsitemap", sm, len(kids))
+        else:
+            pages = [u for u in locs if not _ASSET_RE.search(u)]
+            out.extend(pages)
+            log.info("  sitemapa %s: %d adresów", sm, len(pages))
+    info["sitemaps"] += len(seen)
+    return out
+
+
+def sitemap_urls(site, info=None, name=""):
+    """Adresy stron z sitemap sklepu: robots.txt (Sitemap:), a gdy brak - typowe lokalizacje."""
+    info = info if info is not None else {}
+    info.update({"sitemaps": 0, "children": 0, "failed": [], "tried": []})
+    hdrs = site_headers(name, site) if name else None
+    base = site["base"].rstrip("/")
+    roots = list(site.get("sitemaps", []))
+    if not roots:
+        r = get(base + "/robots.txt", headers=hdrs)
+        if r:
+            roots = re.findall(r"(?im)^sitemap:\s*(\S+)", r.text)
+    if roots:
+        info["tried"] = roots
+        out = _walk_sitemaps(roots, site, hdrs, info)
+    else:
+        out = []
+        for path in SITEMAP_FALLBACKS:
+            info["tried"].append(base + path)
+            out = _walk_sitemaps([base + path], site, hdrs, info)
+            if out:
+                log.info("  sitemapa znaleziona pod %s (brak wpisu Sitemap w robots.txt)", base + path)
+                break
+    info["total"] = len(set(out))
     pattern = site.get("url_regex")
     if pattern:
+        before = len(out)
         out = [u for u in out if re.search(pattern, u)]
         log.info("  filtr url_regex: %d -> %d adresów", before, len(out))
     return list(dict.fromkeys(out))
@@ -594,6 +624,7 @@ def norm_availability(raw):
 
 
 def walk_jsonld(node):
+    """Węzły Product (bez wchodzenia w środek Product) oraz informacja, czy w danych jest lista ItemList."""
     if isinstance(node, list):
         for x in node:
             yield from walk_jsonld(x)
@@ -602,34 +633,45 @@ def walk_jsonld(node):
         types = t if isinstance(t, list) else [t]
         if "Product" in types:
             yield node
+            return  # produkty powiązane/warianty w środku nie liczą się jako osobne produkty strony
+        if "ItemList" in types:
+            yield {"@type": "ItemList", "n": len(node.get("itemListElement") or [])}
         for v in node.values():
             if isinstance(v, (list, dict)):
                 yield from walk_jsonld(v)
 
 
 def from_jsonld(soup):
+    prods, has_list = [], False
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(tag.string or tag.get_text() or "")
         except json.JSONDecodeError:
             continue
-        for prod in walk_jsonld(data):
-            offers = prod.get("offers")
-            if isinstance(offers, list):
-                offers = offers[0] if offers else {}
-            offers = offers or {}
-            price = offers.get("price", offers.get("lowPrice"))
-            if price is None and isinstance(offers.get("priceSpecification"), dict):
-                price = offers["priceSpecification"].get("price")
-            return {
-                "_ld": True,
-                "name": prod.get("name"),
-                "code_raw": prod.get("mpn"),  # kod producenta; SKU sklepu celowo pomijamy
-                "price": parse_price(price),
-                "currency": offers.get("priceCurrency") or "PLN",
-                "availability": norm_availability(offers.get("availability")),
-            }
-    return None
+        for node in walk_jsonld(data):
+            if node.get("@type") == "ItemList":
+                has_list = has_list or node.get("n", 0) >= 3
+            else:
+                prods.append(node)
+    # strona kategorii/listy: wiele Product w ItemList - to nie jest strona jednego produktu
+    if not prods or (len(prods) >= 3 and has_list) or len(prods) >= 8:
+        return None
+    prod = prods[0]
+    offers = prod.get("offers")
+    if isinstance(offers, list):
+        offers = offers[0] if offers else {}
+    offers = offers or {}
+    price = offers.get("price", offers.get("lowPrice"))
+    if price is None and isinstance(offers.get("priceSpecification"), dict):
+        price = offers["priceSpecification"].get("price")
+    return {
+        "_ld": True,
+        "name": prod.get("name"),
+        "code_raw": prod.get("mpn"),  # kod producenta; SKU sklepu celowo pomijamy
+        "price": parse_price(price),
+        "currency": offers.get("priceCurrency") or "PLN",
+        "availability": norm_availability(offers.get("availability")),
+    }
 
 
 def meta(soup, *names):
@@ -1148,16 +1190,213 @@ def resolve_sites(args):
     return [lookup[w] for w in wanted]
 
 
-def fetch_one(url, site, stats, hdrs=None):
-    """Praca wątku roboczego: pobierz + sparsuj. Zwraca (url, dane, status)."""
+def url_group(url):
+    """Grupa adresów (pierwszy człon ścieżki, cyfry -> #; prefiks języka /pl/ + drugi człon)."""
+    segs = [x for x in urlparse(url).path.split("/") if x]
+    if not segs:
+        return "/"
+    g = re.sub(r"\d+", "#", segs[0].lower())
+    if re.fullmatch(r"[a-z]{2}", segs[0].lower()) and len(segs) > 1:
+        g += "/" + re.sub(r"\d+", "#", segs[1].lower())
+    return g[:40]
+
+
+def page_brief(content):
+    """Krótki opis strony bez produktu: tytuł i czy są dane JSON-LD (do diagnozy w logu)."""
+    m = re.search(rb"<title[^>]*>(.*?)</title>", content, re.I | re.S)
+    title = re.sub(r"\s+", " ", m.group(1).decode("utf-8", "replace")).strip()[:70] if m else "?"
+    has_ld = b"application/ld+json" in content
+    has_prod = b'"Product"' in content
+    return f"title={title!r}, JSON-LD={'tak' if has_ld else 'nie'}, Product w JSON-LD={'tak' if has_prod else 'nie'}"
+
+
+def fetch_one(url, site, stats, hdrs=None, skip=None):
+    """Praca wątku roboczego: pobierz + sparsuj. Zwraca (url, dane, status, opis, grupa)."""
+    grp = url_group(url)
+    if skip is not None and grp in skip:
+        return url, None, "skipped", "", grp
+    _tls.last_fail = "?"
     r = get(url, stats, cookies=site.get("cookies"), headers=hdrs)
     if not r:
-        return url, None, "fetch"
+        return url, None, "fetch", _tls.last_fail, grp
     try:
         d = extract(r.content, site)
     except Exception as e:
-        return url, None, f"parse:{e}"
-    return url, d, ("ok" if d else "nonproduct")
+        return url, None, "parse", f"{e.__class__.__name__}: {e}"[:100], grp
+    if d:
+        return url, d, "ok", "", grp
+    return url, None, "nonproduct", page_brief(r.content), grp
+
+
+GROUP_SKIP_AFTER = 40  # tyle stron z grupy bez ani jednego produktu = reszta grupy pomijana w tym przebiegu
+
+
+def sitemap_driver(name, site, known_np, args, q):
+    """Wątek sklepu: sitemapa -> lista adresów -> równoległe pobieranie; wyniki trafiają do kolejki."""
+    hdrs = site_headers(name, site)
+    gets, skip, gstat = Counter(), set(), {}
+    try:
+        info = {}
+        urls = sitemap_urls(site, info, name)
+        total = len(urls)
+        urls = [u for u in urls if u not in known_np]
+        info["cached"] = total - len(urls)
+        if args.max:
+            urls = urls[: args.max]
+        q.put(("plan", name, len(urls), info, gets))
+        pool = ThreadPoolExecutor(max_workers=args.workers)
+        try:
+            for url, d, status, brief, grp in pool.map(lambda u: fetch_one(u, site, gets, hdrs, skip), urls):
+                gs = gstat.setdefault(grp, [0, 0])
+                if status == "ok":
+                    gs[0] += 1
+                elif status == "nonproduct":
+                    gs[1] += 1
+                if gs[0] == 0 and gs[1] >= GROUP_SKIP_AFTER and grp not in skip:
+                    skip.add(grp)
+                    q.put(("skipgrp", name, grp))
+                q.put(("res", name, url, d, status, brief, grp))
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+    except Exception as e:  # jeden sklep nie może zatrzymać reszty
+        q.put(("error", name, f"{e.__class__.__name__}: {str(e)[:150]}"))
+    finally:
+        q.put(("done", name, gstat))
+
+
+def run_sitemap(con, names, args):
+    """Wszystkie sklepy naraz: sitemapa -> strony produktów (JSON-LD). Zapis do bazy w jednym wątku."""
+    t0 = time.time()
+    known = set()
+    if not args.recheck:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=NONPRODUCT_TTL_DAYS)).isoformat(timespec="seconds")
+        known = {u for (u,) in con.execute("SELECT url FROM nonproduct WHERE ts > ?", (cutoff,))}
+    q = queue.Queue()
+    log.info("TRYB SITEMAP: %d sklepów, wątki na sklep: %d, odstęp: %.2fs, znanych nie-produktów w cache: %d",
+             len(names), args.workers, DELAY, len(known))
+    shops = ThreadPoolExecutor(max_workers=max(len(names), 1))
+    for n in names:
+        shops.submit(sitemap_driver, n, SITES[n], known, args, q)
+    st = {n: Counter() for n in names}
+    gets = {n: Counter() for n in names}
+    plan, started = {}, {n: time.time() for n in names}
+    prods = {n: [] for n in names}
+    nps = {n: [] for n in names}
+    seen_np = Counter()
+    fails = {n: Counter() for n in names}
+    problems, finished = [], set()
+    pending, last_beat, nres = len(names), time.time(), 0
+
+    def finish(n, gstat):
+        merged = Counter(st[n])
+        merged.update(gets[n])
+        checked, prod = st[n]["sprawdzone"], st[n]["produkty"]
+        top = sorted(gstat.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:6]
+        log.info("[%s] KONIEC w %s | %s", n, fmt_dur(time.time() - started[n]),
+                 ", ".join(f"{k}={v}" for k, v in sorted(merged.items())) or "brak danych")
+        if top:
+            log.info("[%s] grupy adresów (produkty/nie-produkty): %s", n, ", ".join(f"{g}: {a}/{b}" for g, (a, b) in top))
+        if prods[n]:
+            log.info("[%s] przykładowe produkty: %s", n, " | ".join(prods[n]))
+        if checked and prod == 0:
+            msg = f"0 produktów ze {checked} sprawdzonych stron"
+            if fails[n]:
+                msg += "; błędy pobierania: " + ", ".join(f"{k} x{v}" for k, v in fails[n].most_common(3))
+            if nps[n]:
+                msg += f" | przykład strony bez produktu: {nps[n][0][0]} ({nps[n][0][1]})"
+            problems.append((n, msg))
+        elif checked >= 30 and prod < 0.3 * checked:
+            problems.append((n, f"tylko {prod} produktów na {checked} sprawdzonych stron - warto ustawić url_regex; "
+                                f"grupy (produkty/nie): " + ", ".join(f"{g}: {a}/{b}" for g, (a, b) in top)))
+        finished.add(n)
+
+    try:
+        while pending:
+            try:
+                msg = q.get(timeout=5)
+            except queue.Empty:
+                msg = None
+            if msg:
+                kind, n = msg[0], msg[1]
+                if kind == "plan":
+                    _, _, count, info, g = msg
+                    plan[n], gets[n], started[n] = count, g, time.time()
+                    log.info("[%s] sitemapy: %d (indeksy: %d) | adresów: %d, w cache nie-produktów: %d, do sprawdzenia: %d",
+                             n, info["sitemaps"], info["children"], info["total"], info["cached"], count)
+                    if info["total"] == 0:
+                        extra = f"; nieczytelne: {len(info['failed'])}" if info["failed"] else ""
+                        problems.append((n, "brak adresów w sitemapie; sprawdzone: " + (", ".join(info["tried"][:5]) or "-") + extra))
+                elif kind == "res":
+                    _, _, url, d, status, brief, grp = msg
+                    nres += 1
+                    s_ = st[n]
+                    s_["sprawdzone"] += 1
+                    if status == "ok":
+                        s_["produkty"] += 1
+                        if d.get("price") is None:
+                            s_["bez_ceny"] += 1
+                        if d.get("availability") == "out_of_stock":
+                            s_["niedostepne"] += 1
+                        if save(con, n, url, d):
+                            s_["zmiany_w_historii"] += 1
+                            log.debug("zapisano: %s | %s | %s", d["name"], d["price"], d.get("availability"))
+                        con.execute("DELETE FROM nonproduct WHERE url = ?", (url,))
+                        if len(prods[n]) < 2:
+                            prods[n].append(url)
+                    elif status == "nonproduct":
+                        s_["to_nie_produkt"] += 1
+                        con.execute("INSERT OR REPLACE INTO nonproduct(url, ts) VALUES(?, ?)",
+                                    (url, datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                        seen_np[n] += 1
+                        if len(nps[n]) < 4:
+                            nps[n].append((url, brief))
+                        elif random.random() < 4 / seen_np[n]:
+                            nps[n][random.randrange(4)] = (url, brief)
+                    elif status == "skipped":
+                        s_["pominiete_grupa"] += 1
+                    elif status == "fetch":
+                        s_["nieudane_strony"] += 1
+                        fails[n][brief[:60] or "?"] += 1
+                    elif status == "parse":
+                        s_["blad_parsowania"] += 1
+                        log.warning("[%s] błąd parsowania %s: %s", n, url, brief)
+                    if nres % 200 == 0:
+                        con.commit()
+                elif kind == "skipgrp":
+                    log.info("[%s] pomijam grupę adresów %r: %d stron bez żadnego produktu", n, msg[2], GROUP_SKIP_AFTER)
+                elif kind == "error":
+                    log.error("[%s] błąd sklepu: %s", n, msg[2])
+                    problems.append((n, "błąd: " + msg[2]))
+                elif kind == "done":
+                    pending -= 1
+                    finish(n, msg[2])
+            if time.time() - last_beat >= 20:
+                last_beat = time.time()
+                for n in names:
+                    if n in finished or n not in plan:
+                        continue
+                    i, total = st[n]["sprawdzone"], plan[n]
+                    el = time.time() - started[n]
+                    rate = i / el if el else 0
+                    eta = (total - i) / rate if rate else 0
+                    log.info("[%s] %d/%d (%.0f%%) | produkty: %d | zmiany: %d | nie-produkty: %d | pominięte: %d | błędy: %d | %.1f str/s | zostało ~%s",
+                             n, i, total, 100 * i / max(total, 1), st[n]["produkty"], st[n]["zmiany_w_historii"],
+                             st[n]["to_nie_produkt"], st[n]["pominiete_grupa"],
+                             gets[n]["nieudane"] + st[n]["blad_parsowania"], rate, fmt_dur(eta))
+    finally:
+        shops.shutdown(wait=False, cancel_futures=True)
+        con.commit()
+    if problems:
+        log.warning("PROBLEMY (tryb sitemap, wyszukaj w logu: PROBLEM):")
+        for n, m_ in problems:
+            log.warning("PROBLEM [%s] %s", n, m_)
+    log.info("TRYB SITEMAP zakończony w %s", fmt_dur(time.time() - t0))
+    out = []
+    for n in names:
+        merged = Counter(st[n])
+        merged.update(gets[n])
+        out.append((n, st[n]["sprawdzone"], merged))
+    return out
 
 
 def cmd_scrape(args):
@@ -1179,97 +1418,30 @@ def cmd_scrape(args):
         log.warning("podano proxy, ale żaden wybrany sklep nie ma use_proxy (ustaw SCRAPER_PROXY_ALL=1, by użyć dla wszystkich)")
     in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
     summary = []
-    listing_names = [n for n in names if SITES[n].get("listing")]
+    mode = (args.mode or "sitemap").lower()
+    if mode not in ("sitemap", "listing", "auto"):
+        raise SystemExit(f"Nieznany tryb {mode!r}: użyj sitemap, listing albo auto")
+    with_listing = [n for n in names if SITES[n].get("listing")]
+    listing_names = [] if mode == "sitemap" else with_listing
     sitemap_names = [n for n in names if n not in listing_names]
+    log.info("tryb: %s | listing: %d sklepów, sitemap: %d sklepów", mode, len(listing_names), len(sitemap_names))
     if listing_names:
         if in_actions:
             print("::group::tryb listing", flush=True)
-        summary += run_listing(con, listing_names, args)
+        res = run_listing(con, listing_names, args)
         if in_actions:
             print("::endgroup::", flush=True)
-    for name in sitemap_names:
+        if mode == "auto":  # sklepy, w których listing nic nie dał, przechodzą na sitemapę
+            fallback = [n for (n, _pages, st_) in res if st_["produkty"] == 0]
+            if fallback:
+                log.warning("tryb auto: listing nie dał produktów dla %s - przechodzę na sitemapę", ", ".join(fallback))
+                res = [r for r in res if r[0] not in fallback]
+                sitemap_names += fallback
+        summary += res
+    if sitemap_names:
         if in_actions:
-            print(f"::group::{name}", flush=True)
-        site = SITES[name]
-        t0 = time.time()
-        log.info("[%s] START - pobieram sitemapę (wątki: %d, odstęp: %.2fs)", name, args.workers, DELAY)
-        urls = sitemap_urls(site)
-        if not urls:
-            log.error("[%s] brak adresów do sprawdzenia - sitemapa pusta/niedostępna "
-                      "albo url_regex nic nie łapie. Pomijam sklep.", name)
-            summary.append((name, 0, Counter()))
-            if in_actions:
-                print("::endgroup::", flush=True)
-            continue
-
-        # pomijamy adresy, o których niedawno ustaliliśmy, że to nie produkty
-        if not args.recheck:
-            cutoff = (datetime.now(timezone.utc) - timedelta(days=NONPRODUCT_TTL_DAYS)).isoformat(timespec="seconds")
-            known = {u for (u,) in con.execute("SELECT url FROM nonproduct WHERE ts > ?", (cutoff,))}
-            before = len(urls)
-            urls = [u for u in urls if u not in known]
-            if before != len(urls):
-                log.info("[%s] pomijam %d adresów znanych z poprzednich przebiegów jako nie-produkty", name, before - len(urls))
-        if args.max:
-            urls = urls[: args.max]
-        n = len(urls)
-        log.info("[%s] %d adresów do sprawdzenia", name, n)
-
-        stats = Counter()
-        samples_np, seen_np, samples_prod = [], 0, []
-        last_beat = time.time()
-        pool = ThreadPoolExecutor(max_workers=args.workers)
-        try:
-            for i, (url, d, status) in enumerate(pool.map(lambda u, h=site_headers(name, site): fetch_one(u, site, stats, h), urls), 1):
-                if status == "ok":
-                    stats["produkty"] += 1
-                    if d.get("price") is None:
-                        stats["bez_ceny"] += 1
-                    if save(con, name, url, d):
-                        stats["zmiany_w_historii"] += 1
-                        log.debug("zapisano: %s | %s | %s", d["name"], d["price"], d.get("availability"))
-                    con.execute("DELETE FROM nonproduct WHERE url=?", (url,))
-                    if len(samples_prod) < 3:
-                        samples_prod.append(url)
-                elif status == "nonproduct":
-                    stats["to_nie_produkt"] += 1
-                    con.execute("INSERT OR REPLACE INTO nonproduct(url, ts) VALUES(?, ?)",
-                                (url, datetime.now(timezone.utc).isoformat(timespec="seconds")))
-                    seen_np += 1  # próbkowanie (reservoir) do podglądu w logu
-                    if len(samples_np) < 8:
-                        samples_np.append(url)
-                    elif random.random() < 8 / seen_np:
-                        samples_np[random.randrange(8)] = url
-                elif status.startswith("parse:"):
-                    stats["blad_parsowania"] += 1
-                    log.warning("[%s] błąd parsowania %s: %s", name, url, status[6:])
-                if i % 25 == 0:
-                    con.commit()
-                if time.time() - last_beat >= 20 or i == n:
-                    last_beat = time.time()
-                    el = time.time() - t0
-                    rate = i / el if el else 0
-                    eta = (n - i) / rate if rate else 0
-                    log.info("[%s] %d/%d (%.0f%%) | produkty: %d | zmiany: %d | nie-produkty: %d | "
-                             "błędy: %d | %.1f str/s | zostało ~%s",
-                             name, i, n, 100 * i / n, stats["produkty"], stats["zmiany_w_historii"],
-                             stats["to_nie_produkt"],
-                             stats["nieudane"] + stats["blad_parsowania"], rate, fmt_dur(eta))
-                if i == 20 and stats["produkty"] == 0:
-                    log.warning("[%s] po 20 stronach 0 produktów - sprawdź url_regex, JSON-LD "
-                                "lub selektory (uruchom z -v, żeby zobaczyć szczegóły)", name)
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-            con.commit()
-
-        log.info("[%s] KONIEC w %s | %s", name, fmt_dur(time.time() - t0),
-                 ", ".join(f"{k}={v}" for k, v in sorted(stats.items())) or "brak danych")
-        if samples_prod:
-            log.info("[%s] przykładowe PRODUKTY:\n    %s", name, "\n    ".join(samples_prod))
-        if samples_np:
-            log.info("[%s] przykładowe NIE-produkty (na tej podstawie ustaw url_regex):\n    %s",
-                     name, "\n    ".join(samples_np))
-        summary.append((name, n, stats))
+            print("::group::tryb sitemap", flush=True)
+        summary += run_sitemap(con, sitemap_names, args)
         if in_actions:
             print("::endgroup::", flush=True)
 
@@ -1279,14 +1451,15 @@ def cmd_scrape(args):
     log.info("===== PODSUMOWANIE =====")
     for name, n, st in summary:
         log.info("%-14s sprawdzone: %5d | produkty: %5d | zmiany: %5d | błędy: %d",
-                 name, n, st["produkty"], st["zmiany_w_historii"], st["nieudane"] + st["blad_parsowania"])
+                 name, n, st["produkty"], st["zmiany_w_historii"],
+                 st["nieudane"] + st["blad_parsowania"] + st["nieudane_strony"])
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
         with open(path, "a", encoding="utf-8") as f:
             f.write("| sklep | sprawdzone | produkty | zmiany | błędy |\n|---|---|---|---|---|\n")
             for name, n, st in summary:
                 f.write(f"| {name} | {n} | {st['produkty']} | {st['zmiany_w_historii']} | "
-                        f"{st['nieudane'] + st['blad_parsowania']} |\n")
+                        f"{st['nieudane'] + st['blad_parsowania'] + st['nieudane_strony']} |\n")
 
 
 def cmd_export(args):
@@ -1324,6 +1497,7 @@ def main():
     s.add_argument("--delay", type=float, default=DELAY, help="min. odstęp między zapytaniami do hosta (s)")
     s.add_argument("--proxy", action="append", help="adres proxy (http://user:haslo@host:port lub socks5://...), można podać wiele razy")
     s.add_argument("--proxy-file", help="plik z proxy, jedno na linię")
+    s.add_argument("--mode", default=env("SCRAPER_MODE", "sitemap"), help="sitemap (domyślnie) | listing | auto = listing, a gdy nic nie da - sitemapa; ENV: SCRAPER_MODE")
     s.add_argument("--recheck", action="store_true", default=env("SCRAPER_RECHECK") == "1", help="sprawdź ponownie też adresy znane jako nie-produkty")
     s.set_defaults(fn=cmd_scrape)
     e = sub.add_parser("export")

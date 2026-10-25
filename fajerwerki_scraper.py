@@ -137,10 +137,12 @@ SITES = {
                 "https://www.pyroking.pl/fajerwerki-na-wesele", "https://www.pyroking.pl/Granaty-ASG-c134",
                 "https://www.pyroking.pl/DROP-BOX-c137", "https://www.pyroking.pl/DANGER-HOBBY-made-by-PYRO-CARTEL-c143",
                 "https://www.pyroking.pl/GATLING-c145"],
-            "first": "{url}", "next": "{url}/pa/{page}", "start": 1,
-            "item": "figure.product-tile",
-            "name": "div.product-name a", "link": "div.product-name a@href",
-            "price": "span.core_priceFormat@data-price", "out_text": ["produkt niedostępny"]},
+            "first": "{url}", "next": "{url}/page/{page}/", "start": 1,   # nowy szablon (Woodmart); paginacja do potwierdzenia
+            "item": "div.wd-product",
+            "name": ["h3 a", ".wd-entities-title a", "a"], "link": ["h3 a@href", ".wd-entities-title a@href", "a@href"],
+            "price": ["span.price ins .woocommerce-Price-amount", "span.price .woocommerce-Price-amount",
+                      ".woocommerce-Price-amount", "span.price"],
+            "out_of_stock": ".outofstock", "out_text": ["produkt niedostępny", "brak w magazynie"]},
     },
     "arka": {
         "base": "https://www.arkafajerwerki.pl",
@@ -154,7 +156,10 @@ SITES = {
     "lider": {
         "base": "https://fajerwerkilider.pl",
         "headers": {"Referer": "https://fajerwerkilider.pl/", "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"},
-        "listing": {**_IDO, "price": "strong.price", "price_strip": [r"najniższa.*?dni[^\d]*\d[\d\s]*(?:[.,]\d{1,2})?\s*(?:zł)?"], "out_of_stock": _IDO_OUT,
+        "listing": {"next": "{url}?page={page}", "start": 1,   # nowy szablon (Tailwind); paginacja do potwierdzenia
+            "item": "a.group.relative.flex", "name": ["img@alt", "h3", "h2"], "link": "@href",
+            "price": "span[class*='font-semibold'][class*='text-[17px]']",
+            "out_text": ["niedostępn", "brak towaru", "powiadom"],
             "categories": [_LIDER + x for x in (
                 "5-art-rozne-pirobajery", "15-bron-hukowa-naboje-race-pistoletowe", "61-ciche-fajerwerki",
                 "4-flary-i-race", "9-fontanny-fajerwerki-wulkany", "8-fontanny-tortowe-i-swieczki", "10-katiusze",
@@ -209,10 +214,9 @@ SITES = {
     },
     "szopik": {
         "base": "https://fajerwerki.shop.pl", "use_proxy": True,
-        "listing": {"next": "{url}?counter={page}&p=5", "start": 0, "item": "div.product",
-            "name": "a[class*='product__name']", "link": "a[class*='product__name']@href",
-            "price": ["strong[class*='price']", "span[class*='price']"],
-            "out_of_stock": "span[class*='--disable'], [data-product_disable='true']",
+        "listing": {"next": "{url}?counter={page}&p=5", "start": 0, "item": "product-tile",
+            "name": "a.link_no-underline", "link": "a.link_no-underline@href", "price": "span.price__value",
+            "out_text": ["niedostępn", "powiadom o dostępności", "powiadom mnie", "brak towaru", "wyprzedan"],
             "categories": ["https://fajerwerki.shop.pl/pl/menu/" + x + ".html" for x in (
                 "emiter-dzwieku-154", "petardy-155", "single-shoty-mozdzierze-157", "strefa-kibica-153",
                 "palniki-zarowe-158", "rzymskie-ognie-159", "wulkany-fontanny-160", "swiece-dymne-161",
@@ -785,37 +789,79 @@ def diag(r):
     return f"HTTP {r.status_code}, {len(r.content)} B, title={title!r}, serwer/ochrona={guard}"
 
 
-def suggest_selectors(content):
-    """Gdy selektor 'item' nic nie znajduje: zgaduje, jak wygląda kafelek (powtarzający się element
-    z ceną i linkiem), żeby dało się poprawić konfigurację bez wklejania całego HTML."""
+def _esc(c):
+    try:
+        return sv.escape(c)
+    except Exception:
+        return c
+
+
+def _sig(t):
+    return t.name + "".join("." + _esc(c) for c in (t.get("class") or [])[:3])
+
+
+def outline(tile, limit=12):
+    """Zarys kafelka: tagi/klasy elementów z tekstem, linkiem, alt albo data-price (pod konfigurację selektorów)."""
+    parts = []
+    for el in [tile] + tile.find_all(True):
+        bits, info = _sig(el), False
+        if el.get("href"):
+            bits, info = bits + "[href]", True
+        if el.get("alt"):
+            bits, info = bits + f"[alt={el['alt'][:25]!r}]", True
+        if el.get("data-price"):
+            bits, info = bits + f"[data-price={el['data-price']}]", True
+        own = " ".join("".join(el.find_all(string=True, recursive=False)).split())
+        if len(own) >= 3:
+            bits, info = bits + f" {own[:30]!r}", True
+        if el is tile or info:
+            parts.append(bits)
+        if len(parts) >= limit:
+            break
+    return " > ".join(parts)
+
+
+def pagination_hint(content):
+    """Jak strona wskazuje kolejne strony: <link rel=next> albo link o tekście '2'."""
     try:
         soup = BeautifulSoup(content, "lxml")
-        price_re = re.compile(r"\d[\d\s.]*[,.]\d{2}\s*(?:zł|pln)", re.I)
+        out = []
+        ln = soup.find("link", attrs={"rel": "next"})
+        if ln is not None and ln.get("href"):
+            out.append("rel=next -> " + ln["href"][:120])
+        for a in soup.find_all("a", href=True):
+            if a.get_text(strip=True) == "2" and a["href"].strip() not in ("", "#"):
+                out.append('link "2" -> ' + a["href"][:120])
+                break
+        return "; ".join(out)
+    except Exception:
+        return ""
 
-        def sig(t):
-            return t.name + "".join("." + c for c in (t.get("class") or [])[:3])
 
-        cands, info = Counter(), {}
+def suggest_selectors(content):
+    """Gdy selektor 'item' nic nie znajduje: zgaduje kafelek (powtarzający się element z ceną) i pokazuje
+    jego zarys, żeby dało się poprawić konfigurację bez wklejania całego HTML."""
+    try:
+        soup = BeautifulSoup(content, "lxml")
+        price_re = re.compile(r"\d[\d\s.]*[,.]\d{2}(?:\s*(?:zł|pln))?", re.I)
+        cands, first = Counter(), {}
         for text in soup.find_all(string=price_re):
             node = cur = text.parent
+            if node is None or node.name in ("script", "style"):
+                continue
             for _ in range(8):
                 par = cur.parent
                 if par is None or par.name in ("body", "html", "[document]"):
                     break
-                if sum(1 for c in par.find_all(recursive=False) if c.name == cur.name and sig(c) == sig(cur)) >= 3:
-                    key = sig(cur)
-                    if key not in info:
-                        links = [a for a in cur.find_all("a", href=True) if len(a.get_text(strip=True)) >= 4]
-                        link = max(links, key=lambda a: len(a.get_text(strip=True)), default=None)
-                        info[key] = (sig(link) if link is not None else "?", sig(node),
-                                     link.get_text(" ", strip=True)[:30] if link is not None else "")
+                if sum(1 for c in par.find_all(recursive=False) if c.name == cur.name and _sig(c) == _sig(cur)) >= 3:
+                    key = _sig(cur)
+                    first.setdefault(key, cur)
                     cands[key] += 1
                     break
                 cur = par
         if not cands:
             return "brak powtarzalnych kafelków z ceną w HTML (produkty mogą się ładować przez JavaScript)"
-        return "; ".join(f"item={k} ({n}x), link={info[k][0]}, cena={info[k][1]}, np. {info[k][2]!r}"
-                         for k, n in cands.most_common(2))
+        return " || ".join(f"item={k} ({n}x) kafelek: {outline(first[k])}" for k, n in cands.most_common(3))[:1500]
     except Exception as e:  # diagnostyka nie może psuć scrapowania
         return f"nie udało się zanalizować ({e})"
 
@@ -827,7 +873,7 @@ def listing_category(name, site, cfg, cat_url, q, stats):
     first = cfg.get("first")
     max_pages = cfg.get("max_pages", 400)
     hdrs = site_headers(name, site)
-    seen, page, total, reason = set(), start, 0, None
+    seen, page, total, reason, last_r = set(), start, 0, None, None
     try:
         while page < start + max_pages:
             pattern = first if (first and page == start) else nxt
@@ -839,6 +885,7 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                     reason = _tls.last_fail
                     log.warning("[%s] kategoria niedostępna (%s): %s", name, reason, url)
                 break
+            last_r = r
             n_tiles, items = parse_listing(r.content, url, cfg)
             new, on_page = [], set()
             for it in items:
@@ -846,7 +893,8 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                     new.append(it)
                     on_page.add(it["url"])
             if page == start and n_tiles == 0:
-                reason = "0 kafelków: " + diag(r) + " | podpowiedź: " + suggest_selectors(r.content)
+                reason = ("0 kafelków: " + diag(r) + " | podpowiedź: " + suggest_selectors(r.content)
+                          + " | paginacja: " + (pagination_hint(r.content) or "?"))
                 log.warning("[%s] %s | %s", name, reason, url)
             elif page == start and n_tiles and not items:
                 reason = f"{n_tiles} kafelków, ale selektory name/link nic nie wyciągają"
@@ -861,6 +909,10 @@ def listing_category(name, site, cfg, cat_url, q, stats):
         reason = f"wyjątek: {e}"
         log.warning("[%s] błąd w kategorii %s: %s", name, cat_url, e)
     finally:
+        if not reason and last_r is not None and total and page - start == 1:
+            ph = pagination_hint(last_r.content)
+            if ph:  # strona wskazuje kolejne strony, a my skończyliśmy po jednej: zły parametr paginacji?
+                reason = f"UWAGA tylko 1 strona ({total} prod.), ale strona wskazuje kolejne: {ph}"
         q.put(("done", name, cat_url, page - start, total, reason))
 
 
@@ -903,6 +955,8 @@ def run_listing(con, names, args):
                     st["produkty"] += 1
                     if d["price"] is None:
                         st["bez_ceny"] += 1
+                    if d["availability"] == "out_of_stock":
+                        st["niedostepne"] += 1  # kontrola: 0 niedostępnych przy setkach produktów = zły selektor dostępności
                     if save(con, n, d["url"], d):
                         st["zmiany_w_historii"] += 1
                         log.debug("zapisano: %s | %s | %s", d["name"], d["price"], d["availability"])
@@ -931,10 +985,10 @@ def run_listing(con, names, args):
         if st["produkty"] == 0:
             log.error("[%s] 0 produktów - sprawdź selektory/blokadę (uruchom z SCRAPER_VERBOSE=1)", n)
     if any(problems.values()):
-        log.warning("===== PROBLEMY: kategorie bez produktów (skopiuj ten blok, gdy chcesz poprawek) =====")
+        log.warning("PROBLEMY: kategorie bez produktów lub z podejrzaną paginacją (wyszukaj w logu: PROBLEM)")
         for n in names:
             for cat, reason in problems[n]:
-                log.warning("[%s] %s -> %s", n, cat, reason)
+                log.warning("PROBLEM [%s] %s -> %s", n, cat, reason)
     log.info("TRYB LISTING zakończony w %s", fmt_dur(time.time() - t0))
     return [(n, stats[n]["strony"], stats[n]) for n in names]
 

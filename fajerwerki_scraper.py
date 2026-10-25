@@ -315,6 +315,19 @@ def mask(px):
         return "proxy"
 
 
+def short_err(e):
+    """Sedno błędu sieci bez adresów IP i haseł, np. 'ProxyError: Tunnel connection failed: 407 Proxy
+    Authentication Required' (logi w publicznym repo są widoczne dla wszystkich)."""
+    msg = str(e)
+    msg = re.sub(r"//[^/@\s]+@", "//***@", msg)
+    msg = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b", "<ip>", msg)
+    m = re.search(r"(Tunnel connection failed: \d+ [^'\")]+|Connection refused|Connection reset[^'\")]*|"
+                  r"timed out|Name or service not known|Temporary failure in name resolution|"
+                  r"Remote end closed connection[^'\")]*|certificate verify failed[^'\")]*|Connection aborted[^'\")]*)", msg)
+    detail = m.group(1) if m else re.sub(r"\s+", " ", msg)[-100:].strip(" ()'\"")
+    return f"{e.__class__.__name__}: {detail}"[:160]
+
+
 def setup_proxies(args):
     """Proxy z --proxy, --proxy-file i zmiennej SCRAPER_PROXIES (rozdzielone przecinkami)."""
     global _proxies
@@ -369,18 +382,22 @@ def proxy_kw(px):
 
 def allowed(url):
     host = "{0.scheme}://{0.netloc}".format(urlparse(url))
+    nl = urlparse(url).netloc
     with _lock:
         if host not in _robots:
-            rp, reason = None, "brak odpowiedzi"
-            for _ in range(3):
-                px = proxy_for(urlparse(url).netloc)
+            rp, reason, net_fail = None, "brak odpowiedzi", False
+            via_proxy = bool(_proxies) and (PROXY_ALL or nl in _proxy_hosts)
+            attempts = min(10, max(3, len(_proxies) - len(_proxy_dead) + 1)) if via_proxy else 3
+            for _ in range(attempts):
+                px = proxy_for(nl)
                 try:
                     r = session().get(host + "/robots.txt", timeout=15, **proxy_kw(px))
                 except requests.RequestException as e:
                     report_proxy(px, False)
-                    reason = e.__class__.__name__
+                    reason, net_fail = short_err(e), True
                     continue
                 report_proxy(px, True)
+                net_fail = False
                 if r.status_code == 200:
                     rp = RobotFileParser()
                     rp.parse(r.text.splitlines())
@@ -391,14 +408,19 @@ def allowed(url):
                 else:
                     reason = None  # 4xx = brak robots.txt -> wolno wszystko (RFC 9309)
                 break
-            if reason:  # robots.txt niedostępny z winy serwera -> ostrożnie wstrzymujemy
-                log.warning("robots.txt dla %s niedostępny (%s) - pomijam ten host w tym przebiegu", host, reason)
-                _robots_note[urlparse(url).netloc] = f"robots.txt niedostępny ({reason}) - sprawdź proxy/blokadę"
+            if reason:
+                note = f"robots.txt niedostępny ({reason})"
+                _robots_note[nl] = note
+                if net_fail:
+                    # to błąd sieci/proxy, a nie decyzja sklepu: nie zapamiętujemy zakazu,
+                    # kolejna kategoria spróbuje jeszcze raz (inne proxy)
+                    log.warning("%s: %s - ta kategoria pominięta", host, note)
+                    return False
+                log.warning("%s: %s - pomijam ten host w tym przebiegu", host, note)
                 rp = RobotFileParser()
                 rp.disallow_all = True
             _robots[host] = rp
             cd = rp.crawl_delay(USER_AGENT) if rp else None
-            nl = urlparse(url).netloc
             _min_delay[nl] = max(_min_delay.get(nl, 0.0), float(cd) if cd else 0.0)
             if cd:
                 log.info("  robots.txt: Crawl-delay %s s dla %s", cd, host)
@@ -430,6 +452,8 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         return None
     host = urlparse(url).netloc
     last_err = "?"
+    if _proxies and (PROXY_ALL or host in _proxy_hosts):
+        retries = max(retries, min(8, len(_proxies) - len(_proxy_dead) + 1))  # kolejne próby = kolejne proxy
     for attempt in range(retries):
         throttle(host)
         px = None
@@ -458,9 +482,11 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                     _next_slot[host] = max(_next_slot.get(host, 0.0), time.time() + pause)
         except requests.RequestException as e:
             report_proxy(px, False)
-            last_err = e.__class__.__name__
-            log.warning("błąd sieci %s przez %s (próba %d/%d): %s", e.__class__.__name__,
-                        mask(px), attempt + 1, retries, url)
+            last_err = short_err(e)
+            proxied = px is not None
+            log.warning("błąd sieci przez %s (próba %d/%d): %s | %s", mask(px), attempt + 1, retries, url, last_err)
+            if proxied:
+                continue
         time.sleep(2 ** attempt)
     bump("nieudane")
     _tls.last_fail = f"nieudane po {retries} próbach ({last_err})"
@@ -752,11 +778,46 @@ def site_headers(name, site):
 
 def diag(r):
     """Krótki opis odpowiedzi, gdy strona ma 0 kafelków: tytuł, serwer, czy to ochrona anty-botowa."""
-    m = re.search(rb"<title[^>]*>(.*?)</title>", r.content[:20000], re.I | re.S)
+    m = re.search(rb"<title[^>]*>(.*?)</title>", r.content, re.I | re.S)
     title = re.sub(r"\s+", " ", m.group(1).decode("utf-8", "replace")).strip()[:80] if m else "?"
     hdr = r.headers
     guard = "Cloudflare" if ("cf-ray" in hdr or "cloudflare" in hdr.get("server", "").lower()) else hdr.get("server", "?")
     return f"HTTP {r.status_code}, {len(r.content)} B, title={title!r}, serwer/ochrona={guard}"
+
+
+def suggest_selectors(content):
+    """Gdy selektor 'item' nic nie znajduje: zgaduje, jak wygląda kafelek (powtarzający się element
+    z ceną i linkiem), żeby dało się poprawić konfigurację bez wklejania całego HTML."""
+    try:
+        soup = BeautifulSoup(content, "lxml")
+        price_re = re.compile(r"\d[\d\s.]*[,.]\d{2}\s*(?:zł|pln)", re.I)
+
+        def sig(t):
+            return t.name + "".join("." + c for c in (t.get("class") or [])[:3])
+
+        cands, info = Counter(), {}
+        for text in soup.find_all(string=price_re):
+            node = cur = text.parent
+            for _ in range(8):
+                par = cur.parent
+                if par is None or par.name in ("body", "html", "[document]"):
+                    break
+                if sum(1 for c in par.find_all(recursive=False) if c.name == cur.name and sig(c) == sig(cur)) >= 3:
+                    key = sig(cur)
+                    if key not in info:
+                        links = [a for a in cur.find_all("a", href=True) if len(a.get_text(strip=True)) >= 4]
+                        link = max(links, key=lambda a: len(a.get_text(strip=True)), default=None)
+                        info[key] = (sig(link) if link is not None else "?", sig(node),
+                                     link.get_text(" ", strip=True)[:30] if link is not None else "")
+                    cands[key] += 1
+                    break
+                cur = par
+        if not cands:
+            return "brak powtarzalnych kafelków z ceną w HTML (produkty mogą się ładować przez JavaScript)"
+        return "; ".join(f"item={k} ({n}x), link={info[k][0]}, cena={info[k][1]}, np. {info[k][2]!r}"
+                         for k, n in cands.most_common(2))
+    except Exception as e:  # diagnostyka nie może psuć scrapowania
+        return f"nie udało się zanalizować ({e})"
 
 
 def listing_category(name, site, cfg, cat_url, q, stats):
@@ -785,7 +846,7 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                     new.append(it)
                     on_page.add(it["url"])
             if page == start and n_tiles == 0:
-                reason = "0 kafelków: " + diag(r)
+                reason = "0 kafelków: " + diag(r) + " | podpowiedź: " + suggest_selectors(r.content)
                 log.warning("[%s] %s | %s", name, reason, url)
             elif page == start and n_tiles and not items:
                 reason = f"{n_tiles} kafelków, ale selektory name/link nic nie wyciągają"

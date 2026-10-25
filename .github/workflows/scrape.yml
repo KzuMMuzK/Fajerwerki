@@ -1,4 +1,5 @@
 name: scrape-fajerwerki
+name: scrape-fajerwerki
 
 # Repo z kodem jest PUBLICZNE (nielimitowane minuty Actions), a dane (baza, CSV)
 # trafiają do osobnego PRYWATNEGO repo - patrz sekrety DATA_REPO i DATA_REPO_TOKEN.
@@ -22,6 +23,10 @@ on:
         default: ""
       delay:
         description: "Min. odstęp między zapytaniami do jednego sklepu w sekundach (puste = 0.5)"
+        required: false
+        default: ""
+      mode:
+        description: "Tryb: sitemap (domyślnie, wszystkie sklepy przez sitemapy), listing (strony kategorii, szybko) albo auto"
         required: false
         default: ""
       browser_ua:
@@ -82,6 +87,7 @@ jobs:
           # Ustawienia idą przez zmienne środowiskowe - nie trzeba żadnych flag "--".
           # Przy uruchomieniu z harmonogramu pola są puste = wartości domyślne ze skryptu.
           SCRAPER_ONLY: ${{ inputs.only }}
+          SCRAPER_MODE: ${{ inputs.mode || vars.SCRAPER_MODE }}
           SCRAPER_MAX: ${{ inputs.max }}
           SCRAPER_WORKERS: ${{ inputs.workers }}
           SCRAPER_DELAY: ${{ inputs.delay }}

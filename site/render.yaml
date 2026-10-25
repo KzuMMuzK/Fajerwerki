@@ -1,0 +1,21 @@
+# Render Blueprint: New + > Blueprint > wybierz to repo. Render zapyta o wartości zmiennych oznaczonych sync: false.
+services:
+  - type: web
+    name: fajerwerki-ceny
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DATA_REPO          # np. twojlogin/fajerwerki-dane (prywatne repo z bazą)
+        sync: false
+      - key: DATA_TOKEN         # token GitHub fine-grained: tylko to repo, Contents = Read-only
+        sync: false
+      - key: SITE_PASSWORD      # hasło do strony (min. 8 znaków)
+        sync: false
+      - key: SITE_USER
+        value: admin

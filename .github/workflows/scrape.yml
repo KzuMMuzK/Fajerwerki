@@ -1,5 +1,4 @@
 name: scrape-fajerwerki
-name: scrape-fajerwerki
 
 # Repo z kodem jest PUBLICZNE (nielimitowane minuty Actions), a dane (baza, CSV)
 # trafiają do osobnego PRYWATNEGO repo - patrz sekrety DATA_REPO i DATA_REPO_TOKEN.

@@ -555,20 +555,29 @@ def sitemap_urls(site):
 
 
 # ----------------------------- parsowanie -----------------------------------
-_PRICE_RE = re.compile(r"(\d{1,3}(?:[\s.]\d{3})+|\d+)(?:[.,](\d{1,2}))?(?!\d)")
+# Cena w dowolnym zapisie. Kolejność alternatyw ma znaczenie:
+#  1) liczba z grupami tysięcy (spacja / kropka / przecinek + dokładnie 3 cyfry) i opcjonalnymi groszami 1-2 cyfry
+#  2) zwykła liczba z opcjonalnymi groszami
+_PRICE_RE = re.compile(
+    r"(?<![\d.,])(?:[1-9]\d{0,2}(?:[ \u00a0\u202f.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)(?!\d)")
 
 
 def parse_price(text):
+    """Cena z tekstu: 1 299,00 | 1.299,00 | 1,299.00 | 1299.00 | 1,612.00 zł | 49,9 | 1299. None gdy brak ceny albo <= 0."""
     if text is None:
         return None
     if isinstance(text, (int, float)):
-        return float(text)
-    cleaned = re.sub(r"[^\d,.\s]", "", str(text))
-    m = _PRICE_RE.search(cleaned)
-    if not m:
-        return None
-    whole = re.sub(r"[\s.]", "", m.group(1))
-    return float(f"{whole}.{m.group(2) or '0'}")
+        v = float(text)
+    else:
+        m = _PRICE_RE.search(str(text))
+        if not m:
+            return None
+        tok = m.group(0)
+        dec = re.search(r"[.,](\d{1,2})$", tok)  # ostatni separator + 1-2 cyfry = grosze
+        whole, frac = (tok[:dec.start()], dec.group(1)) if dec else (tok, "")
+        whole = re.sub(r"[ \u00a0\u202f.,]", "", whole)
+        v = float(f"{whole}.{frac or '0'}")
+    return v if 0 < v < 1_000_000 else None
 
 
 def norm_availability(raw):
@@ -760,6 +769,9 @@ def extract_code(name, url=None, hint=None, sku=None, min_score=4):
 
 
 # ----------------------------- baza -----------------------------------------
+PARSER_VERSION = 2  # zwiększ, gdy zmienia się sposób czytania cen: historia cen jest wtedy archiwizowana i liczona od nowa
+
+
 def db():
     con = sqlite3.connect(DB_PATH)
     con.executescript("""
@@ -787,8 +799,25 @@ def db():
         except sqlite3.OperationalError:
             pass  # starszy SQLite: kolumna zostaje nieużywana
     con.execute("CREATE INDEX IF NOT EXISTS ix_products_code ON products(code_key)")
+    con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+    row = con.execute("SELECT v FROM meta WHERE k = 'parser_version'").fetchone()
+    if not row or int(row[0]) < PARSER_VERSION:
+        n = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+        if n:  # ceny z poprzedniego parsera mogły być błędne (np. 1 zł zamiast 1612 zł) - nie mieszamy ich z nowymi
+            con.execute("DROP TABLE IF EXISTS prices_backup")
+            con.execute("DROP INDEX IF EXISTS ix_prices_url")
+            con.execute("ALTER TABLE prices RENAME TO prices_backup")
+            con.execute("""CREATE TABLE prices(id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT, ts TEXT,
+                           price REAL, currency TEXT, availability TEXT)""")
+            con.execute("CREATE INDEX ix_prices_url ON prices(url, ts)")
+            log.warning("zmiana parsera cen: historia (%d wpisów) przeniesiona do tabeli prices_backup, "
+                        "ceny liczone od nowa", n)
+        con.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('parser_version', ?)", (str(PARSER_VERSION),))
     con.commit()
     return con
+
+
+_suspicious = []  # (url, stara cena, nowa cena) - skoki >= 5x, zwykle znak błędu parsera cen
 
 
 def save(con, site_name, url, d):
@@ -802,6 +831,10 @@ def save(con, site_name, url, d):
     last = con.execute("SELECT price, availability FROM prices WHERE url=? "
                        "ORDER BY id DESC LIMIT 1", (url,)).fetchone()
     cur = (d["price"], d.get("availability"))
+    if last and last[0] and d["price"] and (d["price"] / last[0] >= 5 or d["price"] / last[0] <= 0.2):
+        _suspicious.append((url, last[0], d["price"]))
+        if len(_suspicious) <= 25:
+            log.warning("PODEJRZANA ZMIANA CENY %.2f -> %.2f | %s | %s", last[0], d["price"], d["name"], url)
     if last != cur:
         con.execute("INSERT INTO prices(url,ts,price,currency,availability) VALUES(?,?,?,?,?)",
                     (url, now, d["price"], d.get("currency", "PLN"), d.get("availability")))
@@ -1240,6 +1273,9 @@ def cmd_scrape(args):
         if in_actions:
             print("::endgroup::", flush=True)
 
+    if _suspicious:
+        log.warning("PODEJRZANE ZMIANY CEN (skok >= 5x): %d szt. - jeśli to masowe, parser cen zawodzi dla jakiegoś sklepu",
+                    len(_suspicious))
     log.info("===== PODSUMOWANIE =====")
     for name, n, st in summary:
         log.info("%-14s sprawdzone: %5d | produkty: %5d | zmiany: %5d | błędy: %d",

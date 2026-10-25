@@ -18,6 +18,7 @@ Zmienne środowiskowe (GitHub Actions: Settings > Secrets and variables > Action
     DATA_REPO, DATA_REPO_TOKEN   (tylko workflow) prywatne repo na bazę i CSV oraz token do niego
   USTAWIENIA (opcjonalne):
     SCRAPER_ONLY=pirohit,lider   SCRAPER_MAX=2   SCRAPER_WORKERS=12   SCRAPER_DELAY=0.5
+    SCRAPER_PROXY_SOURCE=geonode   darmowe proxy z Geonode, tylko dla sklepów z use_proxy (opcje: SCRAPER_PROXY_COUNTRY=PL,DE  SCRAPER_FREE_PROXY_COUNT=12)
     SCRAPER_MODE=sitemap|listing|auto   SCRAPER_VERBOSE=1   SCRAPER_RECHECK=1   SCRAPER_PROXY_ALL=1   SCRAPER_DB=sciezka/do/bazy.db
 
 Jak to działa (tryb sitemap; tryb listing czyta strony kategorii - patrz SITES):
@@ -29,6 +30,7 @@ Jak to działa (tryb sitemap; tryb listing czyta strony kategorii - patrz SITES)
   4. Szanuje robots.txt i robi odstępy między zapytaniami.
 """
 import argparse
+import contextlib
 import csv
 import gzip
 import itertools
@@ -45,7 +47,8 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -110,6 +113,7 @@ SITES = {
     },
     "pirohit": {
         "base": "https://pirohit.pl", "use_proxy": True,
+        "mode": "listing",   # przez proxy płacisz za transfer: strony kategorii (kilkadziesiąt produktów w 1 zapytaniu) zamiast tysięcy stron produktów; usuń tę linię, by użyć sitemapy
         "listing": {**_IDO, "price": "strong.price.--main", "in_stock": "button.add_to_basket__button",
             "categories": [
                 "https://pirohit.pl/Petardy-i-emitery-dzwieku-c15", "https://pirohit.pl/Wyrzutnie-c20",
@@ -215,6 +219,7 @@ SITES = {
     },
     "szopik": {
         "base": "https://fajerwerki.shop.pl", "use_proxy": True,
+        "mode": "listing",   # j.w. (strony ~0,9 MB); usuń tę linię, by użyć sitemapy
         "listing": {"next": "{url}?counter={page}&p=5", "start": 0, "item": "product-tile",
             "name": "a.link_no-underline", "link": "a.link_no-underline@href", "price": "span.price__value",
             "out_text": ["niedostępn", "powiadom o dostępności", "powiadom mnie", "brak towaru", "wyprzedan"],
@@ -293,10 +298,13 @@ _lock = threading.RLock()
 _stats_lock = threading.Lock()
 _robots, _crawl_delay, _next_slot = {}, {}, {}
 _robots_note = {}
-_proxies, _proxy_i, _proxy_fail, _proxy_dead = [], 0, Counter(), set()
+_proxies, _proxy_i, _proxy_fail, _proxy_dead = [], 0, Counter(), {}   # _proxy_dead: proxy -> do kiedy w pauzie
+_host_sem = {}  # netloc -> semafor: limit równoległych zapytań przez proxy
+_proxy_strikes = Counter()  # ile razy proxy trafiło do pauzy
 _min_delay, _proxy_hosts = {}, set()   # netloc -> min. odstęp (crawl-delay / 'delay' sklepu); hosty z use_proxy
 PROXY_ALL = env('SCRAPER_PROXY_ALL') == '1'  # 1 = proxy dla wszystkich sklepów, nie tylko z use_proxy
-PROXY_MAX_FAILS = 3  # tyle błędów z rzędu i proxy wypada z rotacji
+PROXY_MAX_FAILS = 3   # tyle błędów z rzędu = pauza dla tego proxy
+PROXY_PAUSE = 120     # sekundy pauzy (potem proxy dostaje kolejną szansę)
 
 
 def session():
@@ -347,19 +355,26 @@ def setup_proxies(args):
     return _proxies
 
 
+def _live_count():
+    now = time.time()
+    return sum(1 for px in _proxies if _proxy_dead.get(px, 0) <= now)
+
+
 def pick_proxy():
-    """Następne działające proxy (round-robin). Bez listy proxy -> None (połączenie bezpośrednie)."""
+    """Następne proxy (round-robin) pomijając te w pauzie. Bez listy proxy -> None (połączenie bezpośrednie).
+    Gdy wszystkie są w pauzie, bierze to, którego pauza kończy się najwcześniej - NIGDY nie przechodzi na
+    połączenie bezpośrednie (ujawniłoby Twoje IP)."""
     global _proxy_i
     if not _proxies:
         return None
     with _lock:
+        now = time.time()
         for _ in range(len(_proxies)):
             px = _proxies[_proxy_i % len(_proxies)]
             _proxy_i += 1
-            if px not in _proxy_dead:
+            if _proxy_dead.get(px, 0) <= now:
                 return px
-    # celowo NIE wracamy do połączenia bezpośredniego - ujawniłoby Twoje IP
-    raise RuntimeError("wszystkie proxy przestały działać - przerywam")
+        return min(_proxies, key=lambda x: _proxy_dead.get(x, 0))
 
 
 def report_proxy(px, ok):
@@ -368,12 +383,158 @@ def report_proxy(px, ok):
     with _lock:
         if ok:
             _proxy_fail[px] = 0
+            _proxy_dead.pop(px, None)
             return
         _proxy_fail[px] += 1
-        if _proxy_fail[px] >= PROXY_MAX_FAILS and px not in _proxy_dead:
-            _proxy_dead.add(px)
-            log.warning("proxy %s wyłączone po %d błędach z rzędu (zostało %d)",
-                        mask(px), PROXY_MAX_FAILS, len(_proxies) - len(_proxy_dead))
+        if _proxy_fail[px] >= PROXY_MAX_FAILS:
+            _proxy_fail[px] = 0
+            _proxy_dead[px] = time.time() + PROXY_PAUSE
+            _proxy_strikes[px] += 1
+            if px in _free_proxies and _proxy_strikes[px] >= 2:  # darmowe proxy żyją krótko - nie męczymy ich w kółko
+                label = mask(px)
+                _proxies.remove(px)
+                _free_proxies.discard(px)
+                _proxy_dead.pop(px, None)
+                log.warning("%s (darmowe) usunięte po powtarzających się błędach (zostało %d)", label, len(_proxies))
+            else:
+                log.warning("%s w pauzie %d s po %d błędach z rzędu (aktywnych: %d z %d)",
+                            mask(px), PROXY_PAUSE, PROXY_MAX_FAILS, _live_count(), len(_proxies))
+
+
+GEONODE_API = os.environ.get("GEONODE_API", "https://proxylist.geonode.com/api/proxy-list")
+_free_proxies = set()   # proxy pochodzące z darmowej listy (nie dostają ruchu HTTP, tylko HTTPS)
+
+
+def _socks_ok():
+    try:
+        import socks  # noqa: F401  (PySocks, instalowany przez requests[socks])
+    except ImportError:
+        return False
+    return True
+
+
+def geonode_candidates(countries=()):
+    """Lista kandydatów z API Geonode: tylko 'anonymous'/'elite' (transparent zdradza Twoje IP), uptime >= 80%."""
+    try:
+        r = requests.get(GEONODE_API, params={"limit": 500, "page": 1, "sort_by": "lastChecked", "sort_type": "desc"},
+                         timeout=30, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        data = r.json().get("data", [])
+    except Exception as e:
+        log.warning("darmowe proxy: nie udało się pobrać listy z Geonode: %s", short_err(e))
+        return []
+    socks_ok, cands, skipped = _socks_ok(), [], Counter()
+    for it in data:
+        try:
+            ip, port = str(it["ip"]), str(it["port"])
+        except (KeyError, TypeError):
+            continue
+        if str(it.get("anonymityLevel", "")).lower() == "transparent":
+            skipped["transparent"] += 1
+            continue
+        if countries and str(it.get("country", "")).upper() not in countries:
+            continue
+        up = float(it.get("upTime") or 0)
+        if up < 80:
+            skipped["niski uptime"] += 1
+            continue
+        protos = {str(x).lower() for x in (it.get("protocols") or [])}
+        if protos & {"http", "https"}:
+            scheme = "http"       # serwer proxy HTTP(S); do stron HTTPS używa tunelu CONNECT
+        elif "socks5" in protos and socks_ok:
+            scheme = "socks5h"    # DNS po stronie proxy
+        elif "socks4" in protos and socks_ok:
+            scheme = "socks4a"
+        else:
+            skipped["socks bez PySocks" if protos & {"socks4", "socks5"} else "inny protokół"] += 1
+            continue
+        prio = 0 if "https" in protos else (1 if scheme == "socks5h" else 2)
+        cands.append((prio, round(-up / 10), round(float(it.get("responseTime") or 9999) / 200), f"{scheme}://{ip}:{port}"))
+    random.shuffle(cands)                     # remisy losowo, żeby nie obciążać wciąż tych samych serwerów
+    cands.sort(key=lambda c: c[:3])
+    log.info("darmowe proxy (Geonode): %d na liście, %d kandydatów po filtrach%s", len(data), len(cands),
+             (", odrzucone: " + ", ".join(f"{k} {v}" for k, v in skipped.items())) if skipped else "")
+    return [c[3] for c in cands]
+
+
+def _check_proxy(px, targets):
+    """Czy proxy przepuszcza PRAWDZIWĄ stronę sklepu (HTTP 200 + HTML) z weryfikacją certyfikatu TLS?"""
+    t0 = time.time()
+    for url, hdrs in targets:
+        try:
+            r = requests.get(url, proxies={"http": px, "https": px}, timeout=(5, 9),
+                             headers={"User-Agent": USER_AGENT, **(hdrs or {})})
+        except requests.RequestException:
+            return None
+        if r.status_code != 200 or len(r.content) < 1500 or b"<html" not in r.content[:50000].lower():
+            return None
+    return time.time() - t0
+
+
+def acquire_free_proxies(targets, want=None, budget=None, countries=()):
+    """Pobiera listę, sprawdza kandydatów równolegle na stronach docelowych sklepów i dodaje działające do rotacji."""
+    want = want or int(env("SCRAPER_FREE_PROXY_COUNT", 12))
+    budget = budget or int(env("SCRAPER_FREE_PROXY_SECONDS", 90))
+    t0 = time.time()
+    cands = [c for c in geonode_candidates(countries) if c not in _proxies][:400]
+    if not cands:
+        return []
+    found = []
+    pool = ThreadPoolExecutor(max_workers=40)
+    futs = {pool.submit(_check_proxy, px, targets): px for px in cands}
+    try:
+        for fut in as_completed(futs, timeout=budget):
+            ms = fut.result()
+            if ms is not None:
+                found.append((ms, futs[fut]))
+                if len(found) >= want:
+                    break
+    except FuturesTimeout:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    found.sort()
+    with _lock:
+        for _, px in found:
+            if px not in _proxies:
+                _proxies.append(px)
+                _free_proxies.add(px)
+    log.info("darmowe proxy: sprawdzono %d kandydatów w %.0f s, działa %d (cel: %d) - łącznie w rotacji: %d",
+             len(futs), time.time() - t0, len(found), want, len(_proxies))
+    if not found:
+        log.warning("darmowe proxy: żaden kandydat nie przepuścił stron sklepów (typowe: lista jest zablokowana "
+                    "przez sklepy albo przeciążona) - sklepy z use_proxy mogą nie działać w tym przebiegu")
+    return [px for _, px in found]
+
+
+def free_proxy_targets(names):
+    """Strony główne sklepów używających proxy - na nich sprawdzamy kandydatów."""
+    out, seen = [], set()
+    for n in names:
+        site = SITES[n]
+        if not (PROXY_ALL or site.get("use_proxy")):
+            continue
+        host = urlparse(site["base"]).netloc
+        if host not in seen:
+            seen.add(host)
+            out.append((site["base"].rstrip("/") + "/", site_headers(n, site)))
+    return out
+
+
+def start_free_refresher(targets, countries, every=480):
+    """Co kilka minut uzupełnia pulę, gdy działających darmowych proxy zostało mało (żyją krótko)."""
+    def loop():
+        while True:
+            time.sleep(every)
+            now = time.time()
+            with _lock:
+                live = sum(1 for x in _free_proxies if _proxy_dead.get(x, 0) <= now)
+            if live < 4:
+                try:
+                    acquire_free_proxies(targets, countries=countries)
+                except Exception as e:
+                    log.warning("darmowe proxy: odświeżanie nie powiodło się: %s", short_err(e))
+    threading.Thread(target=loop, daemon=True, name="free-proxy-refresh").start()
 
 
 def proxy_for(netloc):
@@ -392,7 +553,7 @@ def allowed(url):
         if host not in _robots:
             rp, reason, net_fail = None, "brak odpowiedzi", False
             via_proxy = bool(_proxies) and (PROXY_ALL or nl in _proxy_hosts)
-            attempts = min(10, max(3, len(_proxies) - len(_proxy_dead) + 1)) if via_proxy else 3
+            attempts = min(10, max(3, _live_count() + 1)) if via_proxy else 3
             for _ in range(attempts):
                 px = proxy_for(nl)
                 try:
@@ -458,13 +619,18 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     host = urlparse(url).netloc
     last_err = "?"
     if _proxies and (PROXY_ALL or host in _proxy_hosts):
-        retries = max(retries, min(8, len(_proxies) - len(_proxy_dead) + 1))  # kolejne próby = kolejne proxy
+        retries = max(retries, min(8, _live_count() + 1))  # kolejne próby = kolejne proxy
     for attempt in range(retries):
         throttle(host)
         px = None
         try:
             px = proxy_for(host)
-            r = session().get(url, timeout=25, cookies=cookies, headers=headers, **proxy_kw(px))
+            if px in _free_proxies and not url.startswith("https://"):
+                _tls.last_fail = "adres HTTP nie przez darmowe proxy"  # po HTTP proxy widziałoby i mogło zmienić treść
+                bump("nieudane")
+                return None
+            with _host_sem.get(host) or contextlib.nullcontext():
+                r = session().get(url, timeout=(10, 20) if px else 25, cookies=cookies, headers=headers, **proxy_kw(px))
             report_proxy(px, True)
             code = r.status_code
             if code == 200:
@@ -885,6 +1051,27 @@ def save(con, site_name, url, d):
 
 
 # ----------------------------- komendy --------------------------------------
+def report_problems(problems, label):
+    """problems: lista (sklep, miejsce, powód). Grupuje takie same powody i zapisuje też w podsumowaniu przebiegu
+    (na telefonie to jedna strona zamiast przewijania logu)."""
+    if not problems:
+        return
+    groups = {}
+    for n, where, reason in problems:
+        g = groups.setdefault((n, re.sub(r"\d+", "#", reason)[:90]), [0, where, reason])
+        g[0] += 1
+    log.warning("PROBLEMY (%s) - wyszukaj w logu: PROBLEM", label)
+    lines = []
+    for (n, _), (cnt, where, reason) in groups.items():
+        txt = f"[{n}] x{cnt}: {reason}" + (f" | np. {where}" if where else "")
+        log.warning("PROBLEM %s", txt)
+        lines.append(txt)
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n### Problemy ({label})\n" + "".join(f"- {l}\n" for l in lines))
+
+
 def fmt_dur(sec):
     sec = int(sec)
     return f"{sec // 3600}h{sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60}m{sec % 60:02d}s"
@@ -1052,6 +1239,32 @@ def suggest_selectors(content):
         return f"nie udało się zanalizować ({e})"
 
 
+_NEXT_TEXTS = {"»", "›", ">", "→", "następna", "następny", "następna strona", "dalej", "kolejna", "next", "nast.", "nast"}
+
+
+def find_next_link(content, cur_url, ordinal):
+    """Adres następnej strony listy: <link/a rel=next>, link o numerze ordinal+1 albo 'Następna'/'»'."""
+    try:
+        soup = BeautifulSoup(content, "lxml")
+        cands = []
+        ln = soup.find("link", attrs={"rel": "next"}) or soup.find("a", attrs={"rel": "next"})
+        if ln is not None and ln.get("href"):
+            cands.append(ln["href"])
+        anchors = soup.find_all("a", href=True)
+        cands += [a["href"] for a in anchors if a.get_text(strip=True) == str(ordinal + 1)]
+        cands += [a["href"] for a in anchors if a.get_text(strip=True).lower() in _NEXT_TEXTS]
+        for href in cands:
+            href = href.strip()
+            if not href or href.startswith(("#", "javascript:")):
+                continue
+            absu = urljoin(cur_url, href)
+            if absu.split("#")[0] != cur_url.split("#")[0]:
+                return absu
+    except Exception:
+        pass
+    return None
+
+
 def listing_category(name, site, cfg, cat_url, q, stats):
     """Wątek roboczy: przechodzi strony jednej kategorii i wrzuca produkty do kolejki."""
     start = cfg.get("start", 1)
@@ -1091,6 +1304,29 @@ def listing_category(name, site, cfg, cat_url, q, stats):
             total += len(new)
             q.put(("items", name, cat_url, page, new))
             page += 1
+        # szablon adresu stron nie zadziałał (1 strona), ale strona wskazuje kolejne: idziemy za linkami
+        if total and page - start == 1 and last_r is not None:
+            visited, cur, ordinal, extra = {last_r.url}, last_r, 1, 0
+            while ordinal < max_pages:
+                nxt_url = find_next_link(cur.content, cur.url, ordinal)
+                if not nxt_url or nxt_url in visited:
+                    break
+                visited.add(nxt_url)
+                r = get(nxt_url, stats, cookies=site.get("cookies"), headers=hdrs)
+                if not r:
+                    break
+                n_tiles, items = parse_listing(r.content, nxt_url, cfg)
+                new = [it for it in dict((it["url"], it) for it in items).values() if it["url"] not in seen]
+                if not new:
+                    break
+                seen.update(it["url"] for it in new)
+                total += len(new)
+                q.put(("items", name, cat_url, start + ordinal, new))
+                ordinal, extra, cur = ordinal + 1, extra + 1, r
+            if extra:
+                page = start + ordinal
+                log.info("[%s] paginacja przez linki 'następna strona' (szablon adresu nie działał): +%d stron w %s",
+                         name, extra, cat_url.rstrip("/").rsplit("/", 1)[-1])
     except Exception as e:  # nigdy nie wieszamy głównego wątku
         reason = f"wyjątek: {e}"
         log.warning("[%s] błąd w kategorii %s: %s", name, cat_url, e)
@@ -1170,11 +1406,7 @@ def run_listing(con, names, args):
         log.info("[%s] KONIEC | %s", n, ", ".join(f"{k}={v}" for k, v in sorted(st.items())) or "brak danych")
         if st["produkty"] == 0:
             log.error("[%s] 0 produktów - sprawdź selektory/blokadę (uruchom z SCRAPER_VERBOSE=1)", n)
-    if any(problems.values()):
-        log.warning("PROBLEMY: kategorie bez produktów lub z podejrzaną paginacją (wyszukaj w logu: PROBLEM)")
-        for n in names:
-            for cat, reason in problems[n]:
-                log.warning("PROBLEM [%s] %s -> %s", n, cat, reason)
+    report_problems([(n, cat, reason) for n in names for cat, reason in problems[n]], "listing")
     log.info("TRYB LISTING zakończony w %s", fmt_dur(time.time() - t0))
     return [(n, stats[n]["strony"], stats[n]) for n in names]
 
@@ -1386,10 +1618,7 @@ def run_sitemap(con, names, args):
     finally:
         shops.shutdown(wait=False, cancel_futures=True)
         con.commit()
-    if problems:
-        log.warning("PROBLEMY (tryb sitemap, wyszukaj w logu: PROBLEM):")
-        for n, m_ in problems:
-            log.warning("PROBLEM [%s] %s", n, m_)
+    report_problems([(n, "", m_) for n, m_ in problems], "sitemap")
     log.info("TRYB SITEMAP zakończony w %s", fmt_dur(time.time() - t0))
     out = []
     for n in names:
@@ -1414,6 +1643,15 @@ def cmd_scrape(args):
                 _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
             if site.get("use_proxy"):
                 _proxy_hosts.add(h)
+                _host_sem[h] = threading.Semaphore(int(site.get("max_parallel", 4)))  # proxy nie lubią 12 naraz
+    if (env("SCRAPER_PROXY_SOURCE", "") or "").lower() == "geonode":
+        targets = free_proxy_targets(names)
+        if not targets:
+            log.info("darmowe proxy: żaden z wybranych sklepów nie ma use_proxy - pomijam")
+        else:
+            countries = tuple(c.strip().upper() for c in (env("SCRAPER_PROXY_COUNTRY", "") or "").split(",") if c.strip())
+            acquire_free_proxies(targets, countries=countries)
+            start_free_refresher(targets, countries)
     if _proxies and not PROXY_ALL and not _proxy_hosts:
         log.warning("podano proxy, ale żaden wybrany sklep nie ma use_proxy (ustaw SCRAPER_PROXY_ALL=1, by użyć dla wszystkich)")
     in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
@@ -1421,18 +1659,26 @@ def cmd_scrape(args):
     mode = (args.mode or "sitemap").lower()
     if mode not in ("sitemap", "listing", "auto"):
         raise SystemExit(f"Nieznany tryb {mode!r}: użyj sitemap, listing albo auto")
-    with_listing = [n for n in names if SITES[n].get("listing")]
-    listing_names = [] if mode == "sitemap" else with_listing
-    sitemap_names = [n for n in names if n not in listing_names]
-    log.info("tryb: %s | listing: %d sklepów, sitemap: %d sklepów", mode, len(listing_names), len(sitemap_names))
+    listing_names, sitemap_names, auto_names = [], [], []
+    for n in names:
+        m_ = (SITES[n].get("mode") or mode).lower()  # "mode" w konfiguracji sklepu ma pierwszeństwo
+        if m_ == "sitemap" or not SITES[n].get("listing"):
+            sitemap_names.append(n)
+        else:
+            listing_names.append(n)
+            if m_ == "auto":
+                auto_names.append(n)
+    forced = [n for n in names if SITES[n].get("mode")]
+    log.info("tryb: %s | listing: %d sklepów, sitemap: %d sklepów%s", mode, len(listing_names), len(sitemap_names),
+             f" | tryb ustawiony w konfiguracji sklepu: {', '.join(n + '=' + SITES[n]['mode'] for n in forced)}" if forced else "")
     if listing_names:
         if in_actions:
             print("::group::tryb listing", flush=True)
         res = run_listing(con, listing_names, args)
         if in_actions:
             print("::endgroup::", flush=True)
-        if mode == "auto":  # sklepy, w których listing nic nie dał, przechodzą na sitemapę
-            fallback = [n for (n, _pages, st_) in res if st_["produkty"] == 0]
+        if auto_names:  # sklepy w trybie auto, w których listing nic nie dał, przechodzą na sitemapę
+            fallback = [n for (n, _pages, st_) in res if n in auto_names and st_["produkty"] == 0]
             if fallback:
                 log.warning("tryb auto: listing nie dał produktów dla %s - przechodzę na sitemapę", ", ".join(fallback))
                 res = [r for r in res if r[0] not in fallback]

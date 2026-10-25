@@ -42,6 +42,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -614,7 +615,7 @@ def from_jsonld(soup):
             return {
                 "_ld": True,
                 "name": prod.get("name"),
-                "sku": prod.get("sku") or prod.get("mpn"),
+                "code_raw": prod.get("mpn"),  # kod producenta; SKU sklepu celowo pomijamy
                 "price": parse_price(price),
                 "currency": offers.get("priceCurrency") or "PLN",
                 "availability": norm_availability(offers.get("availability")),
@@ -667,12 +668,103 @@ def extract(html, site):
     return d
 
 
+# ----------------------------- kody produktów -------------------------------
+# Kod = oznaczenie producenta/modelu (np. PXO310, TB118, PF-2/R). Wyciągamy go z nazwy, adresu, jawnych
+# oznaczeń ("Kod: ...") i opcjonalnego selektora sklepu. Śmieci typu "20 strzałów", "25mm", "36s",
+# "2x36", "F2", "T1", "1.4G", "CE1234" są odrzucane. Lepiej nie mieć kodu niż mieć zły.
+_UNITS = (r"MM|CM|M|G|KG|ML|L|SZT|S|SEK|SEC|MIN|H|X|V|W|HZ|PCS|SHOT|SHOTS|STRZ\w*|STRZAL\w*|ST|K|CAL|CALI|CALA|CALE|"
+          r"INCH|PLN|ZL|LAT|KAL|KALIBER|KULI|KULA|KUL")
+_UNIT_RE = re.compile(rf"^\d+(?:X\d+)*(?:{_UNITS})?$")           # 36S, 25MM, 2X36, 5X20MM, 14G
+_UNIT_LEAD_RE = re.compile(rf"^(?:X)\d+(?:{_UNITS})?$")           # X36
+_BLACK_RE = re.compile(r"^(?:F[1-4]|T[12]|P[12]|KAT\d|3D|4K|2K|HD|XL{1,2}|XS|RGB\d*|USB\d*|LED\d*|"
+                       r"(?:CE|UN|EN|EAN|ISO|PN|DIN)\d*)$")
+_MARK_RE = re.compile(r"(?:kod(?:\s+produktu)?|nr\s*kat(?:alogowy)?\.?|numer\s+katalogowy|symbol|indeks|sku|"
+                      r"art(?:ykuł)?\.?|ref\.?|model)\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9\-_/.]{2,20})", re.I)
+_SLUG_CODE_RE = re.compile(r"^[a-z]{2,5}\d{2,6}[a-z]{0,2}$")
+
+
+def _fold(text):
+    """Wielkie litery bez polskich znaków - wspólna normalizacja dla kodów i wyszukiwania."""
+    text = (text or "").upper().replace("Ł", "L")
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in text if not unicodedata.combining(c))
+
+
+def _code_candidate(token, marker=False, trusted=False, slug=False):
+    """(wyświetlany, klucz, punkty) albo None. trusted = jawne źródło (kod z selektora/JSON-LD)."""
+    disp = token.strip(" \t.,;:()[]{}<>\"'!?*+")
+    if not 3 <= len(disp) <= 18 or not re.fullmatch(r"[\w][\w\-_/.]*[\w]", disp, re.U):
+        return None
+    key = re.sub(r"[^0-9A-Z]", "", _fold(disp))
+    if not 3 <= len(key) <= 16 or not any(c.isdigit() for c in key):
+        return None
+    if _UNIT_RE.match(key) and not key.isdigit() or _UNIT_LEAD_RE.match(key) or _BLACK_RE.match(key):
+        return None
+    letters, digits = sum(c.isalpha() for c in key), sum(c.isdigit() for c in key)
+    if letters == 0:  # same cyfry: tylko jawny kod (>=4 cyfry) albo długi numer (EAN itp.), nie rok
+        if not ((marker or trusted) and len(key) >= 4) and len(key) < 8:
+            return None
+        if re.fullmatch(r"(?:19|20)\d\d", key):
+            return None
+    elif not (marker or trusted or slug):
+        # z samej nazwy tylko tokeny "wyglądające jak kod": bez małych liter albo ze znakami łączącymi
+        if any(c.islower() for c in disp) and not re.search(r"[-_/]", disp):
+            return None
+    score = 1
+    if letters >= 2 and digits >= 2:
+        score += 2
+    elif letters >= 1 and digits >= 2:
+        score += 1
+    if 4 <= len(key) <= 12:
+        score += 1
+    if letters and not any(c.islower() for c in disp):
+        score += 1
+    if letters and digits and re.search(r"[-_/]", disp):
+        score += 1
+    if marker:
+        score += 4
+    if trusted:
+        score += 2
+    return disp.upper(), key, score
+
+
+def extract_code(name, url=None, hint=None, sku=None, min_score=4):
+    """Zwraca (kod, klucz) albo (None, None). klucz = same wielkie litery i cyfry (do łączenia między sklepami)."""
+    cands = []
+    if sku:
+        c = _code_candidate(str(sku), trusted=True)
+        if c:
+            cands.append(c)
+    text = " ".join(x for x in (name, hint) if x)
+    for m in _MARK_RE.finditer(text):
+        c = _code_candidate(m.group(1), marker=True)
+        if c:
+            cands.append(c)
+    for tok in re.split(r"[\s,;()\[\]{}|]+", name or ""):
+        c = _code_candidate(tok) if tok else None
+        if c:
+            cands.append(c)
+    if url:
+        seg = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+        seg = re.sub(r"\.(?:html?|php)$", "", seg.lower())
+        for tok in re.split(r"[-_+]", seg):
+            if _SLUG_CODE_RE.match(tok):
+                c = _code_candidate(tok, slug=True)
+                if c:
+                    cands.append(c)
+    cands = [c for c in cands if c[2] >= min_score]
+    if not cands:
+        return None, None
+    best = max(cands, key=lambda c: c[2])  # remis: pierwszy znaleziony
+    return best[0], best[1]
+
+
 # ----------------------------- baza -----------------------------------------
 def db():
     con = sqlite3.connect(DB_PATH)
     con.executescript("""
     CREATE TABLE IF NOT EXISTS products(
-      url TEXT PRIMARY KEY, site TEXT, name TEXT, sku TEXT,
+      url TEXT PRIMARY KEY, site TEXT, name TEXT, code TEXT, code_key TEXT,
       first_seen TEXT, last_seen TEXT);
     CREATE TABLE IF NOT EXISTS prices(
       id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT, ts TEXT,
@@ -680,16 +772,33 @@ def db():
     CREATE INDEX IF NOT EXISTS ix_prices_url ON prices(url, ts);
     CREATE TABLE IF NOT EXISTS nonproduct(url TEXT PRIMARY KEY, ts TEXT);
     """)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(products)")}
+    if "code" not in cols:  # migracja starej bazy (kolumna sku) -> kody produktów
+        con.execute("ALTER TABLE products ADD COLUMN code TEXT")
+        con.execute("ALTER TABLE products ADD COLUMN code_key TEXT")
+        rows = con.execute("SELECT url, name FROM products").fetchall()
+        for url, name in rows:  # stary SKU sklepu ignorujemy - kody liczymy z nazwy i adresu
+            code, key = extract_code(name, url)
+            con.execute("UPDATE products SET code=?, code_key=? WHERE url=?", (code, key, url))
+        log.info("migracja bazy: dodano kody produktów (%d produktów)", len(rows))
+    if "sku" in cols:
+        try:
+            con.execute("ALTER TABLE products DROP COLUMN sku")
+        except sqlite3.OperationalError:
+            pass  # starszy SQLite: kolumna zostaje nieużywana
+    con.execute("CREATE INDEX IF NOT EXISTS ix_products_code ON products(code_key)")
+    con.commit()
     return con
 
 
 def save(con, site_name, url, d):
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    con.execute("""INSERT INTO products(url,site,name,sku,first_seen,last_seen)
-                   VALUES(?,?,?,?,?,?)
-                   ON CONFLICT(url) DO UPDATE SET name=excluded.name,
-                   sku=excluded.sku, last_seen=excluded.last_seen""",
-                (url, site_name, d["name"], d.get("sku"), now, now))
+    code, key = extract_code(d["name"], url, d.get("hint"), d.get("code_raw"))
+    con.execute("""INSERT INTO products(url,site,name,code,code_key,first_seen,last_seen)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(url) DO UPDATE SET name=excluded.name, code=excluded.code,
+                   code_key=excluded.code_key, last_seen=excluded.last_seen""",
+                (url, site_name, d["name"], code, key, now, now))
     last = con.execute("SELECT price, availability FROM prices WHERE url=? "
                        "ORDER BY id DESC LIMIT 1", (url,)).fetchone()
     cur = (d["price"], d.get("availability"))
@@ -751,7 +860,8 @@ def parse_listing(html, page_url, cfg):
         if raw_price:
             for pat in cfg.get("price_strip", []):
                 raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
-        text = tile.get_text(" ", strip=True).lower()
+        raw_text = tile.get_text(" ", strip=True)
+        text = raw_text.lower()
         out = False
         if cfg.get("in_stock") and not has(tile, cfg["in_stock"]):
             out = True  # brak elementu "dostępny" (np. przycisku koszyka)
@@ -760,7 +870,8 @@ def parse_listing(html, page_url, cfg):
         if any(t.lower() in text for t in cfg.get("out_text", [])):
             out = True
         products.append({
-            "name": name.strip(), "sku": None, "currency": "PLN",
+            "name": name.strip(), "currency": "PLN",
+            "hint": raw_text[:400], "code_raw": _pick(tile, cfg.get("code")),
             "availability": "out_of_stock" if out else "in_stock",
             "price": parse_price(raw_price),
             "url": urljoin(page_url, href.strip()),
@@ -1145,14 +1256,14 @@ def cmd_scrape(args):
 def cmd_export(args):
     con = db()
     rows = con.execute("""
-      SELECT p.site, p.name, p.sku, p.url, pr.price, pr.currency,
+      SELECT p.site, p.name, p.code, p.url, pr.price, pr.currency,
              pr.availability, pr.ts
       FROM products p JOIN prices pr ON pr.id =
         (SELECT MAX(id) FROM prices WHERE url = p.url)
       ORDER BY p.site, p.name""").fetchall()
     with open(args.path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["sklep", "produkt", "sku", "link", "cena", "waluta", "dostepnosc", "zmiana_ts"])
+        w.writerow(["sklep", "produkt", "kod", "link", "cena", "waluta", "dostepnosc", "zmiana_ts"])
         w.writerows(rows)
     print(f"Zapisano {len(rows)} wierszy do {args.path}")
 

@@ -582,7 +582,18 @@ def proxy_for(netloc):
 
 
 def proxy_kw(px):
-    return {"proxies": {"http": px, "https": px}} if px else {}
+    """Przygotowuje argumenty proxy dla curl_cffi, rozbijając dane logowania z URL."""
+    if not px:
+        return {}
+    parsed = urlparse(px)
+    # Jeśli w adresie jest login i hasło, wyciągamy je i dekodujemy (np. znaki specjalne)
+    if parsed.username and parsed.password:
+        auth = (unquote(parsed.username), unquote(parsed.password))
+        # Budujemy adres proxy bez danych logowania
+        proxy_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        return {"proxy": proxy_url, "proxy_auth": auth}
+    # Jeśli nie ma danych logowania, przekazujemy adres bez zmian
+    return {"proxy": px}
 
 
 def allowed(url):

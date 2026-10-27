@@ -93,7 +93,7 @@ jobs:
         env:
           IPLOOP_PROXY: ${{ secrets.SCRAPER_PROXIES }}
         run: |
-          curl -I https://piroart.pl/robots.txt
+          curl -x "$SCRAPER_PROXIES" https://httpbin.org/ip -v
         continue-on-error: true
 
       - name: Scrape

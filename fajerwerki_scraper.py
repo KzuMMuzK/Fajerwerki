@@ -308,15 +308,10 @@ PROXY_MAX_FAILS = 3   # tyle błędów z rzędu = pauza dla tego proxy
 PROXY_PAUSE = 120     # sekundy pauzy (potem proxy dostaje kolejną szansę)
 
 def session():
+    """Osobna sesja HTTP na wątek."""
     sess = getattr(_tls, "s", None)
     if sess is None:
-        import os
-        if os.environ.get("SCRAPER_FORCE_REQUESTS") == "1":
-            import requests as req
-            sess = req.Session()
-        else:
-            from curl_cffi import requests as cffi_requests
-            sess = cffi_requests.Session(impersonate="chrome")
+        sess = requests.Session()
         sess.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "pl-PL,pl;q=0.9"})
         _tls.s = sess
     return sess
@@ -585,17 +580,7 @@ def proxy_for(netloc):
 
 
 def proxy_kw(px):
-    """Przygotowuje argumenty proxy dla curl_cffi z jawnym uwierzytelnianiem Iploop."""
-    if not px:
-        return {}
-    # Iploop wymaga loginu "iploop" i klucza API jako hasła.
-    # Wyciągamy klucz z adresu URL (część po "iploop:" i przed "@").
-    match = re.search(r"://(?:iploop:)?([^@]+)@", px)
-    api_key = match.group(1) if match else px
-    return {
-        "proxy": "http://proxy.iploop.io:8880",
-        "proxy_auth": ("iploop", api_key),
-    }
+    return {"proxies": {"http": px, "https": px}} if px else {}
 
 
 def allowed(url):

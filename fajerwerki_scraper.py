@@ -52,6 +52,7 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
+from curl_cffi import requests as cffi_requests  # Dodaj na górze pliku
 
 import requests
 import soupsieve as sv  # instalowany razem z beautifulsoup4
@@ -306,16 +307,16 @@ PROXY_ALL = env('SCRAPER_PROXY_ALL') == '1'  # 1 = proxy dla wszystkich sklepów
 PROXY_MAX_FAILS = 3   # tyle błędów z rzędu = pauza dla tego proxy
 PROXY_PAUSE = 120     # sekundy pauzy (potem proxy dostaje kolejną szansę)
 
-
 def session():
-    """Osobna sesja HTTP na wątek."""
+    """Osobna sesja HTTP na wątek (z imitacją Chrome, aby obejść blokady TLS)."""
     sess = getattr(_tls, "s", None)
     if sess is None:
-        sess = requests.Session()
+        # impersonate="chrome" imituje TLS/HTTP2 nowoczesnej przeglądarki Chrome.
+        # Możesz też użyć konkretnej wersji, np. "chrome124" lub "chrome120".
+        sess = cffi_requests.Session(impersonate="chrome")
         sess.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "pl-PL,pl;q=0.9"})
         _tls.s = sess
     return sess
-
 
 # ----------------------------- sieć -----------------------------------------
 def mask(px):

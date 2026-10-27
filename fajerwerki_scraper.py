@@ -308,12 +308,15 @@ PROXY_MAX_FAILS = 3   # tyle błędów z rzędu = pauza dla tego proxy
 PROXY_PAUSE = 120     # sekundy pauzy (potem proxy dostaje kolejną szansę)
 
 def session():
-    """Osobna sesja HTTP na wątek (z imitacją Chrome, aby obejść blokady TLS)."""
     sess = getattr(_tls, "s", None)
     if sess is None:
-        # impersonate="chrome" imituje TLS/HTTP2 nowoczesnej przeglądarki Chrome.
-        # Możesz też użyć konkretnej wersji, np. "chrome124" lub "chrome120".
-        sess = cffi_requests.Session(impersonate="chrome")
+        import os
+        if os.environ.get("SCRAPER_FORCE_REQUESTS") == "1":
+            import requests as req
+            sess = req.Session()
+        else:
+            from curl_cffi import requests as cffi_requests
+            sess = cffi_requests.Session(impersonate="chrome")
         sess.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "pl-PL,pl;q=0.9"})
         _tls.s = sess
     return sess

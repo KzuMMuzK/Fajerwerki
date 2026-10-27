@@ -582,10 +582,17 @@ def proxy_for(netloc):
 
 
 def proxy_kw(px):
-    """Przekazuje pełny adres proxy (z danymi logowania) do curl_cffi."""
+    """Przygotowuje argumenty proxy dla curl_cffi z jawnym uwierzytelnianiem Iploop."""
     if not px:
         return {}
-    return {"proxy": px}
+    # Iploop wymaga loginu "iploop" i klucza API jako hasła.
+    # Wyciągamy klucz z adresu URL (część po "iploop:" i przed "@").
+    match = re.search(r"://(?:iploop:)?([^@]+)@", px)
+    api_key = match.group(1) if match else px
+    return {
+        "proxy": "http://proxy.iploop.io:8880",
+        "proxy_auth": ("iploop", api_key),
+    }
 
 
 def allowed(url):

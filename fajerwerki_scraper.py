@@ -676,10 +676,13 @@ def read_xml(url, headers=None):
     if not r:
         return None
     data = r.content
-    if url.endswith(".gz") or data[:2] == b"\x1f\x8b":
+    # Sprawdzaj nagłówek gzip, a nie tylko końcówkę adresu
+    if data[:2] == b"\x1f\x8b":
         try:
             data = gzip.decompress(data)
+            log.debug("  dekompresja gzip: %s", url)
         except OSError:
+            log.warning("  nie udało się zdekompresować gzip: %s", url)
             return None
     try:
         return ET.fromstring(data)
@@ -695,7 +698,7 @@ def _is_loc(tag):
 def _walk_sitemaps(roots, site, hdrs, info):
     seen, out, stack = set(), [], list(reversed(roots))
     flt = site.get("sitemap_filter")
-    while stack and len(seen) < 300:
+    while stack and len(seen) < 10000:  # zwiększony limit
         sm = stack.pop()
         if sm in seen:
             continue
@@ -705,8 +708,9 @@ def _walk_sitemaps(roots, site, hdrs, info):
             log.warning("  sitemapa niedostępna lub nieczytelna: %s (%s)", sm, getattr(_tls, "last_fail", "?"))
             info["failed"].append(sm)
             continue
-        locs = [el.text.strip() for el in tree.iter() if _is_loc(el.tag) and el.text]
-        if tree.tag.endswith("sitemapindex"):
+        # Buduj pełne adresy URL, nawet jeśli w XML-u są względne
+        locs = [urljoin(sm, el.text.strip()) for el in tree.iter() if _is_loc(el.tag) and el.text]
+        if "sitemapindex" in tree.tag:
             kids = [u for u in locs if not flt or re.search(flt, u)]
             stack.extend(reversed(kids))
             info["children"] += len(kids)

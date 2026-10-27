@@ -470,18 +470,56 @@ def _check_proxy(px, targets):
             return None
     return time.time() - t0
 
+def _fetch_from_proxyscrape(targets=None, countries=()):
+    """Pobiera darmowe proxy z ProxyScrape (format tekstowy: protocol://ip:port)."""
+    url = "https://api.proxyscrape.com/v4/free-proxy-list/get"
+    params = {
+        "request": "display_proxies",
+        "proxy_format": "protocolipport",
+        "format": "text",
+    }
+    if countries:
+        params["country"] = ",".join(countries)
+    try:
+        r = requests.get(url, params=params, timeout=30, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        lines = [line.strip() for line in r.text.splitlines() if line.strip()]
+        proxies = [line for line in lines if line.startswith(("http://", "https://", "socks4://", "socks5://"))]
+        log.info("ProxyScrape: otrzymano %d proxy", len(proxies))
+        return proxies
+    except requests.RequestException as e:
+        log.warning("ProxyScrape: błąd pobierania: %s", short_err(e))
+        return []
+
 
 def acquire_free_proxies(targets, want=None, budget=None, countries=()):
-    """Pobiera listę, sprawdza kandydatów równolegle na stronach docelowych sklepów i dodaje działające do rotacji."""
+    """Pobiera listę z Geonode i ProxyScrape, sprawdza kandydatów równolegle i dodaje działające do rotacji."""
     want = want or int(env("SCRAPER_FREE_PROXY_COUNT", 12))
     budget = budget or int(env("SCRAPER_FREE_PROXY_SECONDS", 90))
     t0 = time.time()
-    cands = [c for c in geonode_candidates(countries) if c not in _proxies][:400]
-    if not cands:
+
+    # 1) Zbierz kandydatów z obu źródeł
+    candidates = []
+    try:
+        candidates.extend(geonode_candidates(countries))
+    except Exception as e:
+        log.warning("Geonode: błąd pobierania: %s", short_err(e))
+    try:
+        candidates.extend(_fetch_from_proxyscrape(targets, countries))
+    except Exception as e:
+        log.warning("ProxyScrape: błąd pobierania: %s", short_err(e))
+
+    # 2) Usuń duplikaty i już znane proxy
+    seen = set()
+    candidates = [p for p in candidates if not (p in seen or seen.add(p)) and p not in _proxies][:400]
+    if not candidates:
+        log.warning("darmowe proxy: żadne źródło nie zwróciło kandydatów")
         return []
+
+    # 3) Sprawdź kandydatów równolegle na stronach docelowych sklepów
     found = []
     pool = ThreadPoolExecutor(max_workers=40)
-    futs = {pool.submit(_check_proxy, px, targets): px for px in cands}
+    futs = {pool.submit(_check_proxy, px, targets): px for px in candidates}
     try:
         for fut in as_completed(futs, timeout=budget):
             ms = fut.result()
@@ -493,19 +531,19 @@ def acquire_free_proxies(targets, want=None, budget=None, countries=()):
         pass
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+
     found.sort()
     with _lock:
         for _, px in found:
             if px not in _proxies:
                 _proxies.append(px)
                 _free_proxies.add(px)
-    log.info("darmowe proxy: sprawdzono %d kandydatów w %.0f s, działa %d (cel: %d) - łącznie w rotacji: %d",
+
+    log.info("Darmowe proxy (Geonode + ProxyScrape): sprawdzono %d kandydatów w %.0f s, działa %d (cel: %d) – łącznie w rotacji: %d",
              len(futs), time.time() - t0, len(found), want, len(_proxies))
     if not found:
-        log.warning("darmowe proxy: żaden kandydat nie przepuścił stron sklepów (typowe: lista jest zablokowana "
-                    "przez sklepy albo przeciążona) - sklepy z use_proxy mogą nie działać w tym przebiegu")
+        log.warning("Darmowe proxy: żaden kandydat nie przepuścił stron sklepów – sklepy z use_proxy mogą nie działać w tym przebiegu")
     return [px for _, px in found]
-
 
 def free_proxy_targets(names):
     """Strony główne sklepów używających proxy - na nich sprawdzamy kandydatów."""

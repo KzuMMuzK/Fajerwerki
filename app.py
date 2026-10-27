@@ -1183,6 +1183,10 @@ def admin_quick():
     apply_live(url)
     return redirect(safe_next(request.form.get("back")))
 
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
+
 
 # ----------------------------------------------------------------------------- wygląd
 CSS = """

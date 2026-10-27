@@ -88,6 +88,13 @@ jobs:
           python-version: "3.12"
 
       - run: pip install "requests[socks]" beautifulsoup4 lxml curl_cffi
+      
+      - name: Test proxy Iploop
+        env:
+          IPLOOP_PROXY: ${{ secrets.SCRAPER_PROXIES }}
+        run: |
+          curl -x "$IPLOOP_PROXY" https://httpbin.org/ip -v
+        continue-on-error: true
 
       - name: Scrape
         env:

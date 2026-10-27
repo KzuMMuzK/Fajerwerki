@@ -89,11 +89,11 @@ jobs:
 
       - run: pip install "requests[socks]" beautifulsoup4 lxml curl_cffi
       
-      - name: Test proxy Iploop
+      - name: Test proxy trueproxies
         env:
           IPLOOP_PROXY: ${{ secrets.SCRAPER_PROXIES }}
         run: |
-          curl -x "$IPLOOP_PROXY" https://httpbin.org/ip -v
+          curl -I https://piroart.pl/robots.txt
         continue-on-error: true
 
       - name: Scrape

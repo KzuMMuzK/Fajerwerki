@@ -1,7 +1,7 @@
 # Render Blueprint: New + > Blueprint > wybierz to repo. Render zapyta o wartości zmiennych oznaczonych sync: false.
 services:
   - type: web
-    name: fajerwerki-ceny
+    name: fajerwerki
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -11,11 +11,17 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.3
-      - key: DATA_REPO          # np. twojlogin/fajerwerki-dane (prywatne repo z bazą)
+      - key: SECRET_KEY            # losowy ciąg do podpisywania sesji - Render wygeneruje go sam
+        generateValue: true
+      - key: BASE_URL              # adres strony, np. https://fajerwerki.onrender.com (bez ukośnika na końcu)
         sync: false
-      - key: DATA_TOKEN         # token GitHub fine-grained: tylko to repo, Contents = Read-only
+      - key: DISCORD_CLIENT_ID     # discord.com/developers/applications > Twoja aplikacja > OAuth2
         sync: false
-      - key: SITE_PASSWORD      # hasło do strony (min. 8 znaków)
+      - key: DISCORD_CLIENT_SECRET
         sync: false
-      - key: SITE_USER
-        value: admin
+      - key: ADMIN_DISCORD_IDS     # Twoje ID użytkownika Discord (kilka po przecinku) - te osoby są zawsze administratorami
+        sync: false
+      - key: DATA_REPO             # np. twojlogin/fajerwerki-dane (prywatne repo z bazą)
+        sync: false
+      - key: DATA_TOKEN            # token GitHub fine-grained: tylko to repo, Contents = Read and write
+        sync: false

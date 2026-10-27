@@ -25,11 +25,15 @@ on:
         required: false
         default: ""
       mode:
-        description: "Tryb: sitemap (domyślnie, wszystkie sklepy przez sitemapy), listing (strony kategorii, szybko) albo auto"
+        description: "Tryb: sitemap (domyślnie), listing (strony kategorii, szybko) albo auto"
         required: false
         default: ""
       free_proxy:
         description: "Darmowe proxy z Geonode (tylko dla sklepów z use_proxy: Pirohit, Szopik); sprawdzane przed użyciem"
+        type: boolean
+        default: false
+      proxy_all:
+        description: "Proxy dla WSZYSTKICH sklepów (odznaczone = tylko sklepy z use_proxy: Pirohit, Szopik). Działa tylko gdy proxy jest skonfigurowane (SCRAPER_PROXIES lub free_proxy). W harmonogramie decyduje zmienna SCRAPER_PROXY_ALL z Variables."
         type: boolean
         default: false
       browser_ua:
@@ -93,6 +97,10 @@ jobs:
           SCRAPER_MODE: ${{ inputs.mode || vars.SCRAPER_MODE }}
           SCRAPER_PROXY_SOURCE: ${{ inputs.free_proxy && 'geonode' || vars.SCRAPER_PROXY_SOURCE }}
           SCRAPER_PROXY_COUNTRY: ${{ vars.SCRAPER_PROXY_COUNTRY }}
+          # 1 = proxy dla wszystkich sklepów (również tych bez use_proxy).
+          # Gdy uruchamiasz ręcznie, decyduje checkbox "proxy_all".
+          # Gdy uruchamia harmonogram, decyduje zmienna SCRAPER_PROXY_ALL (Variables; ustaw "1" żeby włączyć).
+          SCRAPER_PROXY_ALL: ${{ inputs.proxy_all && '1' || vars.SCRAPER_PROXY_ALL }}
           SCRAPER_MAX: ${{ inputs.max }}
           SCRAPER_WORKERS: ${{ inputs.workers }}
           SCRAPER_DELAY: ${{ inputs.delay }}

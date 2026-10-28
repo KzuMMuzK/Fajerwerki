@@ -50,9 +50,8 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
-from curl_cffi import requests as cffi_requests  # Dodaj na górze pliku
 
 import requests
 import soupsieve as sv  # instalowany razem z beautifulsoup4
@@ -282,7 +281,7 @@ SITES = {
             "categories": ["https://pironet.pl/sklep-z-fajerwerkami/"]},
     },
     "piroart": {
-        "base": "https://piroart.pl", "use_proxy": True,
+        "base": "https://piroart.pl",
         "listing": {**_WOO, "name": "div.product__title h3", "link": "a.woocommerce-loop-product__link@href",
             "price": "span.current span.woocommerce-Price-amount",
             "categories": ["https://piroart.pl/hurtownia/"]},
@@ -307,6 +306,7 @@ PROXY_ALL = env('SCRAPER_PROXY_ALL') == '1'  # 1 = proxy dla wszystkich sklepów
 PROXY_MAX_FAILS = 3   # tyle błędów z rzędu = pauza dla tego proxy
 PROXY_PAUSE = 120     # sekundy pauzy (potem proxy dostaje kolejną szansę)
 
+
 def session():
     """Osobna sesja HTTP na wątek."""
     sess = getattr(_tls, "s", None)
@@ -315,6 +315,7 @@ def session():
         sess.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "pl-PL,pl;q=0.9"})
         _tls.s = sess
     return sess
+
 
 # ----------------------------- sieć -----------------------------------------
 def mask(px):
@@ -469,56 +470,18 @@ def _check_proxy(px, targets):
             return None
     return time.time() - t0
 
-def _fetch_from_proxyscrape(targets=None, countries=()):
-    """Pobiera darmowe proxy z ProxyScrape (format tekstowy: protocol://ip:port)."""
-    url = "https://api.proxyscrape.com/v4/free-proxy-list/get"
-    params = {
-        "request": "display_proxies",
-        "proxy_format": "protocolipport",
-        "format": "text",
-    }
-    if countries:
-        params["country"] = ",".join(countries)
-    try:
-        r = requests.get(url, params=params, timeout=30, headers={"User-Agent": USER_AGENT})
-        r.raise_for_status()
-        lines = [line.strip() for line in r.text.splitlines() if line.strip()]
-        proxies = [line for line in lines if line.startswith(("http://", "https://", "socks4://", "socks5://"))]
-        log.info("ProxyScrape: otrzymano %d proxy", len(proxies))
-        return proxies
-    except requests.RequestException as e:
-        log.warning("ProxyScrape: błąd pobierania: %s", short_err(e))
-        return []
-
 
 def acquire_free_proxies(targets, want=None, budget=None, countries=()):
-    """Pobiera listę z Geonode i ProxyScrape, sprawdza kandydatów równolegle i dodaje działające do rotacji."""
+    """Pobiera listę, sprawdza kandydatów równolegle na stronach docelowych sklepów i dodaje działające do rotacji."""
     want = want or int(env("SCRAPER_FREE_PROXY_COUNT", 12))
     budget = budget or int(env("SCRAPER_FREE_PROXY_SECONDS", 90))
     t0 = time.time()
-
-    # 1) Zbierz kandydatów z obu źródeł
-    candidates = []
-    try:
-        candidates.extend(geonode_candidates(countries))
-    except Exception as e:
-        log.warning("Geonode: błąd pobierania: %s", short_err(e))
-    try:
-        candidates.extend(_fetch_from_proxyscrape(targets, countries))
-    except Exception as e:
-        log.warning("ProxyScrape: błąd pobierania: %s", short_err(e))
-
-    # 2) Usuń duplikaty i już znane proxy
-    seen = set()
-    candidates = [p for p in candidates if not (p in seen or seen.add(p)) and p not in _proxies][:400]
-    if not candidates:
-        log.warning("darmowe proxy: żadne źródło nie zwróciło kandydatów")
+    cands = [c for c in geonode_candidates(countries) if c not in _proxies][:400]
+    if not cands:
         return []
-
-    # 3) Sprawdź kandydatów równolegle na stronach docelowych sklepów
     found = []
     pool = ThreadPoolExecutor(max_workers=40)
-    futs = {pool.submit(_check_proxy, px, targets): px for px in candidates}
+    futs = {pool.submit(_check_proxy, px, targets): px for px in cands}
     try:
         for fut in as_completed(futs, timeout=budget):
             ms = fut.result()
@@ -530,19 +493,19 @@ def acquire_free_proxies(targets, want=None, budget=None, countries=()):
         pass
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-
     found.sort()
     with _lock:
         for _, px in found:
             if px not in _proxies:
                 _proxies.append(px)
                 _free_proxies.add(px)
-
-    log.info("Darmowe proxy (Geonode + ProxyScrape): sprawdzono %d kandydatów w %.0f s, działa %d (cel: %d) – łącznie w rotacji: %d",
+    log.info("darmowe proxy: sprawdzono %d kandydatów w %.0f s, działa %d (cel: %d) - łącznie w rotacji: %d",
              len(futs), time.time() - t0, len(found), want, len(_proxies))
     if not found:
-        log.warning("Darmowe proxy: żaden kandydat nie przepuścił stron sklepów – sklepy z use_proxy mogą nie działać w tym przebiegu")
+        log.warning("darmowe proxy: żaden kandydat nie przepuścił stron sklepów (typowe: lista jest zablokowana "
+                    "przez sklepy albo przeciążona) - sklepy z use_proxy mogą nie działać w tym przebiegu")
     return [px for _, px in found]
+
 
 def free_proxy_targets(names):
     """Strony główne sklepów używających proxy - na nich sprawdzamy kandydatów."""
@@ -713,13 +676,10 @@ def read_xml(url, headers=None):
     if not r:
         return None
     data = r.content
-    # Sprawdzaj nagłówek gzip, a nie tylko końcówkę adresu
-    if data[:2] == b"\x1f\x8b":
+    if url.endswith(".gz") or data[:2] == b"\x1f\x8b":
         try:
             data = gzip.decompress(data)
-            log.debug("  dekompresja gzip: %s", url)
         except OSError:
-            log.warning("  nie udało się zdekompresować gzip: %s", url)
             return None
     try:
         return ET.fromstring(data)
@@ -735,7 +695,7 @@ def _is_loc(tag):
 def _walk_sitemaps(roots, site, hdrs, info):
     seen, out, stack = set(), [], list(reversed(roots))
     flt = site.get("sitemap_filter")
-    while stack and len(seen) < 10000:  # zwiększony limit
+    while stack and len(seen) < 300:
         sm = stack.pop()
         if sm in seen:
             continue
@@ -745,9 +705,8 @@ def _walk_sitemaps(roots, site, hdrs, info):
             log.warning("  sitemapa niedostępna lub nieczytelna: %s (%s)", sm, getattr(_tls, "last_fail", "?"))
             info["failed"].append(sm)
             continue
-        # Buduj pełne adresy URL, nawet jeśli w XML-u są względne
-        locs = [urljoin(sm, el.text.strip()) for el in tree.iter() if _is_loc(el.tag) and el.text]
-        if "sitemapindex" in tree.tag:
+        locs = [el.text.strip() for el in tree.iter() if _is_loc(el.tag) and el.text]
+        if tree.tag.endswith("sitemapindex"):
             kids = [u for u in locs if not flt or re.search(flt, u)]
             stack.extend(reversed(kids))
             info["children"] += len(kids)

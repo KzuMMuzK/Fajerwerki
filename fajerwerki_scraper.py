@@ -1700,6 +1700,10 @@ def cmd_scrape(args):
     forced = [n for n in names if SITES[n].get("mode")]
     log.info("tryb: %s | sitemapa: %d sklepów, kategorie: %d sklepów%s", mode, len(sitemap_names), len(listing_names),
              f" | tryb ustawiony w konfiguracji sklepu: {', '.join(n + '=' + SITES[n]['mode'] for n in forced)}" if forced else "")
+    ua_shops = [n for n in names if "User-Agent" in (site_headers(n, SITES[n]) or {})]
+    px_shops = [n for n in names if SITES[n].get("use_proxy") or PROXY_ALL]
+    log.info("ustawienia: User-Agent przeglądarki dla: %s | proxy (%d szt.) dla: %s", ", ".join(ua_shops) or "nikt (SCRAPER_BROWSER_UA puste?)",
+             len(_proxies), ", ".join(px_shops) or "nikt")
     if listing_names:
         if in_actions:
             print("::group::tryb listing", flush=True)

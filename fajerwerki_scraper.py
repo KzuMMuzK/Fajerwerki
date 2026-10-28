@@ -19,7 +19,7 @@ Zmienne środowiskowe (GitHub Actions: Settings > Secrets and variables > Action
   USTAWIENIA (opcjonalne):
     SCRAPER_ONLY=pirohit,lider   SCRAPER_MAX=2   SCRAPER_WORKERS=12   SCRAPER_DELAY=0.5
     SCRAPER_PROXY_SOURCE=geonode   darmowe proxy z Geonode, tylko dla sklepów z use_proxy (opcje: SCRAPER_PROXY_COUNTRY=PL,DE  SCRAPER_FREE_PROXY_COUNT=12)
-    SCRAPER_MODE=sitemap|listing|auto   SCRAPER_VERBOSE=1   SCRAPER_RECHECK=1   SCRAPER_PROXY_ALL=1   SCRAPER_DB=sciezka/do/bazy.db
+    SCRAPER_MODE=smart|sitemap|listing|auto   SCRAPER_VERBOSE=1   SCRAPER_RECHECK=1   SCRAPER_PROXY_ALL=1   SCRAPER_DB=sciezka/do/bazy.db
 
 Jak to działa (tryb sitemap; tryb listing czyta strony kategorii - patrz SITES):
   1. Adresy produktów bierze z sitemap.xml sklepu (robots.txt -> Sitemap:).
@@ -33,6 +33,7 @@ import argparse
 import contextlib
 import csv
 import gzip
+import html as htmllib
 import itertools
 import json
 import logging
@@ -234,7 +235,7 @@ SITES = {
                 "wyrzutnie-100-500-strzalow-191", "wyrzutnie-1-25-strzalow-192", "tpro-show-193")]},
     },
     "pyrotech": {
-        "base": "https://hurtownia-fajerwerki.pl",
+        "base": "https://hurtownia-fajerwerki.pl", "sitemaps": ["https://hurtownia-fajerwerki.pl/sitemap.xml.gz"],
         "listing": {**_IDO, "price": "strong.price.--main", "out_of_stock": "span.--disable",
             "categories": ["https://hurtownia-fajerwerki.pl/pol_m_Fajerwerki-157.html"]},
     },
@@ -281,7 +282,7 @@ SITES = {
             "categories": ["https://pironet.pl/sklep-z-fajerwerkami/"]},
     },
     "piroart": {
-        "base": "https://piroart.pl",
+        "base": "https://piroart.pl", "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
         "listing": {**_WOO, "name": "div.product__title h3", "link": "a.woocommerce-loop-product__link@href",
             "price": "span.current span.woocommerce-Price-amount",
             "categories": ["https://piroart.pl/hurtownia/"]},
@@ -665,31 +666,41 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
 
 
 # ----------------------------- sitemap --------------------------------------
-SITEMAP_FALLBACKS = ("/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml", "/sitemap-index.xml",
-                     "/sitemap/sitemap_index.xml", "/sitemap/sitemap.xml", "/sitemaps/sitemap.xml",
-                     "/product-sitemap.xml", "/sitemap_products_1.xml")
+SITEMAP_FALLBACKS = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap.xml.gz", "/sitemap_index.xml.gz", "/wp-sitemap.xml",
+                     "/sitemap-index.xml", "/sitemap-index.xml.gz", "/sitemap/sitemap_index.xml", "/sitemap/sitemap.xml",
+                     "/sitemaps/sitemap.xml", "/sitemaps.xml", "/product-sitemap.xml", "/sitemap_products_1.xml")
 _ASSET_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg|ico|pdf|mp4|webm|css|js|zip|xml)(?:\?|$)", re.I)
 
 
-def read_xml(url, headers=None):
+def _is_loc(tag):
+    """<loc> ze standardowej przestrzeni sitemap; pomija <image:loc>, <video:loc>, <news:...> itp."""
+    return tag == "loc" or (tag.endswith("}loc") and not any(x in tag.lower() for x in ("image", "video", "news", "xhtml")))
+
+
+def read_sitemap(url, headers=None):
+    """Zwraca (czy_indeks, lista_adresów) albo None. Gzip rozpoznaje po sygnaturze pliku, nie po rozszerzeniu
+    (np. sitemap.xml.gz bywa zwykłym XML-em), toleruje BOM i uszkodzony XML (np. niezakodowane '&' w adresach)."""
     r = get(url, headers=headers)
     if not r:
         return None
     data = r.content
-    if url.endswith(".gz") or data[:2] == b"\x1f\x8b":
-        try:
-            data = gzip.decompress(data)
-        except OSError:
-            return None
+    for _ in range(2):  # także podwójnie spakowane
+        if data[:2] == b"\x1f\x8b":
+            try:
+                data = gzip.decompress(data)
+            except (OSError, EOFError):
+                return None
+    data = data.lstrip(b"\xef\xbb\xbf \t\r\n")
     try:
-        return ET.fromstring(data)
+        tree = ET.fromstring(data)
+        locs = [el.text.strip() for el in tree.iter() if _is_loc(el.tag) and el.text and el.text.strip()]
+        return tree.tag.lower().endswith("sitemapindex"), locs
     except ET.ParseError:
-        return None
-
-
-def _is_loc(tag):
-    """<loc> ze standardowej przestrzeni sitemap; pomija <image:loc>, <video:loc> itp."""
-    return tag == "loc" or (tag.endswith("}loc") and "sitemaps.org" in tag)
+        locs = [htmllib.unescape(m.decode("utf-8", "replace")).strip()
+                for m in re.findall(rb"<loc>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</loc>", data, re.S | re.I)]
+        if not locs:
+            return None
+        return b"sitemapindex" in data[:3000].lower(), locs
 
 
 def _walk_sitemaps(roots, site, hdrs, info):
@@ -700,13 +711,14 @@ def _walk_sitemaps(roots, site, hdrs, info):
         if sm in seen:
             continue
         seen.add(sm)
-        tree = read_xml(sm, hdrs)
-        if tree is None:
+        res = read_sitemap(sm, hdrs)
+        if res is None:
             log.warning("  sitemapa niedostępna lub nieczytelna: %s (%s)", sm, getattr(_tls, "last_fail", "?"))
             info["failed"].append(sm)
             continue
-        locs = [el.text.strip() for el in tree.iter() if _is_loc(el.tag) and el.text]
-        if tree.tag.endswith("sitemapindex"):
+        is_index, locs = res
+        locs = [urljoin(sm, u) for u in locs]
+        if is_index:
             kids = [u for u in locs if not flt or re.search(flt, u)]
             stack.extend(reversed(kids))
             info["children"] += len(kids)
@@ -871,6 +883,14 @@ def extract(html, site):
         d.setdefault("currency", meta(soup, "product:price:currency", "og:price:currency") or "PLN")
     if not d.get("availability"):
         d["availability"] = norm_availability(meta(soup, "product:availability", "og:availability", "availability"))
+    if d.get("price") is None:  # mikrodane: dokładnie jedna cena na stronie = strona produktu (lista ma ich wiele)
+        els = soup.find_all(attrs={"itemprop": "price"})
+        if len(els) == 1:
+            d["price"] = parse_price(els[0].get("content") or els[0].get_text(" ", strip=True))
+    if not d.get("availability"):
+        el = soup.find(attrs={"itemprop": "availability"})
+        if el is not None:
+            d["availability"] = norm_availability(el.get("href") or el.get("content") or el.get_text(" ", strip=True))
     if not d.get("name"):
         d["name"] = meta(soup, "og:title") or (soup.h1.get_text(strip=True) if soup.h1 else None)
     if site.get("selectors"):
@@ -1656,20 +1676,24 @@ def cmd_scrape(args):
         log.warning("podano proxy, ale żaden wybrany sklep nie ma use_proxy (ustaw SCRAPER_PROXY_ALL=1, by użyć dla wszystkich)")
     in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
     summary = []
-    mode = (args.mode or "sitemap").lower()
-    if mode not in ("sitemap", "listing", "auto"):
-        raise SystemExit(f"Nieznany tryb {mode!r}: użyj sitemap, listing albo auto")
-    listing_names, sitemap_names, auto_names = [], [], []
+    mode = (args.mode or "smart").lower()
+    if mode not in ("smart", "sitemap", "listing", "auto"):
+        raise SystemExit(f"Nieznany tryb {mode!r}: użyj smart, sitemap, listing albo auto")
+    listing_names, sitemap_names, fallback_ok = [], [], []   # fallback_ok: sitemapa najpierw, a przy porażce kategorie
     for n in names:
-        m_ = (SITES[n].get("mode") or mode).lower()  # "mode" w konfiguracji sklepu ma pierwszeństwo
-        if m_ == "sitemap" or not SITES[n].get("listing"):
-            sitemap_names.append(n)
-        else:
+        m_ = (SITES[n].get("mode") or mode).lower()          # "mode" w konfiguracji sklepu ma pierwszeństwo
+        has_listing = bool(SITES[n].get("listing"))
+        if m_ == "listing" and has_listing:
             listing_names.append(n)
-            if m_ == "auto":
-                auto_names.append(n)
+        elif m_ == "auto" and has_listing:
+            listing_names.append(n)                           # auto: kategorie najpierw, sitemapa przy porażce
+        else:
+            sitemap_names.append(n)
+            if m_ == "smart" and has_listing:
+                fallback_ok.append(n)
+    auto_names = [n for n in listing_names if (SITES[n].get("mode") or mode).lower() == "auto"]
     forced = [n for n in names if SITES[n].get("mode")]
-    log.info("tryb: %s | listing: %d sklepów, sitemap: %d sklepów%s", mode, len(listing_names), len(sitemap_names),
+    log.info("tryb: %s | sitemapa: %d sklepów, kategorie: %d sklepów%s", mode, len(sitemap_names), len(listing_names),
              f" | tryb ustawiony w konfiguracji sklepu: {', '.join(n + '=' + SITES[n]['mode'] for n in forced)}" if forced else "")
     if listing_names:
         if in_actions:
@@ -1677,19 +1701,28 @@ def cmd_scrape(args):
         res = run_listing(con, listing_names, args)
         if in_actions:
             print("::endgroup::", flush=True)
-        if auto_names:  # sklepy w trybie auto, w których listing nic nie dał, przechodzą na sitemapę
-            fallback = [n for (n, _pages, st_) in res if n in auto_names and st_["produkty"] == 0]
-            if fallback:
-                log.warning("tryb auto: listing nie dał produktów dla %s - przechodzę na sitemapę", ", ".join(fallback))
-                res = [r for r in res if r[0] not in fallback]
-                sitemap_names += fallback
+        fallback = [n for (n, _p, st_) in res if n in auto_names and st_["produkty"] == 0]
+        if fallback:
+            log.warning("tryb auto: kategorie nie dały produktów dla %s - przechodzę na sitemapę", ", ".join(fallback))
+            res = [r for r in res if r[0] not in fallback]
+            sitemap_names += fallback
         summary += res
     if sitemap_names:
         if in_actions:
             print("::group::tryb sitemap", flush=True)
-        summary += run_sitemap(con, sitemap_names, args)
+        res = run_sitemap(con, sitemap_names, args)
         if in_actions:
             print("::endgroup::", flush=True)
+        fallback = [n for (n, _c, st_) in res if n in fallback_ok and st_["produkty"] == 0]
+        if fallback:
+            log.warning("tryb smart: sitemapa nie dała produktów dla %s - przechodzę na strony kategorii", ", ".join(fallback))
+            res = [r for r in res if r[0] not in fallback]
+            if in_actions:
+                print("::group::tryb listing (zapasowy)", flush=True)
+            res += run_listing(con, fallback, args)
+            if in_actions:
+                print("::endgroup::", flush=True)
+        summary += res
 
     if _suspicious:
         log.warning("PODEJRZANE ZMIANY CEN (skok >= 5x): %d szt. - jeśli to masowe, parser cen zawodzi dla jakiegoś sklepu",
@@ -1743,7 +1776,7 @@ def main():
     s.add_argument("--delay", type=float, default=DELAY, help="min. odstęp między zapytaniami do hosta (s)")
     s.add_argument("--proxy", action="append", help="adres proxy (http://user:haslo@host:port lub socks5://...), można podać wiele razy")
     s.add_argument("--proxy-file", help="plik z proxy, jedno na linię")
-    s.add_argument("--mode", default=env("SCRAPER_MODE", "sitemap"), help="sitemap (domyślnie) | listing | auto = listing, a gdy nic nie da - sitemapa; ENV: SCRAPER_MODE")
+    s.add_argument("--mode", default=env("SCRAPER_MODE", "smart"), help="smart (domyślnie) = sitemapa, a gdy się nie da - kategorie | sitemap | listing | auto = kategorie, a gdy nic nie da - sitemapa; ENV: SCRAPER_MODE")
     s.add_argument("--recheck", action="store_true", default=env("SCRAPER_RECHECK") == "1", help="sprawdź ponownie też adresy znane jako nie-produkty")
     s.set_defaults(fn=cmd_scrape)
     e = sub.add_parser("export")

@@ -282,7 +282,8 @@ SITES = {
             "categories": ["https://pironet.pl/sklep-z-fajerwerkami/"]},
     },
     "piroart": {
-        "base": "https://piroart.pl", "use_proxy": True, "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
+        "base": "https://piroart.pl", "use_proxy": True, "browser_ua": True,
+        "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
         "listing": {**_WOO, "name": "div.product__title h3", "link": "a.woocommerce-loop-product__link@href",
             "price": "span.current span.woocommerce-Price-amount",
             "categories": ["https://piroart.pl/hurtownia/"]},

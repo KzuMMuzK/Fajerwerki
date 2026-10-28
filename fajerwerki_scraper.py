@@ -67,7 +67,7 @@ def env(name, default=None):
     return v if v else default
 
 DB_PATH = env("SCRAPER_DB", "fajerwerki.db")  # w Actions: data/fajerwerki.db (prywatne repo z danymi)
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0" + (f" (+kontakt: {env('SCRAPER_CONTACT')})" if env("SCRAPER_CONTACT") else "")
+USER_AGENT = "Mozilla/5.0 (compatible; FajerwerkiPrices/1.0" + (f"; +kontakt: {env('SCRAPER_CONTACT')}" if env("SCRAPER_CONTACT") else "") + ")"
 # Kontakt (e-mail) idzie z sekretu SCRAPER_CONTACT - nie wpisuj go w kod.
 DELAY = float(env('SCRAPER_DELAY', 0.5))   # min. odstęp (s) między ZAPYTANIAMI do jednego hosta (wspólny dla wszystkich wątków)
 WORKERS = int(env('SCRAPER_WORKERS', 12))   # równoległe wątki -> max ok. 1/DELAY zapytań na sekundę do sklepu
@@ -282,8 +282,7 @@ SITES = {
             "categories": ["https://pironet.pl/sklep-z-fajerwerkami/"]},
     },
     "piroart": {
-        "base": "https://piroart.pl", "use_proxy": True, "browser_ua": True,
-        "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
+        "base": "https://piroart.pl", "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
         "listing": {**_WOO, "name": "div.product__title h3", "link": "a.woocommerce-loop-product__link@href",
             "price": "span.current span.woocommerce-Price-amount",
             "categories": ["https://piroart.pl/hurtownia/"]},
@@ -716,6 +715,7 @@ def _walk_sitemaps(roots, site, hdrs, info):
         if res is None:
             log.warning("  sitemapa niedostępna lub nieczytelna: %s (%s)", sm, getattr(_tls, "last_fail", "?"))
             info["failed"].append(sm)
+            info["reasons"].append(getattr(_tls, "last_fail", "?"))
             continue
         is_index, locs = res
         locs = [urljoin(sm, u) for u in locs]
@@ -735,7 +735,7 @@ def _walk_sitemaps(roots, site, hdrs, info):
 def sitemap_urls(site, info=None, name=""):
     """Adresy stron z sitemap sklepu: robots.txt (Sitemap:), a gdy brak - typowe lokalizacje."""
     info = info if info is not None else {}
-    info.update({"sitemaps": 0, "children": 0, "failed": [], "tried": []})
+    info.update({"sitemaps": 0, "children": 0, "failed": [], "reasons": [], "tried": []})
     hdrs = site_headers(name, site) if name else None
     base = site["base"].rstrip("/")
     roots = list(site.get("sitemaps", []))
@@ -1577,8 +1577,12 @@ def run_sitemap(con, names, args):
                     log.info("[%s] sitemapy: %d (indeksy: %d) | adresów: %d, w cache nie-produktów: %d, do sprawdzenia: %d",
                              n, info["sitemaps"], info["children"], info["total"], info["cached"], count)
                     if info["total"] == 0:
-                        extra = f"; nieczytelne: {len(info['failed'])}" if info["failed"] else ""
-                        problems.append((n, "brak adresów w sitemapie; sprawdzone: " + (", ".join(info["tried"][:5]) or "-") + extra))
+                        reasons = sorted(set(info["reasons"]))
+                        extra = f"; powód: {', '.join(reasons)}" if reasons else ""
+                        hint = (" | wskazówka: 403 = serwer odrzuca klienta (reguła na nazwę klienta albo blokada adresów serwerów GitHuba) - "
+                                "spróbuj SCRAPER_BROWSER_UA=" + n + " (nazwa przeglądarki), a jeśli to nie pomoże, proxy (use_proxy) albo pomiń sklep"
+                                if any("403" in r for r in reasons) else "")
+                        problems.append((n, "brak adresów w sitemapie; sprawdzone: " + (", ".join(info["tried"][:5]) or "-") + extra + hint))
                 elif kind == "res":
                     _, _, url, d, status, brief, grp = msg
                     nres += 1

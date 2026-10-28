@@ -67,7 +67,7 @@ def env(name, default=None):
     return v if v else default
 
 DB_PATH = env("SCRAPER_DB", "fajerwerki.db")  # w Actions: data/fajerwerki.db (prywatne repo z danymi)
-USER_AGENT = "FajerwerkiPriceBot/1.0" + (f" (+kontakt: {env('SCRAPER_CONTACT')})" if env("SCRAPER_CONTACT") else "")
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0" + (f" (+kontakt: {env('SCRAPER_CONTACT')})" if env("SCRAPER_CONTACT") else "")
 # Kontakt (e-mail) idzie z sekretu SCRAPER_CONTACT - nie wpisuj go w kod.
 DELAY = float(env('SCRAPER_DELAY', 0.5))   # min. odstęp (s) między ZAPYTANIAMI do jednego hosta (wspólny dla wszystkich wątków)
 WORKERS = int(env('SCRAPER_WORKERS', 12))   # równoległe wątki -> max ok. 1/DELAY zapytań na sekundę do sklepu

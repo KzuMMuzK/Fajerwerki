@@ -25,7 +25,7 @@ on:
         required: false
         default: ""
       mode:
-        description: "Tryb: sitemap (domyślnie, wszystkie sklepy przez sitemapy), listing (strony kategorii, szybko) albo auto"
+        description: "Tryb: smart (domyślnie: sitemapa, a gdy się nie da - kategorie), sitemap (tylko sitemapy), listing (tylko kategorie) albo auto"
         required: false
         default: ""
       free_proxy:

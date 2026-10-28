@@ -97,8 +97,8 @@ jobs:
           SCRAPER_WORKERS: ${{ inputs.workers }}
           SCRAPER_DELAY: ${{ inputs.delay }}
           # Sklepy, które blokują bota (403), mogą wymagać UA przeglądarki. Stałe ustawienie: Settings >
-          # Secrets and variables > Actions > zakładka Variables > SCRAPER_BROWSER_UA (np. lider,szopik)
-          SCRAPER_BROWSER_UA: ${{ inputs.browser_ua || vars.SCRAPER_BROWSER_UA }}
+          # Secrets and variables > Actions > Variables (albo Secrets) > SCRAPER_BROWSER_UA (np. lider,szopik)
+          SCRAPER_BROWSER_UA: ${{ inputs.browser_ua || vars.SCRAPER_BROWSER_UA || secrets.SCRAPER_BROWSER_UA }}
           SCRAPER_VERBOSE: ${{ inputs.verbose && '1' || '' }}
           SCRAPER_RECHECK: ${{ inputs.recheck && '1' || '' }}
           # Sekrety (Settings > Secrets and variables > Actions):

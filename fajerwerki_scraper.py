@@ -167,10 +167,10 @@ SITES = {
                 "https://www.arkafajerwerki.pl/pol_m_Pirotechnika-profesjonalna-i-sceniczna-304.html"]},
     },
     "lider": {
-        # Infinite scroll: /produkty ma tylko ~15 kafelków w HTML, reszta doładowuje się JS-em.
-        # Idziemy przez sitemap.xml (2787 adresów produktów).
         "base": "https://fajerwerkilider.pl",
         "mode": "sitemap",
+        "delay": 0.2,          # było domyślne 0.5 = 2.5x szybciej
+        "max_parallel": 24,    # więcej równoległych
         "headers": {"Referer": "https://fajerwerkilider.pl/",
                     "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"},
     },
@@ -377,6 +377,7 @@ SITES = {
     },
     "pironet": {
         "base": "https://pironet.pl",
+        "sitemaps": ["https://pironet.pl/product-sitemap.xml"],
         "listing": {"next": "{url}page/{page}/", "start": 1,
             "item": ["li.product", "div.product", "article.product"],
             "name": ["h3.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title"],
@@ -1106,6 +1107,10 @@ def _walk_sitemaps(roots, site, hdrs, info):
         if sm in seen:
             continue
         seen.add(sm)
+        # ODRZUĆ: sitemapy tagów/atrybutów/author/stron — nie zawierają produktów
+        if re.search(r"/(?:product[_-]?tag|post[_-]?tag|product_cat[_-]tag|tag[_-]sitemap|"
+                     r"author[_-]?sitemap|product_brand|product_shipping)", sm, re.I):
+            continue
         res = read_sitemap(sm, hdrs)
         if res is None:
             log.warning("  sitemapa niedostępna lub nieczytelna: %s (%s)", sm, getattr(_tls, "last_fail", "?"))

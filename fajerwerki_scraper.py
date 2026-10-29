@@ -1222,6 +1222,19 @@ def fmt_dur(sec):
     sec = int(sec)
     return f"{sec // 3600}h{sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60}m{sec % 60:02d}s"
 
+def _fmt_page(pattern, cat_url, page):
+    """Podstawia {url} i {page}, nie tworząc podwójnych slashy w ścieżce.
+    'https://x.pl/sklep/' + '{url}/page/{page}/' -> 'https://x.pl/sklep/page/2/'
+    'https://x.pl/sklep/' + '{url}page/{page}/'  -> 'https://x.pl/sklep/page/2/' (też OK)"""
+    u = pattern.replace("{page}", str(page))
+    cat = cat_url.rstrip("/") if "{url}/" in pattern else cat_url
+    u = u.replace("{url}", cat)
+    scheme, sep, rest = u.partition("://")
+    if sep:
+        rest = re.sub(r"/{2,}", "/", rest)
+        u = scheme + sep + rest
+    return u
+
 
 # ----------------------------- tryb LISTING ---------------------------------
 def _pick(el, spec):
@@ -1407,7 +1420,7 @@ def listing_category(name, site, cfg, cat_url, q, stats):
     try:
         while page < start + max_pages:
             pattern = first if (first and page == start) else nxt
-            url = pattern.format(url=cat_url, page=page)
+            url = _fmt_page(pattern, cat_url, page)
             _tls.last_fail = "?"
             r = get(url, stats, cookies=site.get("cookies"), headers=hdrs)
             if not r:
@@ -1442,8 +1455,16 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                 if not nxt_url or nxt_url in visited:
                     break
                 visited.add(nxt_url)
-                r = get(nxt_url, stats, cookies=site.get("cookies"), headers=hdrs)
+                r = None
+                for attempt in range(3):
+                    r = get(nxt_url, stats, cookies=site.get("cookies"), headers=hdrs)
+                    if r:
+                        break
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1))
                 if not r:
+                    log.warning("[%s] paginacja przez linki: strona %s nie dała się pobrać po 3 próbach - kończę "
+                                "(jeśli to nie koniec kategorii, zgłoś to jako problem sklepu)", name, nxt_url)
                     break
                 n_tiles, items = parse_listing(r.content, nxt_url, cfg)
                 new = [it for it in dict((it["url"], it) for it in items).values() if it["url"] not in seen]

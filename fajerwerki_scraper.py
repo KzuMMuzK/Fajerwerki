@@ -29,6 +29,17 @@ Jak to działa (tryb sitemap; tryb listing czyta strony kategorii - patrz SITES)
   3. Zapisuje do SQLite; nowy wpis w historii powstaje tylko gdy zmieni się
      cena lub dostępność.
   4. Szanuje robots.txt i robi odstępy między zapytaniami.
+
+Auto-discovery (nowe w tej wersji):
+  Każde uruchomienie, dla każdego sklepu w SITES bez pełnej konfiguracji "listing",
+  scraper próbuje wykryć wszystko sam:
+    a) platformę sklepu z HTML strony głównej (PrestaShop / WooCommerce / IdoSell / Shopify),
+    b) selektory CSS kafelka produktu (item/name/link/price/availability) - z szablonu platformy,
+    c) wzorzec paginacji (<link rel=next>, link "2", itd.),
+    d) adresy kategorii (sitemapa -> menu nawigacyjne -> heurystyka URL).
+  Dzięki temu nowy sklep dodaje się jednym wpisem: {"base": "https://sklep.pl"}.
+  Wystarczy w SITES podać "base" oraz opcje sieciowe (use_proxy, browser_ua, delay,
+  cookies, headers, max_parallel, mode, sitemaps). Ręczne selektory nie są potrzebne.
 """
 import argparse
 import contextlib
@@ -75,6 +86,10 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHT
 BROWSER_UA_SPEC = (env("SCRAPER_BROWSER_UA", "") or "").lower()
 NONPRODUCT_TTL_DAYS = 14
 
+# ---------------------------------------------------------------------------
+# Szablony selektorów dla platform sklepowych. Wykorzystywane przez autoconfig,
+# gdy sklep w SITES ma tylko "base" (bez ręcznych "listing"/selektorów).
+# ---------------------------------------------------------------------------
 _IDO = {"next": "{url}?counter={page}", "start": 0, "item": "div.product",
         "name": "a.product__name", "link": "a.product__name@href"}
 _IDO_OUT = "span.--disable, [data-product_disable='true']"
@@ -82,201 +97,33 @@ _WOO = {"next": "{url}page/{page}/", "start": 1, "item": "li.product"}
 _WOO_PRICE = ["ins .woocommerce-Price-amount", ".woocommerce-Price-amount"]
 _PRESTA = {"next": "{url}?page={page}", "start": 1}
 
-_LIDER = "https://fajerwerkilider.pl/pl/"
-_HAS = "https://fajerwerkigorzow.pl/produkty/hurtownia/"
-
+# Minimalistyczna konfiguracja: tylko base + opcje sieciowe. Reszta (listing,
+# selektory, kategorie, paginacja) wykrywana automatycznie przy każdym starcie.
 SITES = {
-    "odpalaj": {
-        "base": "https://odpalaj.pl",
-        "listing": {**_PRESTA, "categories": ["https://odpalaj.pl/pl/2-wszystko"],
-            "item": "article.product-miniature",
-            "name": "h2.product-title a", "link": "h2.product-title a@href", "price": "span.price",
-            "out_of_stock": "ul.product-flags li.out_of_stock", "out_text": ["brak na stanie"]},
-    },
-    "pirohit": {
-        "base": "https://pirohit.pl", "use_proxy": True, "max_parallel": 6, "browser_ua": True,
-        "mode": "listing",
-        "listing": {**_IDO, "price": "strong.price.--main", "in_stock": "button.add_to_basket__button",
-            "categories": [
-                "https://pirohit.pl/Petardy-i-emitery-dzwieku-c15", "https://pirohit.pl/Wyrzutnie-c20",
-                "https://pirohit.pl/Wulkany-Fontanny-c18", "https://pirohit.pl/Rakiety-c19",
-                "https://pirohit.pl/Compoud-Wyrzutnie-laczone-c50", "https://pirohit.pl/Dymy-c22",
-                "https://pirohit.pl/Race-i-Flary-c28", "https://pirohit.pl/Stroboskopy-c21",
-                "https://pirohit.pl/Piro-Bajery-c16", "https://pirohit.pl/Rzymskie-ognie-c30",
-                "https://pirohit.pl/Single-Shoty-Mozdzierze-c23", "https://pirohit.pl/Zimne-ognie-c31",
-                "https://pirohit.pl/Zestawy-Fajerwerkow-c32", "https://pirohit.pl/Artykuly-pirotechniczne-rozne-c24",
-                "https://pirohit.pl/Akcesoria-c25", "https://pirohit.pl/Zapalarki-i-zapalniczki-c29",
-                "https://pirohit.pl/Rakietnice-pistoletowe-c41", "https://pirohit.pl/Pistolety-i-rewolwery-hukowe-c43",
-                "https://pirohit.pl/pl/menu/granaty-reczne-asg-201.html"]},
-    },
-    "pyroking": {
-        "base": "https://www.pyroking.pl", "cookies": {"currency": "PLN"},
-        "listing": {
-            "categories": [
-                "https://www.pyroking.pl/WYRZUTNIE-c101", "https://www.pyroking.pl/RAKIETY-c95",
-                "https://www.pyroking.pl/PETARDY-c98", "https://www.pyroking.pl/RACE-I-FLARY-c23",
-                "https://www.pyroking.pl/GRANATY-DYMNE-c21", "https://www.pyroking.pl/RZYMSKIE-OGNIE-c96",
-                "https://www.pyroking.pl/SINGLE-SHOTY-c93", "https://www.pyroking.pl/PIROBAJERY-c104",
-                "https://www.pyroking.pl/ZIMNE-OGNIE-c102", "https://www.pyroking.pl/WULKANY-I-FONTANNY-c50",
-                "https://www.pyroking.pl/RACE-PISTOLETOWE-c99", "https://www.pyroking.pl/PALNIKI-I-ZAPALNICZKI-c94",
-                "https://www.pyroking.pl/strzelajace-diabelki", "https://www.pyroking.pl/fajerwerki-na-wesele",
-                "https://www.pyroking.pl/Granaty-ASG-c134"],
-            "first": "{url}", "next": "{url}/page/{page}/", "start": 1,
-            "item": "div.wd-product",
-            "name": ["h3 a", ".wd-entities-title a", "a"], "link": ["h3 a@href", ".wd-entities-title a@href", "a@href"],
-            "price": ["span.price ins .woocommerce-Price-amount", "span.price .woocommerce-Price-amount",
-                      ".woocommerce-Price-amount", "span.price"],
-            "out_of_stock": ".outofstock", "out_text": ["produkt niedostępny", "brak w magazynie"]},
-    },
-    "arka": {
-        "base": "https://www.arkafajerwerki.pl",
-        "listing": {**_IDO, "price": "strong.price", "out_of_stock": _IDO_OUT,
-            "categories": [
-                "https://www.arkafajerwerki.pl/pol_m_Fajerwerki-100.html",
-                "https://www.arkafajerwerki.pl/Promocja-spromo-pol.html",
-                "https://www.arkafajerwerki.pl/Nowosc-snewproducts-pol.html",
-                "https://www.arkafajerwerki.pl/pol_m_Pirotechnika-profesjonalna-i-sceniczna-304.html"]},
-    },
-    "lider": {
-        "base": "https://fajerwerkilider.pl",
-        "headers": {"Referer": "https://fajerwerkilider.pl/", "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"},
-        "listing": {"next": "{url}?page={page}", "start": 1,
-            "item": "a.group.relative.flex", "name": ["img@alt", "h3", "h2"], "link": "@href",
-            "price": "span[class*='font-semibold'][class*='text-[17px]']",
-            "out_text": ["niedostępn", "brak towaru", "powiadom"],
-            "categories": [_LIDER + x for x in (
-                "5-art-rozne-pirobajery", "61-ciche-fajerwerki",
-                "4-flary-i-race", "9-fontanny-fajerwerki-wulkany", "8-fontanny-tortowe-i-swieczki", "10-katiusze",
-                "471-miny-dymne", "12-mozdzierze", "452-odstraszacze-zwierzyny", "16-petardy",
-                "13-pirotechnika-profesjonalna", "14-pirotechnika-sceniczna", "17-pochodnie-parafinowe",
-                "menu/race-pistoletowe-229.html", "18-rakiety", "19-rzymskie-ognie", "436-single-shot-jednostrzaly",
-                "20-stroboskopy", "3-swiece-dymne", "11-tuby-strzelajace-konfetti", "menu/wyrzutnie-dzienne-230.html",
-                "21-wyrzutnie-fajerwerkow-baterie", "22-zestawy-fajerwerkow-do-samodzielnego-odpalenia",
-                "menu/wyrzutnie-hukowe-231.html", "23-zestawy-fajerwerkow", "24-zimne-ognie",
-                "menu/gatlingi-254.html")]},
-    },
-    "pyrostar": {
-        "base": "https://pyrostar.pl",
-        "listing": {**_IDO, "price": "strong.price.--main", "in_stock": "button.add_to_basket__button-listing",
-            "out_of_stock": "span.--disable", "categories": ["https://pyrostar.pl/pl/menu/oferta-232.html"]},
-    },
-    "pirozaur": {
-        "base": "https://www.pirozaur.pl", "delay": 1.0, "browser_ua": True,
-        "use_proxy": True, "max_parallel": 2,
-        "listing": {
-            "first": "{url}", "next": "{url}?page={page}", "start": 1,
-            "categories": ["https://www.pirozaur.pl/2-strona-glowna"],
-            "item": ["article.product-miniature", "article.js-product-miniature"],
-            "name": ["h2.product-title a", "h2.product-title", ".product-title a", ".product-title",
-                     "a.product-name"],
-            "link": ["h2.product-title a@href", "a.product-thumbnail@href", "a.thumbnail@href",
-                     ".product-title a@href", "a.product-name@href"],
-            "price": ["span.price", ".product-price .price", ".product-price"],
-            "out_of_stock": ".product-unavailable, li.out_of_stock, button[data-button-action='add-to-cart'][disabled]",
-            "out_text": ["nie ma takiej ilości", "wyprzedan", "brak w magazynie"],
-        },
-    },
-    "sklepzpetardami": {
-        "base": "https://sklepzpetardami.pl", "browser_ua": True,
-        "use_proxy": True, "max_parallel": 2,
-        "listing": {**_PRESTA,
-            "categories": ["https://sklepzpetardami.pl/kategoria-produktu/oferta/"],
-            "item": "article.product-miniature",
-            "name": "div.tvproduct-name a", "link": "div.tvproduct-name a@href", "price": "span.price",
-            "out_of_stock": "button.add-to-cart.tvproduct-out-of-stock, button.add-to-cart.disable, button.add-to-cart[disabled]"},
-    },
-    "piroman": {
-        "base": "https://piroman.pl",
-        "listing": {**_PRESTA, "item": "article.product-miniature",
-            "name": "h3.product-title a", "link": "h3.product-title a@href", "price": "span[itemprop=price]@content",
-            "out_of_stock": "button.add-to-cart.disabled, li.available_date",
-            "categories": ["https://piroman.pl/23-fajerwerki", "https://piroman.pl/10-strefa-kibica",
-                           "https://piroman.pl/24-odstraszanie-zwierzyny"]},
-    },
-    "hurtowniaas": {
-        "base": "https://fajerwerkigorzow.pl",
-        "listing": {"first": "{url}", "next": "{url}?product-page={page}", "start": 1, "item": "li.product",
-            "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
-            "price": _WOO_PRICE, "in_stock": ".instock",
-            "categories": ["https://fajerwerkigorzow.pl/produkty/nowe/"] + [_HAS + x + "/" for x in (
-                "hurtownia-petardy", "hurtownia-emitery-dzwieku", "hurtownia-wyrzutnie",
-                "hurtownia-race-pistoletowe-amunicja", "hurtownia-dymy-flary-stroboskopy", "hurtownia-fontanny",
-                "hurtownia-rzymskie-ognie", "hurtownia-rakiety-i-zestawy", "hurtownia-art-rozne",
-                "hurtownia-ciche-fajerwerki", "hurtownia-pirotechnika-na-wesela", "hurtownia-strefa-kibica",
-                "hurtownia-wybuchowa-niespodzianka")]},
-    },
-    "szopik": {
-        "base": "https://fajerwerki.shop.pl", "use_proxy": True,
-        "mode": "listing",
-        "listing": {"next": "{url}?counter={page}&p=5", "start": 0, "item": "product-tile",
-            "name": "a.link_no-underline", "link": "a.link_no-underline@href", "price": "span.price__value",
-            "out_text": ["niedostępn", "powiadom o dostępności", "powiadom mnie", "brak towaru", "wyprzedan"],
-            "categories": ["https://fajerwerki.shop.pl/pl/menu/" + x + ".html" for x in (
-                "single-shoty-mozdzierze-157", "palniki-zarowe-158", "rzymskie-ognie-159",
-                "wulkany-fontanny-160", "swiece-dymne-161",
-                "pirobajery-baczki-cyrkoblitze-162", "zimne-ognie-163", "rakiety-164",
-                "race-sygnalowe-startowce-165", "artykuly-weselne-party-gender-party-166",
-                "pirotechnika-sceniczna-167", "lonty-i-zapalniki-splonka-168", "gadzety-fun-gadzet-169",
-                "produkty-bez-rabatu-175", "singleline-183", "wyrzutnie-50mm-182",
-                "zestawy-zlozone-dso-compound-181", "katowe-wyrzutnie-189", "wyrzutnie-25-99-strzalow-190",
-                "wyrzutnie-100-500-strzalow-191", "wyrzutnie-1-25-strzalow-192", "tpro-show-193")]},
-    },
-    "pyrotech": {
-        "base": "https://hurtownia-fajerwerki.pl", "sitemaps": ["https://hurtownia-fajerwerki.pl/sitemap.xml.gz"],
-        "listing": {**_IDO, "price": "strong.price.--main", "out_of_stock": "span.--disable",
-            "categories": ["https://hurtownia-fajerwerki.pl/pol_m_Fajerwerki-157.html"]},
-    },
-    "pirozone": {
-        "base": "https://pirozone.pl", "delay": 0.7,
-        "browser_ua": True, "use_proxy": True, "max_parallel": 2,
-        "listing": {"next": "{url}page/{page}/?currency=PLN", "start": 1, "item": "li.product",
-            "name": ["h3.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title"],
-            "link": ["h3.woocommerce-loop-product__title a@href", "a.woocommerce-LoopProduct-link@href"],
-            "price": ["span.price ins bdi", "p.price ins bdi", "span.price bdi", "p.price bdi", "span.price", "p.price"],
-            "in_stock": ".instock", "out_of_stock": ".outofstock",
-            "categories": ["https://pirozone.pl/fajerwerki-menu-glowne/"]},
-    },
-    "firefactory": {
-        "base": "https://www.firefactory.pl",
-        "listing": {**_WOO, "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
-            "price": ["ins", "span.woocommerce-Price-amount"], "out_text": ["dowiedz się więcej"],
-            "categories": ["https://www.firefactory.pl/sklep/"]},
-    },
-    "obornicka": {
-        "base": "https://www.fajerwerki-obornicka.pl",
-        "listing": {**_WOO, "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
-            "price": ["span.price ins bdi", "span.price bdi"], "out_text": ["brak w magazynie"],
-            "categories": ["https://www.fajerwerki-obornicka.pl/home/sklep/"]},
-    },
-    "andrzej": {
-        "base": "https://piroandrzej.pl",
-    },
-    "pironet": {
-        "base": "https://pironet.pl",
-        "browser_ua": True, "use_proxy": True, "max_parallel": 2,
-        "listing": {**_WOO, "name": "h3.woocommerce-loop-product__title a",
-            "link": "h3.woocommerce-loop-product__title a@href",
-            "price": ["span.price ins bdi", "span.price bdi", "span.price"],
-            "out_of_stock": ".outofstock", "out_text": ["dowiedz się więcej"],
-            "categories": ["https://pironet.pl/sklep-z-fajerwerkami/"]},
-    },
-    "piroart": {
-        "base": "https://piroart.pl",
-        "use_proxy": True, "browser_ua": True, "max_parallel": 2,
-        "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
-        "listing": {**_WOO, "name": "div.product__title h3", "link": "a.woocommerce-loop-product__link@href",
-            "price": "span.current span.woocommerce-Price-amount",
-            "categories": ["https://piroart.pl/hurtownia/"]},
-    },
-    "petardyshop": {
-        "base": "https://petardyshop.pl", "delay": 0.2, "browser_ua": True,
-        "mode": "listing",
-        "listing": {**_WOO, "name": ["h2.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title a",
-                                      "h2.woocommerce-loop-product__title", "h3.woocommerce-loop-product__title"],
-            "link": ["a.woocommerce-LoopProduct-link@href", "a.woocommerce-loop-product__link@href"],
-            "price": _WOO_PRICE, "in_stock": ".instock", "out_of_stock": ".outofstock",
-            "categories": ["https://petardyshop.pl/sklep/"]},
-    },
+    "odpalaj":         {"base": "https://odpalaj.pl"},
+    "pirohit":         {"base": "https://pirohit.pl", "use_proxy": True, "max_parallel": 6, "browser_ua": True},
+    "pyroking":        {"base": "https://www.pyroking.pl", "cookies": {"currency": "PLN"}},
+    "arka":            {"base": "https://www.arkafajerwerki.pl"},
+    "lider":           {"base": "https://fajerwerkilider.pl",
+                        "headers": {"Referer": "https://fajerwerkilider.pl/",
+                                    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"}},
+    "pyrostar":        {"base": "https://pyrostar.pl"},
+    "pirozaur":        {"base": "https://www.pirozaur.pl", "delay": 1.0, "browser_ua": True, "max_parallel": 2},
+    "sklepzpetardami":{"base": "https://sklepzpetardami.pl", "browser_ua": True, "use_proxy": True, "max_parallel": 2},
+    "piroman":         {"base": "https://piroman.pl"},
+    "hurtowniaas":     {"base": "https://fajerwerkigorzow.pl"},
+    "szopik":          {"base": "https://fajerwerki.shop.pl", "use_proxy": True},
+    "pyrotech":        {"base": "https://hurtownia-fajerwerki.pl",
+                        "sitemaps": ["https://hurtownia-fajerwerki.pl/sitemap.xml.gz"]},
+    "pirozone":        {"base": "https://pirozone.pl", "delay": 0.7, "browser_ua": True,
+                        "use_proxy": True, "max_parallel": 2},
+    "firefactory":     {"base": "https://www.firefactory.pl"},
+    "obornicka":       {"base": "https://www.fajerwerki-obornicka.pl"},
+    "andrzej":         {"base": "https://piroandrzej.pl"},
+    "pironet":         {"base": "https://pironet.pl", "browser_ua": True, "use_proxy": True, "max_parallel": 2},
+    "piroart":         {"base": "https://piroart.pl", "use_proxy": True, "browser_ua": True, "max_parallel": 2,
+                        "sitemaps": ["https://piroart.pl/sitemap_index.xml"]},
+    "petardyshop":     {"base": "https://petardyshop.pl", "delay": 0.2, "browser_ua": True},
 }
 
 _tls = threading.local()
@@ -304,7 +151,7 @@ _gate_lock = threading.Lock()
 PROXIFLY_TXT_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt"
 _fallback_lock = threading.Lock()
 _last_fallback_fetch = 0.0
-FALLBACK_INTERVAL = 180  # min. sekundy między pobraniami z Proxifly
+FALLBACK_INTERVAL = 180
 
 
 class _AdaptiveGate:
@@ -445,13 +292,27 @@ def pick_proxy():
         return min(_proxies, key=lambda x: _proxy_dead.get(x, 0))
 
 
-def report_proxy(px, ok):
+def report_proxy(px, ok, dead=False):
+    """dead=True: natychmiastowa pauza (SSL, refused, 403 – proxy ewidentnie zły),
+    bez czekania na 3 błędy z rzędu."""
     if not px:
         return
     with _lock:
         if ok:
             _proxy_fail[px] = 0
             _proxy_dead.pop(px, None)
+            return
+        if dead:
+            _proxy_dead[px] = time.time() + PROXY_PAUSE
+            _proxy_fail[px] = 0
+            _proxy_strikes[px] += 1
+            if px in _free_proxies and _proxy_strikes[px] >= 2:
+                try:
+                    _proxies.remove(px)
+                except ValueError:
+                    pass
+                _free_proxies.discard(px)
+                _proxy_dead.pop(px, None)
             return
         _proxy_fail[px] += 1
         if _proxy_fail[px] >= PROXY_MAX_FAILS:
@@ -466,7 +327,7 @@ def report_proxy(px, ok):
                     pass
                 _free_proxies.discard(px)
                 _proxy_dead.pop(px, None)
-                log.debug("%s (darmowe) usunięte po powtarzających się błędach (zostało %d)", label, len(_proxies))
+                log.debug("%s (darmowe) usunięte (zostało %d)", label, len(_proxies))
             else:
                 log.debug("%s w pauzie %d s (aktywnych: %d z %d)",
                           mask(px), PROXY_PAUSE, _live_count(), len(_proxies))
@@ -485,7 +346,6 @@ def _socks_ok():
 
 
 def _do_fetch_proxifly(tag=""):
-    """Wewnętrzna: pobiera Proxifly bez sprawdzania _last_fallback_fetch (caller sprawdził)."""
     try:
         r = requests.get(PROXIFLY_TXT_URL, timeout=20, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
@@ -520,7 +380,6 @@ def _do_fetch_proxifly(tag=""):
 
 
 def fetch_proxifly_proxies(limit=200):
-    """Fallback: pobiera Proxifly. Throttle FALLBACK_INTERVAL."""
     global _last_fallback_fetch
     with _fallback_lock:
         if time.time() - _last_fallback_fetch < FALLBACK_INTERVAL:
@@ -531,12 +390,10 @@ def fetch_proxifly_proxies(limit=200):
 
 _403_lock = threading.Lock()
 _last_403_fetch = 0.0
-_403_INTERVAL = 120  # Proxifly z 403 handlera: max raz na 2 min
+_403_INTERVAL = 120
 
 
 def _on_403_detected():
-    """Wywoływane, gdy dowolny host zwróci 403 (blokada Cloudflare/Apache).
-    Pobiera świeże proxy z Proxifly w tle."""
     global _last_403_fetch
     now = time.time()
     with _403_lock:
@@ -751,6 +608,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     if _proxies and (PROXY_ALL or host in _proxy_hosts):
         retries = max(retries, min(8, _live_count() + 1))
     gate = _gate(host)
+    proxy_fails = 0
     for attempt in range(retries):
         ensure_fallback_proxies()
         throttle(host)
@@ -768,11 +626,12 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             code = r.status_code
             if code == 200:
                 report_proxy(px, True)
+                proxy_fails = 0
                 _maybe_ease(host, gate)
                 bump("pobrane_ok")
                 return r
             if code == 429:
-                report_proxy(px, True)  # proxy działa, tylko serwer rate-limituje
+                report_proxy(px, True)
                 wait = 5.0
                 ra = r.headers.get("Retry-After")
                 if ra:
@@ -789,15 +648,16 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             if code == 403:
                 bump("http_403")
                 _tls.last_fail = f"HTTP 403 (server: {r.headers.get('server', '?')})"
-                # trigger Proxifly fetch (raz na 2 min, w tle)
                 _on_403_detected()
                 if px is not None:
-                    # proxy dostał blokadę – oznacz jako podejrzane, próbuj kolejne
-                    report_proxy(px, False)
+                    report_proxy(px, False, dead=True)
+                    proxy_fails += 1
+                    if proxy_fails >= 20 and host in _proxy_hosts:
+                        _proxy_hosts.discard(host)
+                        log.warning("%s: 20 kolejnych 403 przez proxy – przełączam na direct", host)
                     _warn_rate_limited(host, "403",
                                        f"HTTP 403 przez {mask(px)} – próbuję kolejne proxy: {url}", every=60)
                     continue
-                # 403 bez proxy – może serwer blokuje direct IP, włącz proxy dla tego hosta
                 if _proxies and host not in _proxy_hosts:
                     log.warning("HTTP 403 bez proxy dla %s – włączam proxy dla tego hosta", host)
                     _proxy_hosts.add(host)
@@ -814,14 +674,43 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             _warn_rate_limited(host, f"http_{code}", f"HTTP {code} (próba {attempt + 1}/{retries}): {url}", every=30)
             if code >= 500:
                 _bump_delay(host, 1.5)
-        except (requests.Timeout, requests.ConnectionError) as e:
-            report_proxy(px, False)
+        except requests.exceptions.SSLError as e:
+            report_proxy(px, False, dead=True)
             last_err = short_err(e)
-            _bump_delay(host, 1.3, cap=10.0)
-            _warn_rate_limited(host, type(e).__name__,
-                               f"błąd sieci przez {mask(px)} (próba {attempt + 1}/{retries}): {url} | {last_err}", every=30)
+            proxy_fails += 1
+            if proxy_fails >= 20 and host in _proxy_hosts:
+                _proxy_hosts.discard(host)
+                log.warning("%s: 20 kolejnych SSL fails przez proxy – przełączam na direct", host)
+            _warn_rate_limited(host, "ssl_proxy",
+                               f"SSL przez {mask(px)} (zły proxy): {url}", every=60)
+            continue
+        except requests.Timeout as e:
+            report_proxy(px, False, dead=(px is not None))
+            last_err = short_err(e)
+            if px is None:
+                _bump_delay(host, 1.3, cap=10.0)
+            else:
+                proxy_fails += 1
+                if proxy_fails >= 20 and host in _proxy_hosts:
+                    _proxy_hosts.discard(host)
+                    log.warning("%s: 20 kolejnych timeoutów przez proxy – przełączam na direct", host)
+            _warn_rate_limited(host, "timeout",
+                               f"timeout przez {mask(px)} (próba {attempt + 1}/{retries}): {url}", every=30)
             if px is None and attempt >= 1:
                 break
+            continue
+        except requests.ConnectionError as e:
+            report_proxy(px, False, dead=(px is not None))
+            last_err = short_err(e)
+            if px is None:
+                _bump_delay(host, 1.3, cap=10.0)
+            else:
+                proxy_fails += 1
+                if proxy_fails >= 20 and host in _proxy_hosts:
+                    _proxy_hosts.discard(host)
+                    log.warning("%s: 20 kolejnych connection errors przez proxy – przełączam na direct", host)
+            _warn_rate_limited(host, type(e).__name__,
+                               f"błąd sieci przez {mask(px)} (próba {attempt + 1}/{retries}): {url} | {last_err}", every=30)
             continue
         except requests.RequestException as e:
             report_proxy(px, False)
@@ -834,7 +723,6 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     bump("nieudane")
     _tls.last_fail = f"nieudane po {retries} próbach ({last_err})"
     return None
-
 
 # ----------------------------- sitemap --------------------------------------
 SITEMAP_FALLBACKS = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap.xml.gz", "/sitemap_index.xml.gz", "/wp-sitemap.xml",
@@ -1019,6 +907,212 @@ def discover_categories(site, name, verbose=False, max_cats=100):
             return cat_urls
     log.warning("[%s] auto-discovery: nie znaleziono kategorii (ani sitemapa, ani menu)", name)
     return []
+
+
+# ---------------------------------------------------------------------------
+# Auto-detekcja platformy sklepu i selektorów kafelka (autoconfig).
+# Gdy w SITES jest tylko "base" (albo niepełny "listing"), ten kod próbuje
+# rozpoznać platformę z HTML i dobrać selektory z _PLATFORM_SELECTORS.
+# ---------------------------------------------------------------------------
+_PLATFORM_SELECTORS = {
+    "prestashop": {
+        "item": ["article.product-miniature", "article.js-product-miniature"],
+        "name": ["h2.product-title a", "h2.product-title", "h3.product-title a", ".product-title a", "a.product-name"],
+        "link": ["h2.product-title a@href", "h3.product-title a@href", "a.product-thumbnail@href",
+                 ".product-title a@href", "a.product-name@href"],
+        "price": ["span.price", ".product-price .price", ".product-price"],
+        "out_of_stock": ".product-unavailable, li.out_of_stock, button[data-button-action='add-to-cart'][disabled]",
+        "out_text": ["nie ma takiej ilości", "wyprzedan", "brak w magazynie"],
+        "next": "{url}?page={page}", "start": 1,
+    },
+    "woocommerce": {
+        "item": "li.product",
+        "name": ["h2.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title a",
+                 "h2.woocommerce-loop-product__title", "h3.woocommerce-loop-product__title"],
+        "link": ["a.woocommerce-LoopProduct-link@href", "a.woocommerce-loop-product__link@href"],
+        "price": ["ins .woocommerce-Price-amount", ".woocommerce-Price-amount", "span.price"],
+        "in_stock": ".instock", "out_of_stock": ".outofstock",
+        "next": "{url}page/{page}/", "start": 1,
+    },
+    "idosell": {
+        "item": "div.product",
+        "name": ["a.product__name", "a.product-name"],
+        "link": ["a.product__name@href", "a.product-name@href"],
+        "price": ["strong.price.--main", "strong.price", ".price"],
+        "in_stock": "button.add_to_basket__button",
+        "out_of_stock": _IDO_OUT,
+        "next": "{url}?counter={page}", "start": 0,
+    },
+    "shopify": {
+        "item": ["li.grid__item", ".product-card", "[data-product-id]"],
+        "name": ["h3 a", ".card__heading a", ".product-card__title a", "h2 a"],
+        "link": ["h3 a@href", ".card__heading a@href", ".product-card__title a@href", "h2 a@href"],
+        "price": [".price-item--regular", ".price__regular .price-item", ".price"],
+        "next": "{url}?page={page}", "start": 1,
+    },
+}
+
+
+def detect_platform(html_bytes):
+    """Rozpoznaje platformę sklepu z HTML. Zwraca 'prestashop'/'woocommerce'/'idosell'/'shopify' albo None."""
+    if not html_bytes:
+        return None
+    head = html_bytes[:200000]
+    try:
+        soup = BeautifulSoup(head, "lxml")
+    except Exception:
+        return None
+    gen = soup.find("meta", attrs={"name": "generator"})
+    gen_c = (gen.get("content") or "").lower() if gen else ""
+    if b"cdn.shopify.com" in head or "shopify" in gen_c:
+        return "shopify"
+    if ("prestashop" in gen_c
+            or soup.select_one("body#category")
+            or soup.select_one("body#product")
+            or soup.select_one("article.product-miniature")
+            or soup.select_one("script[src*='prestashop']")):
+        return "prestashop"
+    if (soup.select_one("body.woocommerce")
+            or soup.select_one("body.woocommerce-page")
+            or soup.select_one("li.product a.woocommerce-LoopProduct-link")):
+        return "woocommerce"
+    if (b"idosell" in head[:50000]
+            or soup.select_one("a.product__name")
+            or soup.select_one("form.products-list")):
+        return "idosell"
+    return None
+
+
+def detect_pagination_pattern(html_bytes, category_url):
+    """Zwraca (next_template, start) albo None - wyciąga wzorzec paginacji z HTML."""
+    try:
+        soup = BeautifulSoup(html_bytes, "lxml")
+        cand_url = None
+        ln = soup.find("link", attrs={"rel": "next"}) or soup.find("a", attrs={"rel": "next"})
+        if ln is not None and ln.get("href"):
+            cand_url = urljoin(category_url, ln["href"])
+        if not cand_url:
+            for a in soup.find_all("a", href=True):
+                if a.get_text(strip=True) == "2":
+                    cand_url = urljoin(category_url, a["href"])
+                    break
+        if not cand_url:
+            return None
+        if "/page/2/" in cand_url or cand_url.rstrip("/").endswith("/page/2"):
+            return "{url}page/{page}/", 1
+        if "?page=2" in cand_url or "&page=2" in cand_url:
+            return "{url}?page={page}", 1
+        if "?p=2" in cand_url or "&p=2" in cand_url:
+            return "{url}?p={page}", 1
+        if "?counter=2" in cand_url or "&counter=2" in cand_url:
+            return "{url}?counter={page}", 2
+        if "product-page=2" in cand_url:
+            return "{url}?product-page={page}", 1
+        return None
+    except Exception:
+        return None
+
+
+def _count_tiles(html_bytes, item_sel):
+    """Pomocnik: ile kafelków pasuje do selektora (do wyboru najlepszego kandydata)."""
+    if not html_bytes or not item_sel:
+        return 0
+    try:
+        soup = BeautifulSoup(html_bytes, "lxml")
+    except Exception:
+        return 0
+    sels = [item_sel] if isinstance(item_sel, str) else item_sel
+    for s in sels:
+        try:
+            n = len(soup.select(s))
+        except Exception:
+            n = 0
+        if n:
+            return n
+    return 0
+
+
+def autoconfigure_all(names, verbose=False):
+    """Pełen auto-discovery konfiguracji każdego sklepu.
+    1. Pobiera stronę główną.
+    2. Wykrywa platformę (prestashop/woocommerce/idosell/shopify).
+    3. Uzupełnia selektory z _PLATFORM_SELECTORS (nie nadpisując ręcznych).
+    4. Znajduje kategorie (sitemap -> menu).
+    5. Pobiera pierwszą kategorię i wykrywa wzorzec paginacji.
+    6. Weryfikuje selektory kafelka - jeśli platforma źle trafiła, próbuje innych.
+    """
+    for n in names:
+        site = SITES[n]
+        lc = site.setdefault("listing", {})
+        log.info("[%s] autoconfig: start", n)
+
+        hdrs = site_headers(n, site)
+        base = site["base"].rstrip("/")
+
+        # 1. Strona główna - platforma + (jeśli trzeba) menu kategorii
+        home_r = get(base + "/", cookies=site.get("cookies"), headers=hdrs)
+        if not home_r:
+            log.warning("[%s] autoconfig: nie udało się pobrać strony głównej (%s)", n, _tls.last_fail)
+            continue
+
+        platform = detect_platform(home_r.content)
+        log.info("[%s] autoconfig: platforma = %s", n, platform or "nieznana")
+
+        # 2. Uzupełnij selektory z platformy (tylko brakujące)
+        if platform and platform in _PLATFORM_SELECTORS:
+            defaults = _PLATFORM_SELECTORS[platform]
+            added = []
+            for k, v in defaults.items():
+                if k not in lc or lc.get(k) in (None, "", [], {}):
+                    lc[k] = v
+                    added.append(k)
+            if added:
+                log.info("[%s] autoconfig: selektory z %r: %s", n, platform, ", ".join(added))
+
+        # 3. Kategorie: sitemap lub menu
+        cats = discover_categories(site, n, verbose=verbose)
+        if not cats:
+            log.warning("[%s] autoconfig: brak kategorii - sklep pominięty w trybie listing", n)
+            continue
+        lc["categories"] = cats
+        log.info("[%s] autoconfig: kategorie = %d adresów", n, len(cats))
+
+        # 4. Paginacja: pobierz pierwszą kategorię, wykryj wzorzec
+        first_cat = cats[0]
+        cat_r = get(first_cat, cookies=site.get("cookies"), headers=hdrs)
+        if cat_r:
+            if not lc.get("next"):
+                pag = detect_pagination_pattern(cat_r.content, first_cat)
+                if pag:
+                    lc["next"], lc["start"] = pag
+                    log.info("[%s] autoconfig: paginacja = %r start=%d", n, lc["next"], lc["start"])
+                else:
+                    # brak wykrytej paginacji - fallback na typowe wzorce
+                    lc.setdefault("next", "{url}?page={page}")
+                    lc.setdefault("start", 1)
+                    log.info("[%s] autoconfig: paginacja = domyślna ?page=N", n)
+            # 5. Weryfikacja kafelka - jeśli nasz item nie łapie nic, spróbuj inne platformy
+            cur_item_n = _count_tiles(cat_r.content, lc.get("item"))
+            if cur_item_n == 0:
+                log.info("[%s] autoconfig: selektor kafelka nie łapie - sprawdzam kandydatów", n)
+                for plat, defaults in _PLATFORM_SELECTORS.items():
+                    if plat == platform:
+                        continue
+                    candidate_item = defaults.get("item")
+                    n_tiles = _count_tiles(cat_r.content, candidate_item)
+                    if n_tiles > 0:
+                        log.info("[%s] autoconfig: platforma %r pasuje (%d kafelków) - przełączam",
+                                 n, plat, n_tiles)
+                        for k, v in defaults.items():
+                            if k not in lc or lc.get(k) in (None, "", [], {}):
+                                lc[k] = v
+                        break
+            else:
+                log.debug("[%s] autoconfig: selektor kafelka OK (%d szt.)", n, cur_item_n)
+
+        if verbose:
+            log.debug("[%s] autoconfig gotowe: item=%r name=%r price=%r next=%r start=%r",
+                      n, lc.get("item"), lc.get("name"), lc.get("price"), lc.get("next"), lc.get("start"))
 
 
 # ----------------------------- parsowanie -----------------------------------
@@ -1544,7 +1638,24 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                 if page == start:
                     reason = _tls.last_fail
                     log.warning("[%s] kategoria niedostępna (%s): %s", name, reason, url)
-                break
+                    break
+                if _tls.last_fail.startswith("HTTP 404") or _tls.last_fail.startswith("HTTP 410"):
+                    break
+                recovered = False
+                for _retry in range(3):
+                    time.sleep(4 * (_retry + 1))
+                    _tls.last_fail = "?"
+                    r = get(url, stats, cookies=site.get("cookies"), headers=hdrs)
+                    if r:
+                        recovered = True
+                        log.info("[%s] %s: strona %d za %d. dodatkową próbą – kontynuuję",
+                                 name, cat_url.rstrip("/").rsplit("/", 1)[-1], page, _retry + 1)
+                        break
+                if not recovered:
+                    log.warning("[%s] %s: strona %d nie dała się pobrać po 3 dodatkowych próbach (%s) – kończę kategorię",
+                                name, cat_url.rstrip("/").rsplit("/", 1)[-1], page, _tls.last_fail)
+                    reason = f"paginacja przerwana na stronie {page}"
+                    break
             last_r = r
             n_tiles, items = parse_listing(r.content, url, cfg)
             new, on_page = [], set()
@@ -1586,14 +1697,17 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                     break
                 visited.add(nxt_url)
                 r = None
-                for attempt in range(3):
+                for attempt in range(5):
+                    _tls.last_fail = "?"
                     r = get(nxt_url, stats, cookies=site.get("cookies"), headers=hdrs)
                     if r:
                         break
-                    if attempt < 2:
-                        time.sleep(2 * (attempt + 1))
+                    if _tls.last_fail.startswith("HTTP 404") or _tls.last_fail.startswith("HTTP 410"):
+                        break
+                    if attempt < 4:
+                        time.sleep(3 * (attempt + 1))
                 if not r:
-                    log.warning("[%s] paginacja przez linki: %s nie dała się pobrać po 3 próbach – kończę",
+                    log.warning("[%s] paginacja przez linki: %s nie dała się pobrać po 5 próbach – kończę",
                                 name, nxt_url)
                     break
                 n_tiles, items = parse_listing(r.content, nxt_url, cfg)
@@ -1918,7 +2032,6 @@ def cmd_scrape(args):
     for n in names:
         site = SITES[n]
         hosts = {urlparse(site["base"]).netloc}
-        hosts |= {urlparse(c).netloc for c in site.get("listing", {}).get("categories", [])}
         for h in hosts:
             if site.get("delay"):
                 _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
@@ -1926,21 +2039,22 @@ def cmd_scrape(args):
                 _proxy_hosts.add(h)
                 _host_sem[h] = threading.Semaphore(int(site.get("max_parallel", 4)))
 
-        listing_cfg = site.get("listing")
-        if (listing_cfg is not None
-                and not listing_cfg.get("categories")
-                and site.get("auto_categories") is not False):
-            log.info("[%s] auto-discovery kategorii...", n)
-            auto = discover_categories(site, n, verbose=args.verbose)
-            if auto:
-                listing_cfg["categories"] = auto
-                log.info("[%s] auto-kategorie: ustawiono %d adresów", n, len(auto))
-                for u in auto:
-                    h = urlparse(u).netloc
-                    if site.get("delay"):
-                        _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
-                    if site.get("use_proxy"):
-                        _proxy_hosts.add(h)
+    # AUTO-DISCOVERY: dla każdego sklepu wykryj platformę, selektory, paginację i kategorie.
+    # Działa dla sklepów bez pełnej konfiguracji w SITES (tylko base + opcje sieciowe).
+    if not getattr(args, "no_autoconfig", False):
+        autoconfigure_all(names, verbose=args.verbose)
+
+    # Rejestracja dodatkowych hostów z auto-wykrytych kategorii (proxy/delay per host).
+    for n in names:
+        site = SITES[n]
+        lc = site.get("listing") or {}
+        for c in lc.get("categories", []):
+            h = urlparse(c).netloc
+            if site.get("delay"):
+                _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
+            if site.get("use_proxy"):
+                _proxy_hosts.add(h)
+                _host_sem.setdefault(h, threading.Semaphore(int(site.get("max_parallel", 4))))
 
     if (env("SCRAPER_PROXY_SOURCE", "") or "").lower() == "geonode":
         targets = free_proxy_targets(names)
@@ -2063,6 +2177,9 @@ def main():
     s.add_argument("--proxy-file")
     s.add_argument("--mode", default=env("SCRAPER_MODE", "auto"))
     s.add_argument("--recheck", action="store_true", default=env("SCRAPER_RECHECK") == "1")
+    s.add_argument("--no-autoconfig", action="store_true",
+                   help="wyłącz automatyczne wykrywanie platformy/selektorów/kategorii "
+                        "(zostaw tylko to, co jest w SITES)")
     s.set_defaults(fn=cmd_scrape)
     e = sub.add_parser("export")
     e.add_argument("path")

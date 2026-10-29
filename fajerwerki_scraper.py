@@ -111,9 +111,12 @@ SITES = {
     "pirohit":         {"base": "https://pirohit.pl", "use_proxy": True, "max_parallel": 6, "browser_ua": True},
     "pyroking":        {"base": "https://www.pyroking.pl", "cookies": {"currency": "PLN"}},
     "arka":            {"base": "https://www.arkafajerwerki.pl"},
-    "lider":           {"base": "https://fajerwerkilider.pl",
-                        "headers": {"Referer": "https://fajerwerkilider.pl/",
-                                    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"}},
+    "lider": {
+        "base": "https://fajerwerkilider.pl",
+        "mode": "sitemap",   # infinite scroll — listing HTML nie zadziała
+        "headers": {"Referer": "https://fajerwerkilider.pl/",
+                    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"},
+    },
     "pyrostar":        {"base": "https://pyrostar.pl"},
     "pirozaur":        {"base": "https://www.pirozaur.pl", "delay": 1.0, "browser_ua": True, "max_parallel": 2},
     "sklepzpetardami":{"base": "https://sklepzpetardami.pl", "browser_ua": True, "use_proxy": True, "max_parallel": 2},

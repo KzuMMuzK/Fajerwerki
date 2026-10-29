@@ -985,8 +985,8 @@ _NOT_CATEGORY_PATTERNS = re.compile(
     r"search|szukaj|wyniki-wyszukiwania|"
     r"page/\d+|strona/\d+"
     r")/|(?:^|/)page/\d+/?$|uncategorized|bez-kategorii)",
-    r"|logowanie|login|register|rejestracja|password|haslo|checkout|zamowienie|order|newsletter|"
-    r"|fajerwerki-(katowice|warszawa|krakow|wroclaw|poznan|gdansk|gdynia|lodz|szczecin|lublin|bydgoszcz|torun|radom|kielce|rzeszow|olsztyn|czestochowa|gliwice|zabrze|bialystok|konin|pila|wejherowo|tarnobrzeg|opole|zielona-gora)"
+    r"|logowanie|login|register|rejestracja|password|haslo|checkout|zamowienie|order|newsletter|",
+    r"|fajerwerki-(katowice|warszawa|krakow|wroclaw|poznan|gdansk|gdynia|lodz|szczecin|lublin|bydgoszcz|torun|radom|kielce|rzeszow|olsztyn|czestochowa|gliwice|zabrze|bialystok|konin|pila|wejherowo|tarnobrzeg|opole|zielona-gora)",
     re.I,
 )
 

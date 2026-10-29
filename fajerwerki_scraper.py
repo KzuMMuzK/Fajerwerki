@@ -246,10 +246,11 @@ SITES = {
         # Shoper: paginacja {url}/{page} (bez ?page=), item product-tile (web component)
         "base": "https://fajerwerki.shop.pl", "use_proxy": True,
         "mode": "listing",
+        "browser_ua": True,
         "listing": {"next": "{url}/{page}", "start": 1,
             "item": ["product-tile.product-tile", "product-tile"],
-            "name": ["h3.product-tile__name", "a.link_no-underline"],
-            "link": ["a.link_no-underline@href"],
+            "name": ["h3.product-tile__name", "a.link_no-underline", "h2", "h3"],
+            "link": ["a.link_no-underline@href", "a[href*='.html']@href", "a@href"],
             "price": ["span.price__value.price__value_bold", "span.price__value"],
             "out_text": ["niedostępn", "powiadom o dostępności", "powiadom mnie", "brak towaru", "wyprzedan"],
             "categories": [
@@ -305,6 +306,7 @@ SITES = {
     "pirozone": {
         # item li.product, name z a.product-title (motyw custom z rating)
         "base": "https://pirozone.pl", "delay": 0.7,
+        "browser_ua": True,
         "listing": {"next": "{url}page/{page}/", "start": 1,
             "item": "li.product",
             "name": ["a.product-title", "h3.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title"],
@@ -383,7 +385,7 @@ SITES = {
         "use_proxy": True, "max_parallel": 2,
         "delay": 1.0,                           # wolno, żeby nie dostać 429
         "sitemaps": ["https://pironet.pl/product-sitemap.xml"],   # TYLKO produkty, bez tagów
-        "url_regex": r"^https://pironet\.pl/sklep/[^/]+/[^/]+/?$",  # tylko polska wersja /sklep/<kategoria>/<produkt>/
+        "url_regex": r"^https://pironet\.pl/sklep/[^/]+/?$",  # /sklep/<slug-produktu>/
     },
     "piroart": {
         # item li.product (fallback li), name a[href] (pierwszy z tekstem)
@@ -444,6 +446,7 @@ PROXY_PAUSE = 120
 # --- Adaptacyjne tempo per host ---------------------------------------------
 _host_delay = {}
 _host_last_ease = {}
+_host_successes = Counter()      # licznik sukcesów z rzędu (do resetu delay)
 _warn_last = {}
 _warn_count = Counter()
 _host_gate = {}
@@ -499,18 +502,19 @@ def _bump_delay(host, factor, cap=20.0):
         if new > cur * 1.1:
             log.debug("spowalniam %s: %.2fs → %.2fs", host, cur, new)
         _host_delay[host] = new
+        _host_successes[host] = 0
 
 
 def _maybe_ease(host, gate):
     with _lock:
         now = time.time()
-        if now - _host_last_ease.get(host, 0) < 5.0:
+        if now - _host_last_ease.get(host, 0) < 1.0:
             return
         _host_last_ease[host] = now
         base = _base_delay(host)
         cur = _host_delay.get(host, base)
         if cur > base * 1.02:
-            _host_delay[host] = max(base, cur * 0.7)
+            _host_delay[host] = max(base, cur * 0.5)
     if gate.max < WORKERS:
         gate.grow(min(WORKERS, gate.max + 1))
 
@@ -572,7 +576,8 @@ def setup_proxies(args):
 
 def _live_count():
     now = time.time()
-    return sum(1 for px in _proxies if _proxy_dead.get(px, 0) <= now)
+    with _lock:
+        return sum(1 for px in _proxies if _proxy_dead.get(px, 0) <= now)
 
 
 def _is_safe_proxy_for_https(px):
@@ -664,13 +669,18 @@ _403_lock = threading.Lock()
 _last_403_fetch = 0.0
 _403_INTERVAL = 120
 
+_socks_cached = None
+
 
 def _socks_ok():
-    try:
-        import socks  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    global _socks_cached
+    if _socks_cached is None:
+        try:
+            import socks  # noqa: F401
+            _socks_cached = True
+        except ImportError:
+            _socks_cached = False
+    return _socks_cached
 
 
 def _do_fetch_proxifly(tag=""):
@@ -964,7 +974,12 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                 report_proxy(px, True)
                 proxy_fails = 0
                 with _lock:
-                    _host_proxy_fails[host] = 0   # reset
+                    _host_proxy_fails[host] = 0
+                    _host_successes[host] += 1
+                    base_d = _base_delay(host)
+                    if _host_successes[host] >= 10 and _host_delay.get(host, base_d) > base_d * 2:
+                        _host_delay[host] = base_d
+                        _host_successes[host] = 0
                 _maybe_ease(host, gate)
                 bump("pobrane_ok")
                 return r
@@ -981,6 +996,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                 gate.shrink(max(2, gate.max // 2))
                 _warn_rate_limited(host, "429", f"HTTP 429 {host} – spowalniam, czekam {wait:.0f}s")
                 bump("http_429")
+                last_err = f"HTTP 429 (retry after {wait:.0f}s)"
                 time.sleep(min(wait, 20.0))
                 continue
             if code == 403:
@@ -999,7 +1015,8 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                 if _proxies and host not in _proxy_hosts:
                     log.warning("HTTP 403 bez proxy dla %s – włączam proxy dla tego hosta", host)
                     _proxy_hosts.add(host)
-                    _host_sem.setdefault(host, threading.Semaphore(4))
+                    if host not in _host_sem:
+                        _host_sem[host] = threading.Semaphore(4)
                     continue
                 log.debug("HTTP 403 (bez proxy, brak proxy do przełączenia): %s", url)
                 return None
@@ -1011,7 +1028,8 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             last_err = f"HTTP {code}"
             _warn_rate_limited(host, f"http_{code}", f"HTTP {code} (próba {attempt + 1}/{retries}): {url}", every=30)
             if code >= 500:
-                _bump_delay(host, 1.5)
+                # nie bumpujemy delay - to błąd serwera, nie rate-limit
+                pass
         except requests.exceptions.SSLError as e:
             report_proxy(px, False, dead=True)
             last_err = short_err(e)
@@ -1156,7 +1174,11 @@ def sitemap_urls(site, info=None, name=""):
     pattern = site.get("url_regex")
     if pattern:
         before = len(out)
-        out = [u for u in out if re.search(pattern, u)]
+        filtered = [u for u in out if re.search(pattern, u)]
+        if not filtered and out:
+            log.warning("  url_regex nie pasuje do ŻADNEGO z %d adresów, przykłady: %s",
+                        before, ", ".join(out[:3]))
+        out = filtered
         log.info("  filtr url_regex: %d -> %d adresów", before, len(out))
     return list(dict.fromkeys(out))
 
@@ -1180,7 +1202,7 @@ def parse_price(text):
         whole, frac = (tok[:dec.start()], dec.group(1)) if dec else (tok, "")
         whole = re.sub(r"[ \u00a0\u202f.,]", "", whole)
         v = float(f"{whole}.{frac or '0'}")
-    return v if 0 < v < 1_000_000 else None
+    return round(v, 2) if 0 < v < 1_000_000 else None
 
 
 def norm_availability(raw):
@@ -1208,6 +1230,7 @@ def walk_jsonld(node):
             return
         if "ItemList" in types:
             yield {"@type": "ItemList", "n": len(node.get("itemListElement") or [])}
+            return  # NIE schodź w itemListElement - to rekomendacje, nie produkty strony
         for v in node.values():
             if isinstance(v, (list, dict)):
                 yield from walk_jsonld(v)
@@ -1445,11 +1468,23 @@ def save(con, site_name, url, d):
     last = con.execute("SELECT price, availability FROM prices WHERE url=? "
                        "ORDER BY id DESC LIMIT 1", (url,)).fetchone()
     cur = (d["price"], d.get("availability"))
+    # porównanie z tolerancją - float po round-tripie przez SQLite może się różnić
+    if last is not None:
+        changed = False
+        if last[0] is not None and d["price"] is not None:
+            if abs(last[0] - d["price"]) > 0.005:
+                changed = True
+        elif last[0] != d["price"]:
+            changed = True
+        if last[1] != d.get("availability"):
+            changed = True
+    else:
+        changed = True
     if last and last[0] and d["price"] and (d["price"] / last[0] >= 5 or d["price"] / last[0] <= 0.2):
         _suspicious.append((url, last[0], d["price"]))
         if len(_suspicious) <= 25:
             log.warning("PODEJRZANA ZMIANA CENY %.2f -> %.2f | %s | %s", last[0], d["price"], d["name"], url)
-    if last != cur:
+    if changed:
         con.execute("INSERT INTO prices(url,ts,price,currency,availability) VALUES(?,?,?,?,?)",
                     (url, now, d["price"], d.get("currency", "PLN"), d.get("availability")))
         return True
@@ -1486,6 +1521,8 @@ def _pick(el, spec):
     if not spec:
         return None
     for one in ([spec] if isinstance(spec, str) else spec):
+        if not isinstance(one, str):
+            continue
         css, attr = one, None
         m = re.match(r"^(.*)@([\w-]+)$", one)
         if m:
@@ -1643,6 +1680,7 @@ def find_next_link(content, cur_url, ordinal):
         anchors = soup.find_all("a", href=True)
         cands += [a["href"] for a in anchors if a.get_text(strip=True) == str(ordinal + 1)]
         cands += [a["href"] for a in anchors if a.get_text(strip=True).lower() in _NEXT_TEXTS]
+        cands += [a["href"] for a in anchors if "następn" in (a.get("aria-label") or "").lower()]
         for href in cands:
             href = href.strip()
             if not href or href.startswith(("#", "javascript:")):
@@ -1685,7 +1723,7 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                           + " | paginacja: " + (pagination_hint(r.content) or "?"))
                 log.warning("[%s] %s | %s", name, reason, url)
             elif page == start and n_tiles and not items:
-                reason = f"{n_tiles} kafelków, ale selektory name/link nic nie wyciągają"
+                reason = f"{n_tiles} kafelków, ale selektory name/link nic nie wyciągają | np. {outline(tiles[0]) if (tiles := __import__('bs4').BeautifulSoup(r.content, 'lxml').select(cfg['item'] if isinstance(cfg['item'], str) else cfg['item'][0])) else '?'}"
                 log.warning("[%s] %s: %s", name, reason, url)
             if not new:
                 break
@@ -1867,7 +1905,10 @@ def sitemap_driver(name, site, known_np, args, q):
         q.put(("plan", name, len(urls), info, gets))
         pool = ThreadPoolExecutor(max_workers=args.workers)
         try:
-            for url, d, status, brief, grp in pool.map(lambda u: fetch_one(u, site, gets, hdrs, skip), urls):
+            # as_completed zamiast map: nie blokujemy na najwolniejszym URL-u.
+            futs = {pool.submit(fetch_one, u, site, gets, hdrs, skip): u for u in urls}
+            for fut in as_completed(futs):
+                url, d, status, brief, grp = fut.result()
                 gs = gstat.setdefault(grp, [0, 0])
                 if status == "ok":
                     gs[0] += 1
@@ -2024,122 +2065,133 @@ def cmd_scrape(args):
     DELAY = args.delay
     setup_proxies(args)
     con = db()
-    names = resolve_sites(args)
-    for n in names:
-        site = SITES[n]
-        hosts = {urlparse(site["base"]).netloc}
-        hosts |= {urlparse(c).netloc for c in site.get("listing", {}).get("categories", [])}
-        for h in hosts:
-            if site.get("delay"):
-                _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
-            if site.get("use_proxy"):
-                _proxy_hosts.add(h)
-                _host_sem[h] = threading.Semaphore(int(site.get("max_parallel", 4)))
-    if (env("SCRAPER_PROXY_SOURCE", "") or "").lower() == "geonode":
-        targets = free_proxy_targets(names)
-        if not targets:
-            log.info("darmowe proxy: żaden z wybranych sklepów nie ma use_proxy - pomijam")
-        else:
-            countries = tuple(c.strip().upper() for c in (env("SCRAPER_PROXY_COUNTRY", "") or "").split(",") if c.strip())
-            acquire_free_proxies(targets, countries=countries)
-            start_free_refresher(targets, countries)
-    if _proxies and not PROXY_ALL and not _proxy_hosts:
-        log.warning("podano proxy, ale żaden wybrany sklep nie ma use_proxy (ustaw SCRAPER_PROXY_ALL=1)")
-    in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
-    summary = []
-    mode = (args.mode or "auto").lower()
-    if mode not in ("smart", "sitemap", "listing", "auto"):
-        raise SystemExit(f"Nieznany tryb {mode!r}: użyj smart, sitemap, listing albo auto")
-    listing_names, sitemap_names, fallback_ok = [], [], []
-    for n in names:
-        m_ = (SITES[n].get("mode") or mode).lower()
-        has_listing = bool(SITES[n].get("listing"))
-        if m_ == "listing" and has_listing:
-            listing_names.append(n)
-        elif m_ == "auto" and has_listing:
-            listing_names.append(n)
-        else:
-            sitemap_names.append(n)
-            if m_ == "smart" and has_listing:
-                fallback_ok.append(n)
-    auto_names = [n for n in listing_names if (SITES[n].get("mode") or mode).lower() == "auto"]
-    forced = [n for n in names if SITES[n].get("mode")]
-    log.info("tryb: %s | sitemapa: %d sklepów, kategorie: %d sklepów%s", mode, len(sitemap_names), len(listing_names),
-             f" | tryb ustawiony w konfiguracji sklepu: {', '.join(n + '=' + SITES[n]['mode'] for n in forced)}" if forced else "")
-    ua_shops = [n for n in names if "User-Agent" in (site_headers(n, SITES[n]) or {})]
-    px_shops = [n for n in names if SITES[n].get("use_proxy") or PROXY_ALL]
-    log.info("ustawienia: User-Agent przeglądarki dla: %s | proxy (%d szt.) dla: %s",
-             ", ".join(ua_shops) or "nikt", len(_proxies), ", ".join(px_shops) or "nikt")
-    if listing_names:
-        if in_actions:
-            print("::group::tryb listing", flush=True)
-        res = run_listing(con, listing_names, args)
-        if in_actions:
-            print("::endgroup::", flush=True)
-        fallback = [n for (n, _p, st_) in res if n in auto_names and st_["produkty"] == 0]
-        if fallback:
-            log.warning("tryb auto: kategorie nie dały produktów dla %s - przechodzę na sitemapę", ", ".join(fallback))
-            res = [r for r in res if r[0] not in fallback]
-            sitemap_names += fallback
-        summary += res
-    if sitemap_names:
-        if in_actions:
-            print("::group::tryb sitemap", flush=True)
-        res = run_sitemap(con, sitemap_names, args)
-        if in_actions:
-            print("::endgroup::", flush=True)
-        fallback = [n for (n, _c, st_) in res if n in fallback_ok and st_["produkty"] == 0]
-        if fallback:
-            log.warning("tryb smart: sitemapa nie dała produktów dla %s - przechodzę na strony kategorii", ", ".join(fallback))
-            res = [r for r in res if r[0] not in fallback]
+    try:
+        names = resolve_sites(args)
+        for n in names:
+            site = SITES[n]
+            hosts = {urlparse(site["base"]).netloc}
+            hosts |= {urlparse(c).netloc for c in site.get("listing", {}).get("categories", [])}
+            for h in hosts:
+                if site.get("delay"):
+                    _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
+                if site.get("use_proxy"):
+                    _proxy_hosts.add(h)
+                # max_parallel działa też bez proxy (np. lider ma 24, ale go nie używa)
+                if site.get("use_proxy") or site.get("max_parallel"):
+                    _host_sem[h] = threading.Semaphore(int(site.get("max_parallel", 4)))
+        if (env("SCRAPER_PROXY_SOURCE", "") or "").lower() == "geonode":
+            targets = free_proxy_targets(names)
+            if not targets:
+                log.info("darmowe proxy: żaden z wybranych sklepów nie ma use_proxy - pomijam")
+            else:
+                countries = tuple(c.strip().upper() for c in (env("SCRAPER_PROXY_COUNTRY", "") or "").split(",") if c.strip())
+                acquire_free_proxies(targets, countries=countries)
+                start_free_refresher(targets, countries)
+        if _proxies and not PROXY_ALL and not _proxy_hosts:
+            log.warning("podano proxy, ale żaden wybrany sklep nie ma use_proxy (ustaw SCRAPER_PROXY_ALL=1)")
+        in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
+        summary = []
+        mode = (args.mode or "auto").lower()
+        if mode not in ("smart", "sitemap", "listing", "auto"):
+            raise SystemExit(f"Nieznany tryb {mode!r}: użyj smart, sitemap, listing albo auto")
+        listing_names, sitemap_names, fallback_ok = [], [], []
+        for n in names:
+            m_ = (SITES[n].get("mode") or mode).lower()
+            has_listing = bool(SITES[n].get("listing"))
+            if m_ == "listing" and has_listing:
+                listing_names.append(n)
+            elif m_ == "auto" and has_listing:
+                listing_names.append(n)
+            else:
+                sitemap_names.append(n)
+                if m_ == "smart" and has_listing:
+                    fallback_ok.append(n)
+        auto_names = [n for n in listing_names if (SITES[n].get("mode") or mode).lower() == "auto"]
+        forced = [n for n in names if SITES[n].get("mode")]
+        log.info("tryb: %s | sitemapa: %d sklepów, kategorie: %d sklepów%s", mode, len(sitemap_names), len(listing_names),
+                 f" | tryb ustawiony w konfiguracji sklepu: {', '.join(n + '=' + SITES[n]['mode'] for n in forced)}" if forced else "")
+        ua_shops = [n for n in names if "User-Agent" in (site_headers(n, SITES[n]) or {})]
+        px_shops = [n for n in names if SITES[n].get("use_proxy") or PROXY_ALL]
+        log.info("ustawienia: User-Agent przeglądarki dla: %s | proxy (%d szt.) dla: %s",
+                 ", ".join(ua_shops) or "nikt", len(_proxies), ", ".join(px_shops) or "nikt")
+        if listing_names:
             if in_actions:
-                print("::group::tryb listing (zapasowy)", flush=True)
-            res += run_listing(con, fallback, args)
+                print("::group::tryb listing", flush=True)
+            res = run_listing(con, listing_names, args)
             if in_actions:
                 print("::endgroup::", flush=True)
-        summary += res
+            fallback = [n for (n, _p, st_) in res if n in auto_names and st_["produkty"] == 0]
+            if fallback:
+                log.warning("tryb auto: kategorie nie dały produktów dla %s - przechodzę na sitemapę", ", ".join(fallback))
+                res = [r for r in res if r[0] not in fallback]
+                sitemap_names += fallback
+            summary += res
+        if sitemap_names:
+            if in_actions:
+                print("::group::tryb sitemap", flush=True)
+            res = run_sitemap(con, sitemap_names, args)
+            if in_actions:
+                print("::endgroup::", flush=True)
+            fallback = [n for (n, _c, st_) in res if n in fallback_ok and st_["produkty"] == 0]
+            if fallback:
+                log.warning("tryb smart: sitemapa nie dała produktów dla %s - przechodzę na strony kategorii", ", ".join(fallback))
+                res = [r for r in res if r[0] not in fallback]
+                if in_actions:
+                    print("::group::tryb listing (zapasowy)", flush=True)
+                res += run_listing(con, fallback, args)
+                if in_actions:
+                    print("::endgroup::", flush=True)
+            summary += res
 
-    if _suspicious:
-        log.warning("PODEJRZANE ZMIANY CEN (skok >= 5x): %d szt.", len(_suspicious))
-        for url, old, new in _suspicious[:10]:
-            log.warning("  %.2f -> %.2f | %s", old, new, url)
-        if len(_suspicious) > 10:
-            log.warning("  ... i %d więcej", len(_suspicious) - 10)
-    log.info("===== PODSUMOWANIE =====")
-    for name, n, st in summary:
-        log.info("%-14s sprawdzone: %5d | produkty: %5d | zmiany: %5d | błędy: %d",
-                 name, n, st["produkty"], st["zmiany_w_historii"],
-                 st["nieudane"] + st["blad_parsowania"] + st["nieudane_strony"])
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if path:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("| sklep | sprawdzone | produkty | zmiany | błędy |\n|---|---|---|---|---|\n")
-            for name, n, st in summary:
-                f.write(f"| {name} | {n} | {st['produkty']} | {st['zmiany_w_historii']} | "
-                        f"{st['nieudane'] + st['blad_parsowania'] + st['nieudane_strony']} |\n")
+        if _suspicious:
+            log.warning("PODEJRZANE ZMIANY CEN (skok >= 5x): %d szt.", len(_suspicious))
+            for url, old, new in _suspicious[:10]:
+                log.warning("  %.2f -> %.2f | %s", old, new, url)
+            if len(_suspicious) > 10:
+                log.warning("  ... i %d więcej", len(_suspicious) - 10)
+        log.info("===== PODSUMOWANIE =====")
+        for name, n, st in summary:
+            log.info("%-14s sprawdzone: %5d | produkty: %5d | zmiany: %5d | błędy: %d",
+                     name, n, st["produkty"], st["zmiany_w_historii"],
+                     st["nieudane"] + st["blad_parsowania"] + st["nieudane_strony"])
+        path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if path:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("| sklep | sprawdzone | produkty | zmiany | błędy |\n|---|---|---|---|---|\n")
+                for name, n, st in summary:
+                    f.write(f"| {name} | {n} | {st['produkty']} | {st['zmiany_w_historii']} | "
+                            f"{st['nieudane'] + st['blad_parsowania'] + st['nieudane_strony']} |\n")
+    finally:
+        con.close()
 
 
 def cmd_export(args):
     con = db()
-    rows = con.execute("""
-      SELECT p.site, p.name, p.code, p.url, pr.price, pr.currency,
-             pr.availability, pr.ts
-      FROM products p JOIN prices pr ON pr.id =
-        (SELECT MAX(id) FROM prices WHERE url = p.url)
-      ORDER BY p.site, p.name""").fetchall()
-    with open(args.path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow(["sklep", "produkt", "kod", "link", "cena", "waluta", "dostepnosc", "zmiana_ts"])
-        w.writerows(rows)
-    print(f"Zapisano {len(rows)} wierszy do {args.path}")
+    try:
+        rows = con.execute("""
+          SELECT p.site, p.name, p.code, p.url, pr.price, pr.currency,
+                 pr.availability, pr.ts
+          FROM products p JOIN prices pr ON pr.id =
+            (SELECT MAX(id) FROM prices WHERE url = p.url)
+          ORDER BY p.site, p.name""").fetchall()
+        with open(args.path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["sklep", "produkt", "kod", "link", "cena", "waluta", "dostepnosc", "zmiana_ts"])
+            w.writerows(rows)
+        print(f"Zapisano {len(rows)} wierszy do {args.path}")
+    finally:
+        con.close()
 
 
 def cmd_history(args):
     con = db()
-    for ts, price, cur, av in con.execute(
-            "SELECT ts, price, currency, availability FROM prices WHERE url=? ORDER BY id", (args.url,)):
-        price_s = f"{price:>9.2f}" if price is not None else "     brak"
-        print(f"{ts}  {price_s} {cur}  {av}")
+    try:
+        for ts, price, cur, av in con.execute(
+                "SELECT ts, price, currency, availability FROM prices WHERE url=? ORDER BY id", (args.url,)):
+            price_s = f"{price:>9.2f}" if price is not None else "     brak"
+            print(f"{ts}  {price_s} {cur}  {av}")
+    finally:
+        con.close()
 
 
 def main():

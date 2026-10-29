@@ -21,7 +21,6 @@ Zmienne środowiskowe (GitHub Actions: Settings > Secrets and variables > Action
     SCRAPER_PROXY_SOURCE=geonode   SCRAPER_PROXY_COUNTRY=PL,DE  SCRAPER_FREE_PROXY_COUNT=12
     SCRAPER_MODE=auto|smart|sitemap|listing   SCRAPER_VERBOSE=1   SCRAPER_RECHECK=1
     SCRAPER_PROXY_ALL=1   SCRAPER_DB=sciezka/do/bazy.db
-    SCRAPER_AUTOCONFIG_CACHE=autoconfig_cache.json   SCRAPER_AUTOCONFIG_TTL=7   SCRAPER_REFRESH_CONFIG=1
 
 Jak to działa (tryb sitemap; tryb listing czyta strony kategorii - patrz SITES):
   1. Adresy produktów bierze z sitemap.xml sklepu (robots.txt -> Sitemap:).
@@ -31,21 +30,12 @@ Jak to działa (tryb sitemap; tryb listing czyta strony kategorii - patrz SITES)
      cena lub dostępność.
   4. Szanuje robots.txt i robi odstępy między zapytaniami.
 
-Auto-discovery:
-  Każde uruchomienie, dla każdego sklepu bez pełnej konfiguracji "listing",
-  scraper wykrywa:
-    a) platformę sklepu z HTML strony głównej (PrestaShop / WooCommerce /
-       IdoSell / Woodmart / Shopify),
-    b) selektory CSS kafelka produktu (item/name/link/price/availability) -
-       waliduje każdy szablon po tym, czy kafelki faktycznie mają nazwę,
-       link i cenę,
-    c) wzorzec paginacji (rel=next, link "2", typowe ?page=N),
-    d) adresy kategorii - najpierw z sitemap kategorii (jeśli istnieje),
-       potem z menu nawigacyjnego, na końcu z heurystyki URL z bloklistą
-       (blog, kontakt, o-nas, faq, regulamin, itd.).
-  Wykryty wynik jest zapisywany do cache (domyślnie autoconfig_cache.json,
-  TTL 7 dni), żeby kolejne uruchomienia nie skanowały wszystkiego od nowa.
-  Wymuszenie ponownego skanu: --refresh-config (albo SCRAPER_REFRESH_CONFIG=1).
+Uwagi o proxy (obecna wersja):
+  - Dla HTTPS używane są tylko SOCKS5/SOCKS4 (tunelują bez MITM). HTTP proxy
+    z Proxifly/Geonode są odrzucane dla HTTPS, bo robią SSL interception.
+  - Proxy użytkownika (SCRAPER_PROXIES) są zaufane - HTTP proxy z sekretów
+    mogą być użyte także dla HTTPS.
+  - Proxifly pobiera trzy pliki: HTTPS, SOCKS5, "all" - do 2000 adresów.
 """
 import argparse
 import contextlib
@@ -91,12 +81,7 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHT
               "Chrome/124.0.0.0 Safari/537.36")
 BROWSER_UA_SPEC = (env("SCRAPER_BROWSER_UA", "") or "").lower()
 NONPRODUCT_TTL_DAYS = 14
-AUTOCONFIG_CACHE = env("SCRAPER_AUTOCONFIG_CACHE", "autoconfig_cache.json")
-AUTOCONFIG_TTL_DAYS = int(env("SCRAPER_AUTOCONFIG_TTL", 7))
 
-# ---------------------------------------------------------------------------
-# Szablony selektorów dla platform sklepowych (wykorzystywane przez autoconfig).
-# ---------------------------------------------------------------------------
 _IDO = {"next": "{url}?counter={page}", "start": 0, "item": "div.product",
         "name": "a.product__name", "link": "a.product__name@href"}
 _IDO_OUT = "span.--disable, [data-product_disable='true']"
@@ -104,11 +89,17 @@ _WOO = {"next": "{url}page/{page}/", "start": 1, "item": "li.product"}
 _WOO_PRICE = ["ins .woocommerce-Price-amount", ".woocommerce-Price-amount"]
 _PRESTA = {"next": "{url}?page={page}", "start": 1}
 
-# Ręczne wpisy dla sklepów, które działały stabilnie (auto-config je psuł).
-# Sklepy BEZ "listing" (odpalaj, hurtowniaas, andrzej, pyrotech, petardyshop,
-# pirozone, pironet, piroart, sklepzpetardami) idą przez auto-discovery.
+_LIDER = "https://fajerwerkilider.pl/pl/"
+_HAS = "https://fajerwerkigorzow.pl/produkty/hurtownia/"
+
 SITES = {
-    "odpalaj":         {"base": "https://odpalaj.pl"},
+    "odpalaj": {
+        "base": "https://odpalaj.pl",
+        "listing": {**_PRESTA, "categories": ["https://odpalaj.pl/pl/2-wszystko"],
+            "item": "article.product-miniature",
+            "name": "h2.product-title a", "link": "h2.product-title a@href", "price": "span.price",
+            "out_of_stock": "ul.product-flags li.out_of_stock", "out_text": ["brak na stanie"]},
+    },
     "pirohit": {
         "base": "https://pirohit.pl", "use_proxy": True, "max_parallel": 6, "browser_ua": True,
         "mode": "listing",
@@ -198,7 +189,18 @@ SITES = {
             "categories": ["https://piroman.pl/23-fajerwerki", "https://piroman.pl/10-strefa-kibica",
                            "https://piroman.pl/24-odstraszanie-zwierzyny"]},
     },
-    "hurtowniaas":     {"base": "https://fajerwerkigorzow.pl"},
+    "hurtowniaas": {
+        "base": "https://fajerwerkigorzow.pl",
+        "listing": {"first": "{url}", "next": "{url}?product-page={page}", "start": 1, "item": "li.product",
+            "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
+            "price": _WOO_PRICE, "in_stock": ".instock",
+            "categories": ["https://fajerwerkigorzow.pl/produkty/nowe/"] + [_HAS + x + "/" for x in (
+                "hurtownia-petardy", "hurtownia-emitery-dzwieku", "hurtownia-wyrzutnie",
+                "hurtownia-race-pistoletowe-amunicja", "hurtownia-dymy-flary-stroboskopy", "hurtownia-fontanny",
+                "hurtownia-rzymskie-ognie", "hurtownia-rakiety-i-zestawy", "hurtownia-art-rozne",
+                "hurtownia-ciche-fajerwerki", "hurtownia-pirotechnika-na-wesela", "hurtownia-strefa-kibica",
+                "hurtownia-wybuchowa-niespodzianka")]},
+    },
     "szopik": {
         "base": "https://fajerwerki.shop.pl", "use_proxy": True,
         "mode": "listing",
@@ -215,10 +217,21 @@ SITES = {
                 "zestawy-zlozone-dso-compound-181", "katowe-wyrzutnie-189", "wyrzutnie-25-99-strzalow-190",
                 "wyrzutnie-100-500-strzalow-191", "wyrzutnie-1-25-strzalow-192", "tpro-show-193")]},
     },
-    "pyrotech":        {"base": "https://hurtownia-fajerwerki.pl",
-                        "sitemaps": ["https://hurtownia-fajerwerki.pl/sitemap.xml.gz"]},
-    "pirozone":        {"base": "https://pirozone.pl", "delay": 0.7, "browser_ua": True,
-                        "use_proxy": True, "max_parallel": 2},
+    "pyrotech": {
+        "base": "https://hurtownia-fajerwerki.pl", "sitemaps": ["https://hurtownia-fajerwerki.pl/sitemap.xml.gz"],
+        "listing": {**_IDO, "price": "strong.price.--main", "out_of_stock": "span.--disable",
+            "categories": ["https://hurtownia-fajerwerki.pl/pol_m_Fajerwerki-157.html"]},
+    },
+    "pirozone": {
+        "base": "https://pirozone.pl", "delay": 0.7,
+        "browser_ua": True, "use_proxy": True, "max_parallel": 2,
+        "listing": {"next": "{url}page/{page}/?currency=PLN", "start": 1, "item": "li.product",
+            "name": ["h3.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title"],
+            "link": ["h3.woocommerce-loop-product__title a@href", "a.woocommerce-LoopProduct-link@href"],
+            "price": ["span.price ins bdi", "p.price ins bdi", "span.price bdi", "p.price bdi", "span.price", "p.price"],
+            "in_stock": ".instock", "out_of_stock": ".outofstock",
+            "categories": ["https://pirozone.pl/fajerwerki-menu-glowne/"]},
+    },
     "firefactory": {
         "base": "https://www.firefactory.pl",
         "listing": {**_WOO, "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
@@ -231,11 +244,35 @@ SITES = {
             "price": ["span.price ins bdi", "span.price bdi"], "out_text": ["brak w magazynie"],
             "categories": ["https://www.fajerwerki-obornicka.pl/home/sklep/"]},
     },
-    "andrzej":         {"base": "https://piroandrzej.pl"},
-    "pironet":         {"base": "https://pironet.pl", "browser_ua": True, "use_proxy": True, "max_parallel": 2},
-    "piroart":         {"base": "https://piroart.pl", "use_proxy": True, "browser_ua": True, "max_parallel": 2,
-                        "sitemaps": ["https://piroart.pl/sitemap_index.xml"]},
-    "petardyshop":     {"base": "https://petardyshop.pl", "delay": 0.2, "browser_ua": True},
+    "andrzej": {
+        "base": "https://piroandrzej.pl",
+    },
+    "pironet": {
+        "base": "https://pironet.pl",
+        "browser_ua": True, "use_proxy": True, "max_parallel": 2,
+        "listing": {**_WOO, "name": "h3.woocommerce-loop-product__title a",
+            "link": "h3.woocommerce-loop-product__title a@href",
+            "price": ["span.price ins bdi", "span.price bdi", "span.price"],
+            "out_of_stock": ".outofstock", "out_text": ["dowiedz się więcej"],
+            "categories": ["https://pironet.pl/sklep-z-fajerwerkami/"]},
+    },
+    "piroart": {
+        "base": "https://piroart.pl",
+        "use_proxy": True, "browser_ua": True, "max_parallel": 2,
+        "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
+        "listing": {**_WOO, "name": "div.product__title h3", "link": "a.woocommerce-loop-product__link@href",
+            "price": "span.current span.woocommerce-Price-amount",
+            "categories": ["https://piroart.pl/hurtownia/"]},
+    },
+    "petardyshop": {
+        "base": "https://petardyshop.pl", "delay": 0.2, "browser_ua": True,
+        "mode": "listing",
+        "listing": {**_WOO, "name": ["h2.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title a",
+                                      "h2.woocommerce-loop-product__title", "h3.woocommerce-loop-product__title"],
+            "link": ["a.woocommerce-LoopProduct-link@href", "a.woocommerce-loop-product__link@href"],
+            "price": _WOO_PRICE, "in_stock": ".instock", "out_of_stock": ".outofstock",
+            "categories": ["https://petardyshop.pl/sklep/"]},
+    },
 }
 
 _tls = threading.local()
@@ -259,9 +296,7 @@ _warn_count = Counter()
 _host_gate = {}
 _gate_lock = threading.Lock()
 
-# --- Proxifly fallback ------------------------------------------------------
-# Kolejność ma znaczenie: HTTPS i SOCKS5 są najpierw, bo nie robią MITM na TLS.
-# "all" na końcu jako uzupełnienie (HTTP proxy - przydatne dla sklepów bez HTTPS).
+# --- Proxifly fallback (multi-source: HTTPS -> SOCKS5 -> reszta) ------------
 PROXIFLY_URLS = (
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt",
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
@@ -397,24 +432,36 @@ def _live_count():
 
 
 def _is_safe_proxy_for_https(px):
-    """Tylko SOCKS tuneluje surowe bajty (bez MITM).
-    HTTP i HTTPS proxy mogą robić SSL interception, więc ich nie używamy dla HTTPS."""
+    """SOCKS tuneluje surowe bajty (bez MITM). HTTP/HTTPS proxy mogą robić SSL
+    interception (self-signed cert) - dla HTTPS ich unikamy (poza proxy usera)."""
     return px.startswith(("socks5", "socks4"))
 
+
 def pick_proxy(url_scheme="https"):
-    """Dla HTTPS preferuj socks5/https (bez MITM). Dla HTTP każdy proxy jest OK."""
+    """Dla HTTPS: socks5/socks4 lub proxy usera (zaufane). Dla HTTP: każdy proxy."""
     global _proxy_i
     if not _proxies:
         return None
     with _lock:
         now = time.time()
         if url_scheme == "https":
+            # 1) SOCKS (bez MITM)
             safe = [px for px in _proxies
                     if _is_safe_proxy_for_https(px) and _proxy_dead.get(px, 0) <= now]
             if safe:
                 px = safe[_proxy_i % len(safe)]
                 _proxy_i += 1
                 return px
+            # 2) proxy usera (nie z Proxifly/Geonode) - user wie co robi
+            user_proxies = [px for px in _proxies
+                           if px not in _free_proxies and _proxy_dead.get(px, 0) <= now]
+            if user_proxies:
+                px = user_proxies[_proxy_i % len(user_proxies)]
+                _proxy_i += 1
+                return px
+            # 3) brak socks/user → direct (lepiej niż HTTP proxy z MITM)
+            return None
+        # HTTP: każdy proxy OK
         for _ in range(len(_proxies)):
             px = _proxies[_proxy_i % len(_proxies)]
             _proxy_i += 1
@@ -503,10 +550,10 @@ def _do_fetch_proxifly(tag=""):
             seen_in_batch.add(line)
             added.append(line)
             got += 1
-            if len(added) >= 5000:
+            if len(added) >= 2000:
                 break
         log.info("Proxifly%s: źródło %s -> %d adresów", tag, proto, got)
-        if len(added) >= 5000:
+        if len(added) >= 2000:
             break
     if not added:
         log.warning("Proxifly%s: lista pusta lub bez obsługiwanych protokołów", tag)
@@ -522,7 +569,7 @@ def _do_fetch_proxifly(tag=""):
     return new_count
 
 
-def fetch_proxifly_proxies(limit=200):
+def fetch_proxifly_proxies(limit=2000):
     global _last_fallback_fetch
     with _fallback_lock:
         if time.time() - _last_fallback_fetch < FALLBACK_INTERVAL:
@@ -670,7 +717,7 @@ def start_free_refresher(targets, countries, every=480):
     threading.Thread(target=loop, daemon=True, name="free-proxy-refresh").start()
 
 
-def proxy_for(netloc, url_scheme="http"):
+def proxy_for(netloc, url_scheme="https"):
     if not (PROXY_ALL or netloc in _proxy_hosts):
         return None
     return pick_proxy(url_scheme)
@@ -965,36 +1012,11 @@ def sitemap_urls(site, info=None, name=""):
 
 
 # ---------------------------------------------------------------------------
-# Auto-discovery kategorii (sitemap kategorii -> menu -> heurystyka z bloklistą)
+# Auto-discovery kategorii (używane TYLKO gdy sklep w SITES nie ma "categories")
 # ---------------------------------------------------------------------------
 _SKIP_EXT = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".zip", ".rar",
              ".mp4", ".mp3", ".doc", ".docx", ".xls", ".xlsx", ".css", ".js", ".ico")
 _PRODUCT_HINTS = re.compile(r"(?:-p-\d+|/p/\d+|/product/|/produkt/|-\d{5,}\.html?$)", re.I)
-
-# Bloklista: strony, które NA PEWNO nie są kategoriami produktów.
-# Stosowana do filtrowania adresów z sitemap i menu.
-_NOT_CATEGORY_PATTERNS = re.compile(
-    r"(?:/(?:blog|aktualnosci|aktualności|news|faq|opinie|reviews|"
-    r"kontakt|contact|o-nas|about-us|about|"
-    r"regulamin|terms|tos|"
-    r"polityka-prywatnosci|polityka-prywatności|privacy|privacy-policy|rodo|gdpr|"
-    r"moje-konto|my-account|account|konto|"
-    r"koszyk|cart|basket|zamowienie|zamówienie|order|"
-    r"logowanie|login|signin|rejestracja|register|signup|"
-    r"tag|tags|author|autor|"
-    r"producenci|producers|brands|marki|"
-    r"search|szukaj|wyniki-wyszukiwania|"
-    r"page/\d+|strona/\d+"
-    r")/|(?:^|/)page/\d+/?$|uncategorized|bez-kategorii"
-    r"|logowanie|login|register|rejestracja|password|haslo|checkout|newsletter"
-    r"|fajerwerki-(?:katowice|warszawa|krakow|wroclaw|poznan|gdansk|gdynia|lodz|szczecin|lublin|"
-    r"bydgoszcz|torun|radom|kielce|rzeszow|olsztyn|czestochowa|gliwice|zabrze|bialystok|konin|"
-    r"pila|wejherowo|tarnobrzeg|opole|zielona-gora))",
-    re.I,
-)
-
-# Wzorzec: URL pochodzi z sitemap kategorii (można mu ufać).
-_CATEGORY_SITEMAP_RE = re.compile(r"categor|product_cat|kategori|cat_sitemap", re.I)
 
 
 def _looks_like_category(url, base_netloc):
@@ -1005,15 +1027,13 @@ def _looks_like_category(url, base_netloc):
     if not path:
         return False
     segs = [s for s in path.split("/") if s]
-    if len(segs) > 5:
+    if len(segs) > 4:
         return False
     if re.search(r"\.html?$", p.path, re.I):
         return False
     if _PRODUCT_HINTS.search(url):
         return False
-    if _NOT_CATEGORY_PATTERNS.search(p.path):
-        return False
-    if len(segs[-1]) > 60:
+    if len(segs[-1]) > 40:
         return False
     return True
 
@@ -1043,362 +1063,45 @@ def _menu_cat_candidates(menu_links, base_url, base_netloc):
             continue
         if p.scheme not in ("http", "https"):
             continue
-        if p.fragment:                 # #showSearchForm, #content — nie kategoria
+        if p.fragment:
             continue
         path_lower = p.path.lower()
         if any(path_lower.endswith(ext) for ext in _SKIP_EXT):
             continue
         if u.rstrip("/") == base_clean:
             continue
-        if _NOT_CATEGORY_PATTERNS.search(p.path):
-            continue
         out.append(u)
     return out
 
 
-def category_urls_from_sitemaps(site, name):
-    """Zwraca adresy kategorii TYLKO z sitemap, których nazwa zawiera 'category',
-    'product_cat' lub 'kategori' (np. category-sitemap.xml, product_cat-sitemap.xml).
-    Zwraca [] jeśli taki plik nie istnieje."""
-    base = site["base"].rstrip("/")
-    hdrs = site_headers(name, site)
-    roots = list(site.get("sitemaps", []))
-    if not roots:
-        r = get(base + "/robots.txt", headers=hdrs)
-        if r:
-            roots = re.findall(r"(?im)^sitemap:\s*(\S+)", r.text)
-    if not roots:
-        return []
-    cat_urls = []
-    visited = set()
-    stack = list(reversed(roots))
-    while stack and len(visited) < 100:
-        sm = stack.pop()
-        if sm in visited:
-            continue
-        visited.add(sm)
-        res = read_sitemap(sm, hdrs)
-        if not res:
-            continue
-        is_index, locs = res
-        locs = [urljoin(sm, u) for u in locs]
-        if is_index:
-            cat_children = [u for u in locs if _CATEGORY_SITEMAP_RE.search(u)]
-            stack.extend(reversed(cat_children))
-        elif _CATEGORY_SITEMAP_RE.search(sm):
-            cat_urls.extend(locs)
-    return cat_urls
-
-
-def discover_categories(site, name, verbose=False, max_cats=50):
-    """Znajduje adresy kategorii w kolejności: sitemap kategorii -> menu -> heurystyka."""
+def discover_categories(site, name, verbose=False, max_cats=100):
     base = site["base"].rstrip("/")
     base_netloc = urlparse(base).netloc
     hdrs = site_headers(name, site)
-
-    # 1) dedykowana sitemapa kategorii (najbardziej wiarygodna)
-    cat_sitemap = category_urls_from_sitemaps(site, name)
-    if len(cat_sitemap) >= 3:
-        cats = [u for u in cat_sitemap
-                if urlparse(u).netloc == base_netloc
-                and not _NOT_CATEGORY_PATTERNS.search(urlparse(u).path)]
-        cats = list(dict.fromkeys(cats))[:max_cats]
-        if len(cats) >= 3:
-            log.info("[%s] auto-kategorie z sitemap kategorii: %d adresów", name, len(cats))
-            return cats
-
-    # 2) menu nawigacyjne
-    home = get(base + "/", cookies=site.get("cookies"), headers=hdrs)
-    if home:
-        menu_links = _extract_menu_links(home.content, base + "/")
-        cats = _menu_cat_candidates(menu_links, base + "/", base_netloc)
-        cats = list(dict.fromkeys(cats))[:max_cats]
-        if len(cats) >= 3:
-            log.info("[%s] auto-kategorie z menu: %d adresów", name, len(cats))
-            if verbose:
-                for u in cats[:10]:
-                    log.debug("  %s", u)
-            return cats
-
-    # 3) heurystyka z sitemap produktów (ostatnia deska ratunku)
     try:
         urls = sitemap_urls(site, info={}, name=name)
     except Exception as e:
         log.debug("[%s] auto-kategorie: sitemapa padła: %s", name, e)
         urls = []
     if urls:
-        cats = [u for u in urls if _looks_like_category(u, base_netloc)]
-        cats = list(dict.fromkeys(cats))[:max_cats]
-        if len(cats) >= 3:
-            log.info("[%s] auto-kategorie z sitemapy (heurystyka): %d adresów", name, len(cats))
-            return cats
-
-    log.warning("[%s] auto-discovery: nie znaleziono kategorii", name)
+        cat_urls = [u for u in urls if _looks_like_category(u, base_netloc)]
+        if len(cat_urls) >= 5:
+            cat_urls = list(dict.fromkeys(cat_urls))[:max_cats]
+            log.info("[%s] auto-kategorie z sitemapy: %d adresów", name, len(cat_urls))
+            return cat_urls
+    home = get(base + "/", cookies=site.get("cookies"), headers=hdrs)
+    if home:
+        menu_links = _extract_menu_links(home.content, base + "/")
+        cat_urls = _menu_cat_candidates(menu_links, base + "/", base_netloc)
+        cat_urls = list(dict.fromkeys(cat_urls))[:max_cats]
+        if cat_urls:
+            log.info("[%s] auto-kategorie z menu: %d adresów", name, len(cat_urls))
+            if verbose:
+                for u in cat_urls[:10]:
+                    log.debug("  %s", u)
+            return cat_urls
+    log.warning("[%s] auto-discovery: nie znaleziono kategorii (ani sitemapa, ani menu)", name)
     return []
-
-
-# ---------------------------------------------------------------------------
-# Auto-detekcja platformy i selektorów kafelka (autoconfig).
-# ---------------------------------------------------------------------------
-_PLATFORM_SELECTORS = {
-    "prestashop": {
-        "item": ["article.product-miniature", "article.js-product-miniature"],
-        "name": ["h2.product-title a", "h2.product-title", "h3.product-title a", ".product-title a", "a.product-name"],
-        "link": ["h2.product-title a@href", "h3.product-title a@href", "a.product-thumbnail@href",
-                 ".product-title a@href", "a.product-name@href"],
-        "price": ["span.price", ".product-price .price", ".product-price"],
-        "out_of_stock": ".product-unavailable, li.out_of_stock, button[data-button-action='add-to-cart'][disabled]",
-        "out_text": ["nie ma takiej ilości", "wyprzedan", "brak w magazynie"],
-        "next": "{url}?page={page}", "start": 1,
-    },
-    "woocommerce": {
-        "item": "li.product",
-        "name": ["h2.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title a",
-                 "h2.woocommerce-loop-product__title", "h3.woocommerce-loop-product__title"],
-        "link": ["a.woocommerce-LoopProduct-link@href", "a.woocommerce-loop-product__link@href"],
-        "price": ["ins .woocommerce-Price-amount", ".woocommerce-Price-amount", "span.price"],
-        "in_stock": ".instock", "out_of_stock": ".outofstock",
-        "next": "{url}page/{page}/", "start": 1,
-    },
-    "woodmart": {
-        # popularny motyw WooCommerce (np. pyroking)
-        "item": "div.wd-product",
-        "name": [".wd-entities-title a", "h3 a"],
-        "link": [".wd-entities-title a@href", "a.wd-product-img-link@href"],
-        "price": ["span.price", ".price"],
-        "out_of_stock": ".outofstock",
-        "next": "{url}page/{page}/", "start": 1,
-    },
-    "idosell": {
-        "item": ["div.product[data-product-id]", "div.product.product-miniature",
-                 "div.product.product-view", "div.product"],
-        "name": ["a.product__name", "a.product-name"],
-        "link": ["a.product__name@href", "a.product-name@href"],
-        "price": ["strong.price.--main", "strong.price", ".price"],
-        "in_stock": "button.add_to_basket__button",
-        "out_of_stock": _IDO_OUT,
-        "next": "{url}?counter={page}", "start": 0,
-    },
-    "shopify": {
-        "item": ["li.grid__item", ".product-card", "[data-product-id]"],
-        "name": ["h3 a", ".card__heading a", ".product-card__title a", "h2 a"],
-        "link": ["h3 a@href", ".card__heading a@href", ".product-card__title a@href", "h2 a@href"],
-        "price": [".price-item--regular", ".price__regular .price-item", ".price"],
-        "next": "{url}?page={page}", "start": 1,
-    },
-}
-
-
-def detect_platform(html_bytes):
-    """Rozpoznaje platformę sklepu z HTML (informacyjnie; decyzja i tak po walidacji)."""
-    if not html_bytes:
-        return None
-    head = html_bytes[:200000]
-    try:
-        soup = BeautifulSoup(head, "lxml")
-    except Exception:
-        return None
-    gen = soup.find("meta", attrs={"name": "generator"})
-    gen_c = (gen.get("content") or "").lower() if gen else ""
-    if b"cdn.shopify.com" in head or "shopify" in gen_c:
-        return "shopify"
-    if b"wd-product" in head or b"woodmart" in head[:50000].lower():
-        return "woodmart"
-    if ("prestashop" in gen_c
-            or soup.select_one("body#category")
-            or soup.select_one("body#product")
-            or soup.select_one("article.product-miniature")
-            or soup.select_one("script[src*='prestashop']")):
-        return "prestashop"
-    if (soup.select_one("body.woocommerce")
-            or soup.select_one("body.woocommerce-page")
-            or soup.select_one("li.product a.woocommerce-LoopProduct-link")):
-        return "woocommerce"
-    if (b"idosell" in head[:50000]
-            or soup.select_one("a.product__name")
-            or soup.select_one("form.products-list")):
-        return "idosell"
-    return None
-
-
-def detect_pagination_pattern(html_bytes, category_url):
-    """Zwraca (next_template, start) albo None - wyciąga wzorzec paginacji z HTML."""
-    try:
-        soup = BeautifulSoup(html_bytes, "lxml")
-        cand_url = None
-        ln = soup.find("link", attrs={"rel": "next"}) or soup.find("a", attrs={"rel": "next"})
-        if ln is not None and ln.get("href"):
-            cand_url = urljoin(category_url, ln["href"])
-        if not cand_url:
-            for a in soup.find_all("a", href=True):
-                if a.get_text(strip=True) == "2":
-                    cand_url = urljoin(category_url, a["href"])
-                    break
-        if not cand_url:
-            return None
-        if "/page/2/" in cand_url or cand_url.rstrip("/").endswith("/page/2"):
-            return "{url}page/{page}/", 1
-        if "?page=2" in cand_url or "&page=2" in cand_url:
-            return "{url}?page={page}", 1
-        if "?p=2" in cand_url or "&p=2" in cand_url:
-            return "{url}?p={page}", 1
-        if "?counter=2" in cand_url or "&counter=2" in cand_url:
-            return "{url}?counter={page}", 2
-        if "product-page=2" in cand_url:
-            return "{url}?product-page={page}", 1
-        return None
-    except Exception:
-        return None
-
-
-def _validate_template(html_bytes, template):
-    """Ocenia szablon: ile kafelków ma JEDNOCZEŚNIE name + link + price.
-    Zwraca (total_tiles, valid_tiles). Wymaga min. 3 prawidłowych, żeby szablon był użyty."""
-    try:
-        soup = BeautifulSoup(html_bytes, "lxml")
-    except Exception:
-        return 0, 0
-    item_sel = template.get("item")
-    name_sel = template.get("name")
-    link_sel = template.get("link")
-    price_sel = template.get("price")
-    if not (item_sel and link_sel):
-        return 0, 0
-
-    def _first(el, spec):
-        if not spec:
-            return None
-        for one in ([spec] if isinstance(spec, str) else spec):
-            css, attr = one, None
-            m = re.match(r"^(.*)@([\w-]+)$", one)
-            if m:
-                css, attr = m.group(1), m.group(2)
-            node = el.select_one(css) if css else el
-            if node is None:
-                continue
-            val = node.get(attr) if attr else node.get_text(" ", strip=True)
-            if val:
-                return val
-        return None
-
-    sels = [item_sel] if isinstance(item_sel, str) else item_sel
-    for s in sels:
-        try:
-            tiles = soup.select(s)
-        except Exception:
-            continue
-        if not tiles:
-            continue
-        valid = 0
-        for tile in tiles[:20]:
-            if not _first(tile, link_sel):
-                continue
-            if not _first(tile, name_sel):
-                continue
-            raw = _first(tile, price_sel) if price_sel else None
-            if not raw:
-                continue
-            if not re.search(r"\d+[.,]\d{1,2}", str(raw)):
-                continue
-            valid += 1
-        return len(tiles), valid
-    return 0, 0
-
-
-def _load_autoconfig_cache():
-    try:
-        with open(AUTOCONFIG_CACHE, encoding="utf-8") as f:
-            data = json.load(f)
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=AUTOCONFIG_TTL_DAYS)).isoformat()
-        return {k: v for k, v in data.items() if v.get("ts", "") > cutoff}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save_autoconfig_cache(cache):
-    try:
-        with open(AUTOCONFIG_CACHE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
-        log.info("autoconfig cache: zapisano %d wpisów do %s", len(cache), AUTOCONFIG_CACHE)
-    except OSError as e:
-        log.warning("autoconfig cache: nie udało się zapisać %s: %s", AUTOCONFIG_CACHE, e)
-
-
-def autoconfigure_all(names, verbose=False, force=False):
-    """Pełny auto-discovery konfiguracji każdego sklepu (z cache).
-    force=True: ignoruj cache i skanuj wszystko od nowa."""
-    cache = {} if force else _load_autoconfig_cache()
-    new_entries = {}
-    for n in names:
-        site = SITES[n]
-        lc = site.setdefault("listing", {})
-
-        if not force and n in cache and cache[n].get("listing"):
-            site["listing"] = dict(cache[n]["listing"])
-            log.info("[%s] autoconfig: z cache (%s), kategorie=%d",
-                     n, cache[n].get("ts", "")[:10], len(site["listing"].get("categories", [])))
-            new_entries[n] = cache[n]
-            continue
-
-        log.info("[%s] autoconfig: start", n)
-        hdrs = site_headers(n, site)
-        base = site["base"].rstrip("/")
-
-        home_r = get(base + "/", cookies=site.get("cookies"), headers=hdrs)
-        if not home_r:
-            log.warning("[%s] autoconfig: nie udało się pobrać strony głównej (%s)", n, _tls.last_fail)
-            continue
-        platform = detect_platform(home_r.content)
-        log.info("[%s] autoconfig: platforma = %s", n, platform or "nieznana")
-
-        cats = discover_categories(site, n, verbose=verbose)
-        if not cats:
-            log.warning("[%s] autoconfig: brak kategorii - sklep pójdzie przez sitemap", n)
-            continue
-        log.info("[%s] autoconfig: kategorie = %d adresów", n, len(cats))
-
-        first_cat = cats[0]
-        cat_r = get(first_cat, cookies=site.get("cookies"), headers=hdrs)
-        if not cat_r:
-            log.warning("[%s] autoconfig: nie udało się pobrać kategorii %s (%s)", n, first_cat, _tls.last_fail)
-            continue
-
-        candidates = []
-        for plat, template in _PLATFORM_SELECTORS.items():
-            item_n, valid_n = _validate_template(cat_r.content, template)
-            if valid_n >= 3:
-                candidates.append((valid_n, item_n, plat, template))
-        candidates.sort(reverse=True)
-
-        if not candidates:
-            log.warning("[%s] autoconfig: żaden szablon nie pasuje do %s - sklep pójdzie przez sitemap",
-                        n, first_cat)
-            continue
-
-        best_valid, best_item, best_plat, best_template = candidates[0]
-        log.info("[%s] autoconfig: szablon = %r (%d/%d prawidłowych kafelków)",
-                 n, best_plat, best_valid, best_item)
-        for k, v in best_template.items():
-            lc[k] = v
-
-        pag = detect_pagination_pattern(cat_r.content, first_cat)
-        if pag:
-            lc["next"], lc["start"] = pag
-            log.info("[%s] autoconfig: paginacja = %r start=%d", n, lc["next"], lc["start"])
-        else:
-            lc.setdefault("next", "{url}?page={page}")
-            lc.setdefault("start", 1)
-            log.info("[%s] autoconfig: paginacja = domyślna ?page=N", n)
-
-        lc["categories"] = cats
-        new_entries[n] = {"listing": dict(lc), "ts": datetime.now(timezone.utc).isoformat()}
-
-        if verbose:
-            log.debug("[%s] autoconfig gotowe: item=%r name=%r price=%r next=%r start=%r",
-                      n, lc.get("item"), lc.get("name"), lc.get("price"),
-                      lc.get("next"), lc.get("start"))
-
-    _save_autoconfig_cache(new_entries)
 
 
 # ----------------------------- parsowanie -----------------------------------
@@ -2318,6 +2021,7 @@ def cmd_scrape(args):
     for n in names:
         site = SITES[n]
         hosts = {urlparse(site["base"]).netloc}
+        hosts |= {urlparse(c).netloc for c in site.get("listing", {}).get("categories", [])}
         for h in hosts:
             if site.get("delay"):
                 _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
@@ -2325,21 +2029,22 @@ def cmd_scrape(args):
                 _proxy_hosts.add(h)
                 _host_sem[h] = threading.Semaphore(int(site.get("max_parallel", 4)))
 
-    # AUTO-DISCOVERY z cache: wykryj platformę, selektory, paginację, kategorie.
-    if not getattr(args, "no_autoconfig", False):
-        autoconfigure_all(names, verbose=args.verbose,
-                          force=getattr(args, "refresh_config", False))
-
-    for n in names:
-        site = SITES[n]
-        lc = site.get("listing") or {}
-        for c in lc.get("categories", []):
-            h = urlparse(c).netloc
-            if site.get("delay"):
-                _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
-            if site.get("use_proxy"):
-                _proxy_hosts.add(h)
-                _host_sem.setdefault(h, threading.Semaphore(int(site.get("max_parallel", 4))))
+        # fallback: jeśli sklep ma "listing" bez "categories", wykryj kategorie
+        listing_cfg = site.get("listing")
+        if (listing_cfg is not None
+                and not listing_cfg.get("categories")
+                and site.get("auto_categories") is not False):
+            log.info("[%s] auto-discovery kategorii...", n)
+            auto = discover_categories(site, n, verbose=args.verbose)
+            if auto:
+                listing_cfg["categories"] = auto
+                log.info("[%s] auto-kategorie: ustawiono %d adresów", n, len(auto))
+                for u in auto:
+                    h = urlparse(u).netloc
+                    if site.get("delay"):
+                        _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
+                    if site.get("use_proxy"):
+                        _proxy_hosts.add(h)
 
     if (env("SCRAPER_PROXY_SOURCE", "") or "").lower() == "geonode":
         targets = free_proxy_targets(names)
@@ -2360,8 +2065,7 @@ def cmd_scrape(args):
     for n in names:
         m_ = (SITES[n].get("mode") or mode).lower()
         lc = SITES[n].get("listing")
-        has_listing = (bool(lc) and bool(lc.get("categories")) and bool(lc.get("item"))
-                       and bool(lc.get("name")) and bool(lc.get("link")))
+        has_listing = bool(lc) and bool(lc.get("categories"))
         if m_ == "listing" and has_listing:
             listing_names.append(n)
         elif m_ == "auto" and has_listing:
@@ -2463,11 +2167,6 @@ def main():
     s.add_argument("--proxy-file")
     s.add_argument("--mode", default=env("SCRAPER_MODE", "auto"))
     s.add_argument("--recheck", action="store_true", default=env("SCRAPER_RECHECK") == "1")
-    s.add_argument("--refresh-config", action="store_true",
-                   default=env("SCRAPER_REFRESH_CONFIG") == "1",
-                   help="wymuś ponowne wykrycie platformy/selektorów/kategorii (ignoruj cache)")
-    s.add_argument("--no-autoconfig", action="store_true",
-                   help="wyłącz automatyczne wykrywanie (użyj tylko tego, co jest w SITES)")
     s.set_defaults(fn=cmd_scrape)
     e = sub.add_parser("export")
     e.add_argument("path")

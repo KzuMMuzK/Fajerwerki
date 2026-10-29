@@ -128,17 +128,7 @@ SITES = {
         "base": "https://www.pyroking.pl", "cookies": {"currency": "PLN"},
         "listing": {
             "categories": [
-                "https://www.pyroking.pl/WYRZUTNIE-c101", "https://www.pyroking.pl/RAKIETY-c95",
-                "https://www.pyroking.pl/PETARDY-c98", "https://www.pyroking.pl/RACE-I-FLARY-c23",
-                "https://www.pyroking.pl/GRANATY-DYMNE-c21", "https://www.pyroking.pl/STROBOSKOPY-c103",
-                "https://www.pyroking.pl/RZYMSKIE-OGNIE-c96", "https://www.pyroking.pl/SINGLE-SHOTY-c93",
-                "https://www.pyroking.pl/PIROBAJERY-c104", "https://www.pyroking.pl/ZIMNE-OGNIE-c102",
-                "https://www.pyroking.pl/WULKANY-I-FONTANNY-c50", "https://www.pyroking.pl/RACE-PISTOLETOWE-c99",
-                "https://www.pyroking.pl/PISTOLETY-SYGNALOWE-c105", "https://www.pyroking.pl/PALNIKI-I-ZAPALNICZKI-c94",
-                "https://www.pyroking.pl/LONT-I-AKCESORIA-c60", "https://www.pyroking.pl/strzelajace-diabelki",
-                "https://www.pyroking.pl/fajerwerki-na-wesele", "https://www.pyroking.pl/Granaty-ASG-c134",
-                "https://www.pyroking.pl/DROP-BOX-c137", "https://www.pyroking.pl/DANGER-HOBBY-made-by-PYRO-CARTEL-c143",
-                "https://www.pyroking.pl/GATLING-c145"],
+                "https://pyroking.pl/sklep/"],
             "first": "{url}", "next": "{url}/page/{page}/", "start": 1,
             "item": "div.wd-product",
             "name": ["h3 a", ".wd-entities-title a", "a"], "link": ["h3 a@href", ".wd-entities-title a@href", "a@href"],

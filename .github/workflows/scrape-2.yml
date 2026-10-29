@@ -44,6 +44,10 @@ on:
         description: "Sprawdź ponownie adresy znane jako nie-produkty (tryb sitemap)"
         type: boolean
         default: false
+      refresh_config:
+        description: "Wymuś ponowne wykrycie platform/selektorów/kategorii (ignoruj cache)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write           # tylko do podtrzymania aktywności tego repo (patrz ostatni krok)
@@ -59,6 +63,7 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       SCRAPER_DB: data/fajerwerki.db
+      SCRAPER_AUTOCONFIG_CACHE: data/autoconfig_cache.json   # NOWE
     steps:
       # Bezpiecznik: bez prywatnego repo na dane baza wylądowałaby w publicznym.
       - name: Sprawdź konfigurację prywatnych danych
@@ -104,17 +109,19 @@ jobs:
           # Sekrety (Settings > Secrets and variables > Actions):
           SCRAPER_PROXIES: ${{ secrets.SCRAPER_PROXIES }}   # http://user:haslo@ip:port,http://user:haslo@ip2:port
           SCRAPER_CONTACT: ${{ secrets.SCRAPER_CONTACT }}   # Twój e-mail dla sklepów (User-Agent)
+          SCRAPER_REFRESH_CONFIG: ${{ inputs.refresh_config && '1' || '' }}
         run: python -u fajerwerki_scraper.py
 
       - name: Export CSV
         run: python fajerwerki_scraper.py export data/latest.csv
-
+      
       - name: Zapisz dane w prywatnym repo
         working-directory: data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add fajerwerki.db latest.csv
+          [ -f autoconfig_cache.json ] && git add autoconfig_cache.json || true
           git diff --cached --quiet || git commit -m "Aktualizacja cen $(date -u +%F)"
           git push
 

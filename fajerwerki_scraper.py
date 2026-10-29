@@ -104,31 +104,133 @@ _WOO = {"next": "{url}page/{page}/", "start": 1, "item": "li.product"}
 _WOO_PRICE = ["ins .woocommerce-Price-amount", ".woocommerce-Price-amount"]
 _PRESTA = {"next": "{url}?page={page}", "start": 1}
 
-# Minimalistyczna konfiguracja: tylko base + opcje sieciowe. Reszta (listing,
-# selektory, kategorie, paginacja) wykrywana automatycznie i cache'owana.
+# Ręczne wpisy dla sklepów, które działały stabilnie (auto-config je psuł).
+# Sklepy BEZ "listing" (odpalaj, hurtowniaas, andrzej, pyrotech, petardyshop,
+# pirozone, pironet, piroart, sklepzpetardami) idą przez auto-discovery.
 SITES = {
     "odpalaj":         {"base": "https://odpalaj.pl"},
-    "pirohit":         {"base": "https://pirohit.pl", "use_proxy": True, "max_parallel": 6, "browser_ua": True},
-    "pyroking":        {"base": "https://www.pyroking.pl", "cookies": {"currency": "PLN"}},
-    "arka":            {"base": "https://www.arkafajerwerki.pl"},
+    "pirohit": {
+        "base": "https://pirohit.pl", "use_proxy": True, "max_parallel": 6, "browser_ua": True,
+        "mode": "listing",
+        "listing": {**_IDO, "price": "strong.price.--main", "in_stock": "button.add_to_basket__button",
+            "categories": [
+                "https://pirohit.pl/Petardy-i-emitery-dzwieku-c15", "https://pirohit.pl/Wyrzutnie-c20",
+                "https://pirohit.pl/Wulkany-Fontanny-c18", "https://pirohit.pl/Rakiety-c19",
+                "https://pirohit.pl/Compoud-Wyrzutnie-laczone-c50", "https://pirohit.pl/Dymy-c22",
+                "https://pirohit.pl/Race-i-Flary-c28", "https://pirohit.pl/Stroboskopy-c21",
+                "https://pirohit.pl/Piro-Bajery-c16", "https://pirohit.pl/Rzymskie-ognie-c30",
+                "https://pirohit.pl/Single-Shoty-Mozdzierze-c23", "https://pirohit.pl/Zimne-ognie-c31",
+                "https://pirohit.pl/Zestawy-Fajerwerkow-c32", "https://pirohit.pl/Artykuly-pirotechniczne-rozne-c24",
+                "https://pirohit.pl/Akcesoria-c25", "https://pirohit.pl/Zapalarki-i-zapalniczki-c29",
+                "https://pirohit.pl/Rakietnice-pistoletowe-c41", "https://pirohit.pl/Pistolety-i-rewolwery-hukowe-c43",
+                "https://pirohit.pl/pl/menu/granaty-reczne-asg-201.html"]},
+    },
+    "pyroking": {
+        "base": "https://www.pyroking.pl", "cookies": {"currency": "PLN"},
+        "listing": {
+            "categories": [
+                "https://www.pyroking.pl/WYRZUTNIE-c101", "https://www.pyroking.pl/RAKIETY-c95",
+                "https://www.pyroking.pl/PETARDY-c98", "https://www.pyroking.pl/RACE-I-FLARY-c23",
+                "https://www.pyroking.pl/GRANATY-DYMNE-c21", "https://www.pyroking.pl/RZYMSKIE-OGNIE-c96",
+                "https://www.pyroking.pl/SINGLE-SHOTY-c93", "https://www.pyroking.pl/PIROBAJERY-c104",
+                "https://www.pyroking.pl/ZIMNE-OGNIE-c102", "https://www.pyroking.pl/WULKANY-I-FONTANNY-c50",
+                "https://www.pyroking.pl/RACE-PISTOLETOWE-c99", "https://www.pyroking.pl/PALNIKI-I-ZAPALNICZKI-c94",
+                "https://www.pyroking.pl/strzelajace-diabelki", "https://www.pyroking.pl/fajerwerki-na-wesele",
+                "https://www.pyroking.pl/Granaty-ASG-c134"],
+            "first": "{url}", "next": "{url}/page/{page}/", "start": 1,
+            "item": "div.wd-product",
+            "name": [".wd-entities-title a", "h3 a"],
+            "link": [".wd-entities-title a@href", "a.wd-product-img-link@href"],
+            "price": ["span.price ins .woocommerce-Price-amount", "span.price .woocommerce-Price-amount",
+                      ".woocommerce-Price-amount", "span.price"],
+            "out_of_stock": ".outofstock", "out_text": ["produkt niedostępny", "brak w magazynie"]},
+    },
+    "arka": {
+        "base": "https://www.arkafajerwerki.pl",
+        "listing": {**_IDO, "price": "strong.price", "out_of_stock": _IDO_OUT,
+            "categories": [
+                "https://www.arkafajerwerki.pl/pol_m_Fajerwerki-100.html",
+                "https://www.arkafajerwerki.pl/Promocja-spromo-pol.html",
+                "https://www.arkafajerwerki.pl/Nowosc-snewproducts-pol.html",
+                "https://www.arkafajerwerki.pl/pol_m_Pirotechnika-profesjonalna-i-sceniczna-304.html"]},
+    },
     "lider": {
         "base": "https://fajerwerkilider.pl",
-        "mode": "sitemap",   # infinite scroll — listing HTML nie zadziała
+        "mode": "sitemap",   # infinite scroll - listing HTML nie zadziała
         "headers": {"Referer": "https://fajerwerkilider.pl/",
                     "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"},
     },
-    "pyrostar":        {"base": "https://pyrostar.pl"},
-    "pirozaur":        {"base": "https://www.pirozaur.pl", "delay": 1.0, "browser_ua": True, "max_parallel": 2},
-    "sklepzpetardami":{"base": "https://sklepzpetardami.pl", "browser_ua": True, "use_proxy": True, "max_parallel": 2},
-    "piroman":         {"base": "https://piroman.pl"},
+    "pyrostar": {
+        "base": "https://pyrostar.pl",
+        "listing": {**_IDO, "price": "strong.price.--main", "in_stock": "button.add_to_basket__button-listing",
+            "out_of_stock": "span.--disable", "categories": ["https://pyrostar.pl/pl/menu/oferta-232.html"]},
+    },
+    "pirozaur": {
+        "base": "https://www.pirozaur.pl", "delay": 1.0, "browser_ua": True,
+        "max_parallel": 2,
+        "listing": {
+            "first": "{url}", "next": "{url}?page={page}", "start": 1,
+            "categories": ["https://www.pirozaur.pl/2-strona-glowna"],
+            "item": ["article.product-miniature", "article.js-product-miniature"],
+            "name": ["h2.product-title a", "h2.product-title", ".product-title a", ".product-title",
+                     "a.product-name"],
+            "link": ["h2.product-title a@href", "a.product-thumbnail@href", "a.thumbnail@href",
+                     ".product-title a@href", "a.product-name@href"],
+            "price": ["span.price", ".product-price .price", ".product-price"],
+            "out_of_stock": ".product-unavailable, li.out_of_stock, button[data-button-action='add-to-cart'][disabled]",
+            "out_text": ["nie ma takiej ilości", "wyprzedan", "brak w magazynie"],
+        },
+    },
+    "sklepzpetardami": {
+        "base": "https://sklepzpetardami.pl", "browser_ua": True,
+        "use_proxy": True, "max_parallel": 2,
+        "listing": {**_PRESTA,
+            "categories": ["https://sklepzpetardami.pl/kategoria-produktu/oferta/"],
+            "item": "article.product-miniature",
+            "name": "div.tvproduct-name a", "link": "div.tvproduct-name a@href", "price": "span.price",
+            "out_of_stock": "button.add-to-cart.tvproduct-out-of-stock, button.add-to-cart.disable, button.add-to-cart[disabled]"},
+    },
+    "piroman": {
+        "base": "https://piroman.pl",
+        "listing": {**_PRESTA, "item": "article.product-miniature",
+            "name": "h3.product-title a", "link": "h3.product-title a@href", "price": "span[itemprop=price]@content",
+            "out_of_stock": "button.add-to-cart.disabled, li.available_date",
+            "categories": ["https://piroman.pl/23-fajerwerki", "https://piroman.pl/10-strefa-kibica",
+                           "https://piroman.pl/24-odstraszanie-zwierzyny"]},
+    },
     "hurtowniaas":     {"base": "https://fajerwerkigorzow.pl"},
-    "szopik":          {"base": "https://fajerwerki.shop.pl", "use_proxy": True},
+    "szopik": {
+        "base": "https://fajerwerki.shop.pl", "use_proxy": True,
+        "mode": "listing",
+        "listing": {"next": "{url}?counter={page}&p=5", "start": 0, "item": "product-tile",
+            "name": "a.link_no-underline", "link": "a.link_no-underline@href", "price": "span.price__value",
+            "out_text": ["niedostępn", "powiadom o dostępności", "powiadom mnie", "brak towaru", "wyprzedan"],
+            "categories": ["https://fajerwerki.shop.pl/pl/menu/" + x + ".html" for x in (
+                "single-shoty-mozdzierze-157", "palniki-zarowe-158", "rzymskie-ognie-159",
+                "wulkany-fontanny-160", "swiece-dymne-161",
+                "pirobajery-baczki-cyrkoblitze-162", "zimne-ognie-163", "rakiety-164",
+                "race-sygnalowe-startowce-165", "artykuly-weselne-party-gender-party-166",
+                "pirotechnika-sceniczna-167", "lonty-i-zapalniki-splonka-168", "gadzety-fun-gadzet-169",
+                "produkty-bez-rabatu-175", "singleline-183", "wyrzutnie-50mm-182",
+                "zestawy-zlozone-dso-compound-181", "katowe-wyrzutnie-189", "wyrzutnie-25-99-strzalow-190",
+                "wyrzutnie-100-500-strzalow-191", "wyrzutnie-1-25-strzalow-192", "tpro-show-193")]},
+    },
     "pyrotech":        {"base": "https://hurtownia-fajerwerki.pl",
                         "sitemaps": ["https://hurtownia-fajerwerki.pl/sitemap.xml.gz"]},
     "pirozone":        {"base": "https://pirozone.pl", "delay": 0.7, "browser_ua": True,
                         "use_proxy": True, "max_parallel": 2},
-    "firefactory":     {"base": "https://www.firefactory.pl"},
-    "obornicka":       {"base": "https://www.fajerwerki-obornicka.pl"},
+    "firefactory": {
+        "base": "https://www.firefactory.pl",
+        "listing": {**_WOO, "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
+            "price": ["ins", "span.woocommerce-Price-amount"], "out_text": ["dowiedz się więcej"],
+            "categories": ["https://www.firefactory.pl/sklep/"]},
+    },
+    "obornicka": {
+        "base": "https://www.fajerwerki-obornicka.pl",
+        "listing": {**_WOO, "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
+            "price": ["span.price ins bdi", "span.price bdi"], "out_text": ["brak w magazynie"],
+            "categories": ["https://www.fajerwerki-obornicka.pl/home/sklep/"]},
+    },
     "andrzej":         {"base": "https://piroandrzej.pl"},
     "pironet":         {"base": "https://pironet.pl", "browser_ua": True, "use_proxy": True, "max_parallel": 2},
     "piroart":         {"base": "https://piroart.pl", "use_proxy": True, "browser_ua": True, "max_parallel": 2,
@@ -295,9 +397,7 @@ def _live_count():
 
 
 def _is_safe_proxy_for_https(px):
-    """SOCKS i HTTPS proxy tunelują bez MITM - bezpieczne dla HTTPS.
-    HTTP proxy mogą MITM (self-signed cert) - używamy ich tylko jako fallback."""
-    return px.startswith(("socks5", "socks4", "https://"))
+    return px.startswith(("socks5", "socks4"))
 
 
 def pick_proxy(url_scheme="https"):
@@ -885,6 +985,8 @@ _NOT_CATEGORY_PATTERNS = re.compile(
     r"search|szukaj|wyniki-wyszukiwania|"
     r"page/\d+|strona/\d+"
     r")/|(?:^|/)page/\d+/?$|uncategorized|bez-kategorii)",
+    r"|logowanie|login|register|rejestracja|password|haslo|checkout|zamowienie|order|newsletter|"
+    r"|fajerwerki-(katowice|warszawa|krakow|wroclaw|poznan|gdansk|gdynia|lodz|szczecin|lublin|bydgoszcz|torun|radom|kielce|rzeszow|olsztyn|czestochowa|gliwice|zabrze|bialystok|konin|pila|wejherowo|tarnobrzeg|opole|zielona-gora)"
     re.I,
 )
 
@@ -944,6 +1046,8 @@ def _menu_cat_candidates(menu_links, base_url, base_netloc):
         if u.rstrip("/") == base_clean:
             continue
         if _NOT_CATEGORY_PATTERNS.search(p.path):
+            continue
+        if p.fragment:
             continue
         out.append(u)
     return out

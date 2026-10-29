@@ -397,8 +397,9 @@ def _live_count():
 
 
 def _is_safe_proxy_for_https(px):
+    """Tylko SOCKS tuneluje surowe bajty (bez MITM).
+    HTTP i HTTPS proxy mogą robić SSL interception, więc ich nie używamy dla HTTPS."""
     return px.startswith(("socks5", "socks4"))
-
 
 def pick_proxy(url_scheme="https"):
     """Dla HTTPS preferuj socks5/https (bez MITM). Dla HTTP każdy proxy jest OK."""
@@ -984,9 +985,11 @@ _NOT_CATEGORY_PATTERNS = re.compile(
     r"producenci|producers|brands|marki|"
     r"search|szukaj|wyniki-wyszukiwania|"
     r"page/\d+|strona/\d+"
-    r")/|(?:^|/)page/\d+/?$|uncategorized|bez-kategorii)",
-    r"|logowanie|login|register|rejestracja|password|haslo|checkout|zamowienie|order|newsletter|",
-    r"|fajerwerki-(katowice|warszawa|krakow|wroclaw|poznan|gdansk|gdynia|lodz|szczecin|lublin|bydgoszcz|torun|radom|kielce|rzeszow|olsztyn|czestochowa|gliwice|zabrze|bialystok|konin|pila|wejherowo|tarnobrzeg|opole|zielona-gora)",
+    r")/|(?:^|/)page/\d+/?$|uncategorized|bez-kategorii"
+    r"|logowanie|login|register|rejestracja|password|haslo|checkout|newsletter"
+    r"|fajerwerki-(?:katowice|warszawa|krakow|wroclaw|poznan|gdansk|gdynia|lodz|szczecin|lublin|"
+    r"bydgoszcz|torun|radom|kielce|rzeszow|olsztyn|czestochowa|gliwice|zabrze|bialystok|konin|"
+    r"pila|wejherowo|tarnobrzeg|opole|zielona-gora))",
     re.I,
 )
 
@@ -1040,14 +1043,14 @@ def _menu_cat_candidates(menu_links, base_url, base_netloc):
             continue
         if p.scheme not in ("http", "https"):
             continue
+        if p.fragment:                 # #showSearchForm, #content — nie kategoria
+            continue
         path_lower = p.path.lower()
         if any(path_lower.endswith(ext) for ext in _SKIP_EXT):
             continue
         if u.rstrip("/") == base_clean:
             continue
         if _NOT_CATEGORY_PATTERNS.search(p.path):
-            continue
-        if p.fragment:
             continue
         out.append(u)
     return out

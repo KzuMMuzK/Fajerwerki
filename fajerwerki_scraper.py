@@ -19,7 +19,7 @@ Zmienne środowiskowe (GitHub Actions: Settings > Secrets and variables > Action
   USTAWIENIA (opcjonalne):
     SCRAPER_ONLY=pirohit,lider   SCRAPER_MAX=2   SCRAPER_WORKERS=12   SCRAPER_DELAY=0.5
     SCRAPER_PROXY_SOURCE=geonode   darmowe proxy z Geonode, tylko dla sklepów z use_proxy (opcje: SCRAPER_PROXY_COUNTRY=PL,DE  SCRAPER_FREE_PROXY_COUNT=12)
-    SCRAPER_MODE=smart|sitemap|listing|auto   SCRAPER_VERBOSE=1   SCRAPER_RECHECK=1   SCRAPER_PROXY_ALL=1   SCRAPER_DB=sciezka/do/bazy.db
+    SCRAPER_MODE=auto|smart|sitemap|listing   SCRAPER_VERBOSE=1   SCRAPER_RECHECK=1   SCRAPER_PROXY_ALL=1   SCRAPER_DB=sciezka/do/bazy.db
 
 Jak to działa (tryb sitemap; tryb listing czyta strony kategorii - patrz SITES):
   1. Adresy produktów bierze z sitemap.xml sklepu (robots.txt -> Sitemap:).
@@ -65,6 +65,7 @@ def env(name, default=None):
     """Zmienna środowiskowa; pusta wartość = brak (tak działają puste pola w GitHub Actions)."""
     v = os.environ.get(name, "").strip()
     return v if v else default
+
 
 DB_PATH = env("SCRAPER_DB", "fajerwerki.db")  # w Actions: data/fajerwerki.db (prywatne repo z danymi)
 USER_AGENT = "Mozilla/5.0 (compatible; FajerwerkiPrices/1.0" + (f"; +kontakt: {env('SCRAPER_CONTACT')}" if env("SCRAPER_CONTACT") else "") + ")"
@@ -306,6 +307,94 @@ _min_delay, _proxy_hosts = {}, set()   # netloc -> min. odstęp (crawl-delay / '
 PROXY_ALL = env('SCRAPER_PROXY_ALL') == '1'  # 1 = proxy dla wszystkich sklepów, nie tylko z use_proxy
 PROXY_MAX_FAILS = 3   # tyle błędów z rzędu = pauza dla tego proxy
 PROXY_PAUSE = 120     # sekundy pauzy (potem proxy dostaje kolejną szansę)
+
+# --- Adaptacyjne tempo per host (mniej 429 i mniej timeoutów) ---------------
+_host_delay = {}          # host -> aktualny (adaptacyjny) odstęp między zapytaniami
+_host_last_ease = {}      # host -> timestamp ostatniego rozluźnienia (delay/gate)
+_warn_last = {}           # (host, kind) -> timestamp ostatniego ostrzeżenia
+_warn_count = Counter()   # (host, kind) -> ile ostrzeżeń stłumiono od ostatniego wydruku
+_host_gate = {}           # host -> _AdaptiveGate (ogranicza równoległe zapytania)
+_gate_lock = threading.Lock()
+
+
+class _AdaptiveGate:
+    """Ogranicza liczbę równoległych zapytań do hosta; można zmniejszać w locie przy 429/timeoutach."""
+    def __init__(self, n):
+        self.max = n
+        self.active = 0
+        self.cv = threading.Condition()
+
+    def __enter__(self):
+        with self.cv:
+            while self.active >= self.max:
+                self.cv.wait()
+            self.active += 1
+        return self
+
+    def __exit__(self, *a):
+        with self.cv:
+            self.active -= 1
+            self.cv.notify()
+
+    def shrink(self, n):
+        with self.cv:
+            self.max = max(1, min(self.max, n))
+
+    def grow(self, n):
+        with self.cv:
+            if n > self.max:
+                self.max = n
+                self.cv.notify_all()
+
+
+def _gate(host):
+    with _gate_lock:
+        g = _host_gate.get(host)
+        if g is None:
+            g = _AdaptiveGate(WORKERS)
+            _host_gate[host] = g
+        return g
+
+
+def _base_delay(host):
+    return max(DELAY, _min_delay.get(host, 0.0))
+
+
+def _bump_delay(host, factor, cap=20.0):
+    with _lock:
+        cur = _host_delay.get(host) or _base_delay(host)
+        new = min(cap, cur * factor)
+        if new > cur * 1.1:
+            log.info("spowalniam %s: %.2fs → %.2fs", host, cur, new)
+        _host_delay[host] = new
+
+
+def _maybe_ease(host, gate):
+    """Po sukcesie: max raz na 5s rozluźnia delay (x0.7) i bramkę (+1 do WORKERS)."""
+    with _lock:
+        now = time.time()
+        if now - _host_last_ease.get(host, 0) < 5.0:
+            return
+        _host_last_ease[host] = now
+        base = _base_delay(host)
+        cur = _host_delay.get(host, base)
+        if cur > base * 1.02:
+            _host_delay[host] = max(base, cur * 0.7)
+    if gate.max < WORKERS:
+        gate.grow(min(WORKERS, gate.max + 1))
+
+
+def _warn_rate_limited(host, kind, msg, every=30.0):
+    """Ostrzeżenie najwyżej raz na `every` s per (host, kind) - koniec ze spamem setek linii."""
+    now = time.time()
+    key = (host, kind)
+    with _lock:
+        if now - _warn_last.get(key, 0) < every:
+            _warn_count[key] += 1
+            return
+        skipped = _warn_count.pop(key, 0)
+        _warn_last[key] = now
+    log.warning("%s%s", msg, f" [+{skipped} podobnych]" if skipped else "")
 
 
 def session():
@@ -596,9 +685,11 @@ def allowed(url):
 
 
 def throttle(host):
-    """Rezerwuje następny wolny slot czasowy dla hosta (działa między wątkami)."""
-    delay = max(DELAY, _min_delay.get(host, 0.0))
+    """Rezerwuje następny wolny slot czasowy dla hosta (działa między wątkami).
+    Używa adaptacyjnego delay (rośnie przy 429/timeoutach, maleje po sukcesach)."""
     with _lock:
+        base = _base_delay(host)
+        delay = max(base, _host_delay.get(host, base))
         now = time.time()
         slot = max(now, _next_slot.get(host, 0.0))
         _next_slot[host] = slot + delay
@@ -621,6 +712,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     last_err = "?"
     if _proxies and (PROXY_ALL or host in _proxy_hosts):
         retries = max(retries, min(8, _live_count() + 1))  # kolejne próby = kolejne proxy
+    gate = _gate(host)
     for attempt in range(retries):
         throttle(host)
         px = None
@@ -630,13 +722,30 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                 _tls.last_fail = "adres HTTP nie przez darmowe proxy"  # po HTTP proxy widziałoby i mogło zmienić treść
                 bump("nieudane")
                 return None
-            with _host_sem.get(host) or contextlib.nullcontext():
-                r = session().get(url, timeout=(10, 20) if px else 25, cookies=cookies, headers=headers, **proxy_kw(px))
+            to = (10, 20) if px else (8, 20)   # krótszy connect: 8s zamiast 25s = mniej czasu na martwych serwerach
+            with gate:
+                with _host_sem.get(host) or contextlib.nullcontext():
+                    r = session().get(url, timeout=to, cookies=cookies, headers=headers, **proxy_kw(px))
             report_proxy(px, True)
             code = r.status_code
             if code == 200:
+                _maybe_ease(host, gate)   # sukces -> powoli rozluźniamy delay/gate (jeśli były podniesione)
                 bump("pobrane_ok")
                 return r
+            if code == 429:
+                wait = 5.0
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        wait = min(60.0, float(ra))
+                    except (ValueError, TypeError):
+                        pass
+                _bump_delay(host, 2.0)                # następne zapytania rzadziej
+                gate.shrink(max(2, gate.max // 2))     # mniej równoległych = mniej 429
+                _warn_rate_limited(host, "429", f"HTTP 429 {host} – spowalniam, czekam {wait:.0f}s")
+                bump("http_429")
+                time.sleep(min(wait, 20.0))           # czeka TYLKO ten wątek, nie cały host
+                continue
             if code in (403, 404, 410):
                 bump(f"http_{code}")
                 _tls.last_fail = f"HTTP {code}" + (f" (server: {r.headers.get('server', '?')})" if code == 403 else "")
@@ -646,18 +755,24 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                 elif code != 403:
                     log.debug("HTTP %s: %s", code, url)
                 return None
-            log.warning("HTTP %s (próba %d/%d): %s", code, attempt + 1, retries, url)
             last_err = f"HTTP {code}"
-            if code == 429 or code >= 500:
-                pause = 10 * (attempt + 1)
-                with _lock:  # spowalniamy WSZYSTKIE wątki dla tego hosta
-                    _next_slot[host] = max(_next_slot.get(host, 0.0), time.time() + pause)
+            _warn_rate_limited(host, f"http_{code}", f"HTTP {code} (próba {attempt + 1}/{retries}): {url}", every=30)
+            if code >= 500:
+                _bump_delay(host, 1.5)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            report_proxy(px, False)
+            last_err = short_err(e)
+            _bump_delay(host, 1.3, cap=10.0)          # wolniejszy host = większy odstęp
+            _warn_rate_limited(host, type(e).__name__,
+                               f"błąd sieci przez {mask(px)} (próba {attempt + 1}/{retries}): {url} | {last_err}", every=30)
+            if attempt >= 1:                          # timeout/conn error: max 2 próby zamiast 3
+                break
         except requests.RequestException as e:
             report_proxy(px, False)
             last_err = short_err(e)
-            proxied = px is not None
-            log.warning("błąd sieci przez %s (próba %d/%d): %s | %s", mask(px), attempt + 1, retries, url, last_err)
-            if proxied:
+            _warn_rate_limited(host, type(e).__name__,
+                               f"błąd sieci przez {mask(px)} (próba {attempt + 1}/{retries}): {url} | {last_err}", every=30)
+            if px is not None:
                 continue
         time.sleep(2 ** attempt)
     bump("nieudane")
@@ -1681,7 +1796,7 @@ def cmd_scrape(args):
         log.warning("podano proxy, ale żaden wybrany sklep nie ma use_proxy (ustaw SCRAPER_PROXY_ALL=1, by użyć dla wszystkich)")
     in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
     summary = []
-    mode = (args.mode or "smart").lower()
+    mode = (args.mode or "auto").lower()
     if mode not in ("smart", "sitemap", "listing", "auto"):
         raise SystemExit(f"Nieznany tryb {mode!r}: użyj smart, sitemap, listing albo auto")
     listing_names, sitemap_names, fallback_ok = [], [], []   # fallback_ok: sitemapa najpierw, a przy porażce kategorie
@@ -1785,7 +1900,7 @@ def main():
     s.add_argument("--delay", type=float, default=DELAY, help="min. odstęp między zapytaniami do hosta (s)")
     s.add_argument("--proxy", action="append", help="adres proxy (http://user:haslo@host:port lub socks5://...), można podać wiele razy")
     s.add_argument("--proxy-file", help="plik z proxy, jedno na linię")
-    s.add_argument("--mode", default=env("SCRAPER_MODE", "smart"), help="smart (domyślnie) = sitemapa, a gdy się nie da - kategorie | sitemap | listing | auto = kategorie, a gdy nic nie da - sitemapa; ENV: SCRAPER_MODE")
+    s.add_argument("--mode", default=env("SCRAPER_MODE", "auto"), help="auto (domyślnie) = kategorie najpierw, a gdy nic nie da - sitemapa | listing | sitemap | smart = sitemapa, a gdy się nie da - kategorie; ENV: SCRAPER_MODE")
     s.add_argument("--recheck", action="store_true", default=env("SCRAPER_RECHECK") == "1", help="sprawdź ponownie też adresy znane jako nie-produkty")
     s.set_defaults(fn=cmd_scrape)
     e = sub.add_parser("export")

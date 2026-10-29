@@ -83,6 +83,10 @@ NONPRODUCT_TTL_DAYS = 14  # tyle dni pamiętamy, że dany adres NIE jest produkt
 #                przyspiesza, ale opcjonalny
 #   selectors  : (opcjonalnie) nadpisanie, gdy sklep nie ma JSON-LD
 #   sitemaps   : (opcjonalnie) ręczne adresy sitemap
+#   browser_ua : (opcjonalnie) wysyłaj User-Agent przeglądarki (dla sklepów blokujących scrapery)
+#   delay      : (opcjonalnie) min. odstęp w s dla tego sklepu
+#   use_proxy  : (opcjonalnie) używaj proxy dla tego sklepu
+#   max_parallel: (opcjonalnie) limit równoległych zapytań przez proxy (domyślnie 4)
 # ---------------------------------------------------------------------------
 # Wspólne wzorce szablonów sklepów (IdoSell, WooCommerce, PrestaShop).
 _IDO = {"next": "{url}?counter={page}", "start": 0, "item": "div.product",
@@ -97,15 +101,6 @@ _HAS = "https://fajerwerkigorzow.pl/produkty/hurtownia/"
 _PZ = "https://pirozone.pl/"
 
 SITES = {
-    # --- TRYB "listing": czyta strony kategorii (kilkadziesiąt produktów na 1 zapytanie).
-    # To jest ~20-40x szybsze niż wejście na każdy produkt osobno.
-    # Pola: categories = adresy kategorii; item = kafelek produktu (lub lista selektorów: pierwszy,
-    # który coś znajdzie); name/link/price = selektor CSS wewnątrz kafelka ("sel@atrybut" czyta
-    # atrybut, lista = próbuj po kolei); in_stock = selektor, którego BRAK oznacza brak towaru;
-    # out_of_stock = selektor, którego obecność oznacza brak; out_text = teksty oznaczające brak;
-    # price_strip = regexy wycinane z tekstu ceny; first/next = wzorce adresów stron ({url}, {page});
-    # start = numer pierwszej strony.
-    # Opcje sklepu: cookies, headers, delay (min. odstęp w s dla tego sklepu), use_proxy.
     "odpalaj": {
         "base": "https://odpalaj.pl",
         "listing": {**_PRESTA, "categories": ["https://odpalaj.pl/pl/2-wszystko"],
@@ -114,8 +109,8 @@ SITES = {
             "out_of_stock": "ul.product-flags li.out_of_stock", "out_text": ["brak na stanie"]},
     },
     "pirohit": {
-        "base": "https://pirohit.pl", "use_proxy": True,
-        "mode": "listing",   # przez proxy płacisz za transfer: strony kategorii (kilkadziesiąt produktów w 1 zapytaniu) zamiast tysięcy stron produktów; usuń tę linię, by użyć sitemapy
+        "base": "https://pirohit.pl", "use_proxy": True, "max_parallel": 6, "browser_ua": True,
+        "mode": "listing",
         "listing": {**_IDO, "price": "strong.price.--main", "in_stock": "button.add_to_basket__button",
             "categories": [
                 "https://pirohit.pl/Petardy-i-emitery-dzwieku-c15", "https://pirohit.pl/Wyrzutnie-c20",
@@ -144,7 +139,7 @@ SITES = {
                 "https://www.pyroking.pl/fajerwerki-na-wesele", "https://www.pyroking.pl/Granaty-ASG-c134",
                 "https://www.pyroking.pl/DROP-BOX-c137", "https://www.pyroking.pl/DANGER-HOBBY-made-by-PYRO-CARTEL-c143",
                 "https://www.pyroking.pl/GATLING-c145"],
-            "first": "{url}", "next": "{url}/page/{page}/", "start": 1,   # nowy szablon (Woodmart); paginacja do potwierdzenia
+            "first": "{url}", "next": "{url}/page/{page}/", "start": 1,
             "item": "div.wd-product",
             "name": ["h3 a", ".wd-entities-title a", "a"], "link": ["h3 a@href", ".wd-entities-title a@href", "a@href"],
             "price": ["span.price ins .woocommerce-Price-amount", "span.price .woocommerce-Price-amount",
@@ -163,12 +158,12 @@ SITES = {
     "lider": {
         "base": "https://fajerwerkilider.pl",
         "headers": {"Referer": "https://fajerwerkilider.pl/", "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"},
-        "listing": {"next": "{url}?page={page}", "start": 1,   # nowy szablon (Tailwind); paginacja do potwierdzenia
+        "listing": {"next": "{url}?page={page}", "start": 1,
             "item": "a.group.relative.flex", "name": ["img@alt", "h3", "h2"], "link": "@href",
             "price": "span[class*='font-semibold'][class*='text-[17px]']",
             "out_text": ["niedostępn", "brak towaru", "powiadom"],
             "categories": [_LIDER + x for x in (
-                "5-art-rozne-pirobajery", "15-bron-hukowa-naboje-race-pistoletowe", "61-ciche-fajerwerki",
+                "5-art-rozne-pirobajery", "61-ciche-fajerwerki",
                 "4-flary-i-race", "9-fontanny-fajerwerki-wulkany", "8-fontanny-tortowe-i-swieczki", "10-katiusze",
                 "471-miny-dymne", "12-mozdzierze", "452-odstraszacze-zwierzyny", "16-petardy",
                 "13-pirotechnika-profesjonalna", "14-pirotechnika-sceniczna", "17-pochodnie-parafinowe",
@@ -176,7 +171,7 @@ SITES = {
                 "20-stroboskopy", "3-swiece-dymne", "11-tuby-strzelajace-konfetti", "menu/wyrzutnie-dzienne-230.html",
                 "21-wyrzutnie-fajerwerkow-baterie", "22-zestawy-fajerwerkow-do-samodzielnego-odpalenia",
                 "menu/wyrzutnie-hukowe-231.html", "23-zestawy-fajerwerkow", "24-zimne-ognie",
-                "menu/gatlingi-254.html", "51-fajerwerki-na-wesele")]},
+                "menu/gatlingi-254.html")]},
     },
     "pyrostar": {
         "base": "https://pyrostar.pl",
@@ -184,16 +179,18 @@ SITES = {
             "out_of_stock": "span.--disable", "categories": ["https://pyrostar.pl/pl/menu/oferta-232.html"]},
     },
     "pirozaur": {
-        "base": "https://www.pirozaur.pl", "delay": 1.0,
+        "base": "https://www.pirozaur.pl", "delay": 1.0, "browser_ua": True,
         "listing": {**_PRESTA, "categories": ["https://www.pirozaur.pl/2-strona-glowna"],
-            "item": ["div.js-product", "article.product-miniature"],
-            "name": ["h3.product-title a", "a.product-thumbnail"],
-            "link": ["h3.product-title a@href", "a.product-thumbnail@href"],
-            "price": ["span.price", "meta[itemprop=price]@content"],
-            "out_of_stock": "li.out_of_stock, button[data-button-action='add-to-cart'][disabled]"},
+            "item": ["article.product-miniature", "div.js-product", "div.product-miniature", "article.product"],
+            "name": ["h2.product-title a", "h3.product-title a", "a.product-name", ".product-title a",
+                     "h2 a", "h3 a"],
+            "link": ["h2.product-title a@href", "h3.product-title a@href", "a.product-name@href",
+                     ".product-title a@href", "h2 a@href", "h3 a@href", "a.product-thumbnail@href"],
+            "price": ["span.price", ".product-price", "meta[itemprop=price]@content"],
+            "out_of_stock": "li.out_of_stock, button[data-button-action='add-to-cart'][disabled], .out-of-stock"},
     },
     "sklepzpetardami": {
-        "base": "https://sklepzpetardami.pl",
+        "base": "https://sklepzpetardami.pl", "browser_ua": True,
         "listing": {**_PRESTA, "categories": ["https://sklepzpetardami.pl/kategoria-produktu/oferta/"],
             "item": "article.product-miniature",
             "name": "div.tvproduct-name a", "link": "div.tvproduct-name a@href", "price": "span.price",
@@ -221,7 +218,7 @@ SITES = {
     },
     "szopik": {
         "base": "https://fajerwerki.shop.pl", "use_proxy": True,
-        "mode": "listing",   # j.w. (strony ~0,9 MB); usuń tę linię, by użyć sitemapy
+        "mode": "listing",
         "listing": {"next": "{url}?counter={page}&p=5", "start": 0, "item": "product-tile",
             "name": "a.link_no-underline", "link": "a.link_no-underline@href", "price": "span.price__value",
             "out_text": ["niedostępn", "powiadom o dostępności", "powiadom mnie", "brak towaru", "wyprzedan"],
@@ -241,7 +238,7 @@ SITES = {
             "categories": ["https://hurtownia-fajerwerki.pl/pol_m_Fajerwerki-157.html"]},
     },
     "pirozone": {
-        "base": "https://pirozone.pl", "delay": 0.7,
+        "base": "https://pirozone.pl", "delay": 0.7, "browser_ua": True,
         "listing": {"next": "{url}page/{page}/?currency=PLN", "start": 1, "item": "li.product",
             "name": ["h3.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title"],
             "link": ["h3.woocommerce-loop-product__title a@href", "a.woocommerce-LoopProduct-link@href"],
@@ -275,7 +272,7 @@ SITES = {
             "categories": ["https://piroandrzej.pl/sklep/"]},
     },
     "pironet": {
-        "base": "https://pironet.pl",
+        "base": "https://pironet.pl", "browser_ua": True,
         "listing": {**_WOO, "name": "h3.woocommerce-loop-product__title a",
             "link": "h3.woocommerce-loop-product__title a@href",
             "price": ["span.price ins bdi", "span.price bdi", "span.price"],
@@ -283,16 +280,21 @@ SITES = {
             "categories": ["https://pironet.pl/sklep-z-fajerwerkami/"]},
     },
     "piroart": {
-        "base": "https://piroart.pl", "use_proxy": True, "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
+        "base": "https://piroart.pl", "use_proxy": True, "browser_ua": True,
+        "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
         "listing": {**_WOO, "name": "div.product__title h3", "link": "a.woocommerce-loop-product__link@href",
             "price": "span.current span.woocommerce-Price-amount",
             "categories": ["https://piroart.pl/hurtownia/"]},
     },
-    # --- TRYB "sitemap" (wolniejszy, uniwersalny): sklepy bez konfiguracji "listing"
-    "petardyshop": {"base": "https://petardyshop.pl"},
-    # Wzór wpisu z selektorami dla trybu sitemap, gdy sklep nie ma JSON-LD:
-    # "nazwa": {"base": "https://example.pl", "url_regex": r"\.html$",
-    #           "selectors": {"name": "h1", "price": ".price", "availability": ".stock"}},
+    "petardyshop": {
+        "base": "https://petardyshop.pl", "delay": 0.2, "browser_ua": True,
+        "mode": "listing",
+        "listing": {**_WOO, "name": ["h2.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title a",
+                                      "h2.woocommerce-loop-product__title", "h3.woocommerce-loop-product__title"],
+            "link": ["a.woocommerce-LoopProduct-link@href", "a.woocommerce-loop-product__link@href"],
+            "price": _WOO_PRICE, "in_stock": ".instock", "out_of_stock": ".outofstock",
+            "categories": ["https://petardyshop.pl/sklep/"]},
+    },
 }
 
 _tls = threading.local()
@@ -300,20 +302,20 @@ _lock = threading.RLock()
 _stats_lock = threading.Lock()
 _robots, _crawl_delay, _next_slot = {}, {}, {}
 _robots_note = {}
-_proxies, _proxy_i, _proxy_fail, _proxy_dead = [], 0, Counter(), {}   # _proxy_dead: proxy -> do kiedy w pauzie
-_host_sem = {}  # netloc -> semafor: limit równoległych zapytań przez proxy
-_proxy_strikes = Counter()  # ile razy proxy trafiło do pauzy
-_min_delay, _proxy_hosts = {}, set()   # netloc -> min. odstęp (crawl-delay / 'delay' sklepu); hosty z use_proxy
-PROXY_ALL = env('SCRAPER_PROXY_ALL') == '1'  # 1 = proxy dla wszystkich sklepów, nie tylko z use_proxy
-PROXY_MAX_FAILS = 3   # tyle błędów z rzędu = pauza dla tego proxy
-PROXY_PAUSE = 120     # sekundy pauzy (potem proxy dostaje kolejną szansę)
+_proxies, _proxy_i, _proxy_fail, _proxy_dead = [], 0, Counter(), {}
+_host_sem = {}
+_proxy_strikes = Counter()
+_min_delay, _proxy_hosts = {}, set()
+PROXY_ALL = env('SCRAPER_PROXY_ALL') == '1'
+PROXY_MAX_FAILS = 3
+PROXY_PAUSE = 120
 
 # --- Adaptacyjne tempo per host (mniej 429 i mniej timeoutów) ---------------
-_host_delay = {}          # host -> aktualny (adaptacyjny) odstęp między zapytaniami
-_host_last_ease = {}      # host -> timestamp ostatniego rozluźnienia (delay/gate)
-_warn_last = {}           # (host, kind) -> timestamp ostatniego ostrzeżenia
-_warn_count = Counter()   # (host, kind) -> ile ostrzeżeń stłumiono od ostatniego wydruku
-_host_gate = {}           # host -> _AdaptiveGate (ogranicza równoległe zapytania)
+_host_delay = {}
+_host_last_ease = {}
+_warn_last = {}
+_warn_count = Counter()
+_host_gate = {}
 _gate_lock = threading.Lock()
 
 
@@ -409,7 +411,6 @@ def session():
 
 # ----------------------------- sieć -----------------------------------------
 def mask(px):
-    """Etykieta proxy do logów: bez hosta, portu i hasła (logi w publicznym repo są widoczne dla wszystkich)."""
     if not px:
         return "bezpośrednio"
     try:
@@ -419,8 +420,6 @@ def mask(px):
 
 
 def short_err(e):
-    """Sedno błędu sieci bez adresów IP i haseł, np. 'ProxyError: Tunnel connection failed: 407 Proxy
-    Authentication Required' (logi w publicznym repo są widoczne dla wszystkich)."""
     msg = str(e)
     msg = re.sub(r"//[^/@\s]+@", "//***@", msg)
     msg = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b", "<ip>", msg)
@@ -432,7 +431,6 @@ def short_err(e):
 
 
 def setup_proxies(args):
-    """Proxy z --proxy, --proxy-file i zmiennej SCRAPER_PROXIES (rozdzielone przecinkami)."""
     global _proxies
     items = list(args.proxy or [])
     if args.proxy_file:
@@ -451,9 +449,6 @@ def _live_count():
 
 
 def pick_proxy():
-    """Następne proxy (round-robin) pomijając te w pauzie. Bez listy proxy -> None (połączenie bezpośrednie).
-    Gdy wszystkie są w pauzie, bierze to, którego pauza kończy się najwcześniej - NIGDY nie przechodzi na
-    połączenie bezpośrednie (ujawniłoby Twoje IP)."""
     global _proxy_i
     if not _proxies:
         return None
@@ -480,7 +475,7 @@ def report_proxy(px, ok):
             _proxy_fail[px] = 0
             _proxy_dead[px] = time.time() + PROXY_PAUSE
             _proxy_strikes[px] += 1
-            if px in _free_proxies and _proxy_strikes[px] >= 2:  # darmowe proxy żyją krótko - nie męczymy ich w kółko
+            if px in _free_proxies and _proxy_strikes[px] >= 2:
                 label = mask(px)
                 _proxies.remove(px)
                 _free_proxies.discard(px)
@@ -492,19 +487,18 @@ def report_proxy(px, ok):
 
 
 GEONODE_API = os.environ.get("GEONODE_API", "https://proxylist.geonode.com/api/proxy-list")
-_free_proxies = set()   # proxy pochodzące z darmowej listy (nie dostają ruchu HTTP, tylko HTTPS)
+_free_proxies = set()
 
 
 def _socks_ok():
     try:
-        import socks  # noqa: F401  (PySocks, instalowany przez requests[socks])
+        import socks  # noqa: F401
     except ImportError:
         return False
     return True
 
 
 def geonode_candidates(countries=()):
-    """Lista kandydatów z API Geonode: tylko 'anonymous'/'elite' (transparent zdradza Twoje IP), uptime >= 80%."""
     try:
         r = requests.get(GEONODE_API, params={"limit": 500, "page": 1, "sort_by": "lastChecked", "sort_type": "desc"},
                          timeout=30, headers={"User-Agent": USER_AGENT})
@@ -530,9 +524,9 @@ def geonode_candidates(countries=()):
             continue
         protos = {str(x).lower() for x in (it.get("protocols") or [])}
         if protos & {"http", "https"}:
-            scheme = "http"       # serwer proxy HTTP(S); do stron HTTPS używa tunelu CONNECT
+            scheme = "http"
         elif "socks5" in protos and socks_ok:
-            scheme = "socks5h"    # DNS po stronie proxy
+            scheme = "socks5h"
         elif "socks4" in protos and socks_ok:
             scheme = "socks4a"
         else:
@@ -540,7 +534,7 @@ def geonode_candidates(countries=()):
             continue
         prio = 0 if "https" in protos else (1 if scheme == "socks5h" else 2)
         cands.append((prio, round(-up / 10), round(float(it.get("responseTime") or 9999) / 200), f"{scheme}://{ip}:{port}"))
-    random.shuffle(cands)                     # remisy losowo, żeby nie obciążać wciąż tych samych serwerów
+    random.shuffle(cands)
     cands.sort(key=lambda c: c[:3])
     log.info("darmowe proxy (Geonode): %d na liście, %d kandydatów po filtrach%s", len(data), len(cands),
              (", odrzucone: " + ", ".join(f"{k} {v}" for k, v in skipped.items())) if skipped else "")
@@ -548,7 +542,6 @@ def geonode_candidates(countries=()):
 
 
 def _check_proxy(px, targets):
-    """Czy proxy przepuszcza PRAWDZIWĄ stronę sklepu (HTTP 200 + HTML) z weryfikacją certyfikatu TLS?"""
     t0 = time.time()
     for url, hdrs in targets:
         try:
@@ -562,7 +555,6 @@ def _check_proxy(px, targets):
 
 
 def acquire_free_proxies(targets, want=None, budget=None, countries=()):
-    """Pobiera listę, sprawdza kandydatów równolegle na stronach docelowych sklepów i dodaje działające do rotacji."""
     want = want or int(env("SCRAPER_FREE_PROXY_COUNT", 12))
     budget = budget or int(env("SCRAPER_FREE_PROXY_SECONDS", 90))
     t0 = time.time()
@@ -592,13 +584,11 @@ def acquire_free_proxies(targets, want=None, budget=None, countries=()):
     log.info("darmowe proxy: sprawdzono %d kandydatów w %.0f s, działa %d (cel: %d) - łącznie w rotacji: %d",
              len(futs), time.time() - t0, len(found), want, len(_proxies))
     if not found:
-        log.warning("darmowe proxy: żaden kandydat nie przepuścił stron sklepów (typowe: lista jest zablokowana "
-                    "przez sklepy albo przeciążona) - sklepy z use_proxy mogą nie działać w tym przebiegu")
+        log.warning("darmowe proxy: żaden kandydat nie przepuścił stron sklepów - sklepy z use_proxy mogą nie działać")
     return [px for _, px in found]
 
 
 def free_proxy_targets(names):
-    """Strony główne sklepów używających proxy - na nich sprawdzamy kandydatów."""
     out, seen = [], set()
     for n in names:
         site = SITES[n]
@@ -612,7 +602,6 @@ def free_proxy_targets(names):
 
 
 def start_free_refresher(targets, countries, every=480):
-    """Co kilka minut uzupełnia pulę, gdy działających darmowych proxy zostało mało (żyją krótko)."""
     def loop():
         while True:
             time.sleep(every)
@@ -628,7 +617,6 @@ def start_free_refresher(targets, countries, every=480):
 
 
 def proxy_for(netloc):
-    """Proxy tylko dla sklepów z use_proxy (oszczędza transfer) albo dla wszystkich przy SCRAPER_PROXY_ALL=1."""
     return pick_proxy() if (PROXY_ALL or netloc in _proxy_hosts) else None
 
 
@@ -662,14 +650,12 @@ def allowed(url):
                     reason = f"HTTP {r.status_code}"
                     continue
                 else:
-                    reason = None  # 4xx = brak robots.txt -> wolno wszystko (RFC 9309)
+                    reason = None
                 break
             if reason:
                 note = f"robots.txt niedostępny ({reason})"
                 _robots_note[nl] = note
                 if net_fail:
-                    # to błąd sieci/proxy, a nie decyzja sklepu: nie zapamiętujemy zakazu,
-                    # kolejna kategoria spróbuje jeszcze raz (inne proxy)
                     log.warning("%s: %s - ta kategoria pominięta", host, note)
                     return False
                 log.warning("%s: %s - pomijam ten host w tym przebiegu", host, note)
@@ -685,8 +671,7 @@ def allowed(url):
 
 
 def throttle(host):
-    """Rezerwuje następny wolny slot czasowy dla hosta (działa między wątkami).
-    Używa adaptacyjnego delay (rośnie przy 429/timeoutach, maleje po sukcesach)."""
+    """Rezerwuje następny wolny slot czasowy dla hosta (adaptacyjny delay: rośnie przy 429/timeoutach)."""
     with _lock:
         base = _base_delay(host)
         delay = max(base, _host_delay.get(host, base))
@@ -711,7 +696,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     host = urlparse(url).netloc
     last_err = "?"
     if _proxies and (PROXY_ALL or host in _proxy_hosts):
-        retries = max(retries, min(8, _live_count() + 1))  # kolejne próby = kolejne proxy
+        retries = max(retries, min(8, _live_count() + 1))
     gate = _gate(host)
     for attempt in range(retries):
         throttle(host)
@@ -719,17 +704,17 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         try:
             px = proxy_for(host)
             if px in _free_proxies and not url.startswith("https://"):
-                _tls.last_fail = "adres HTTP nie przez darmowe proxy"  # po HTTP proxy widziałoby i mogło zmienić treść
+                _tls.last_fail = "adres HTTP nie przez darmowe proxy"
                 bump("nieudane")
                 return None
-            to = (10, 20) if px else (8, 20)   # krótszy connect: 8s zamiast 25s = mniej czasu na martwych serwerach
+            to = (10, 20) if px else (8, 20)
             with gate:
                 with _host_sem.get(host) or contextlib.nullcontext():
                     r = session().get(url, timeout=to, cookies=cookies, headers=headers, **proxy_kw(px))
             report_proxy(px, True)
             code = r.status_code
             if code == 200:
-                _maybe_ease(host, gate)   # sukces -> powoli rozluźniamy delay/gate (jeśli były podniesione)
+                _maybe_ease(host, gate)
                 bump("pobrane_ok")
                 return r
             if code == 429:
@@ -740,11 +725,11 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                         wait = min(60.0, float(ra))
                     except (ValueError, TypeError):
                         pass
-                _bump_delay(host, 2.0)                # następne zapytania rzadziej
-                gate.shrink(max(2, gate.max // 2))     # mniej równoległych = mniej 429
+                _bump_delay(host, 2.0)
+                gate.shrink(max(2, gate.max // 2))
                 _warn_rate_limited(host, "429", f"HTTP 429 {host} – spowalniam, czekam {wait:.0f}s")
                 bump("http_429")
-                time.sleep(min(wait, 20.0))           # czeka TYLKO ten wątek, nie cały host
+                time.sleep(min(wait, 20.0))
                 continue
             if code in (403, 404, 410):
                 bump(f"http_{code}")
@@ -762,11 +747,14 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         except (requests.Timeout, requests.ConnectionError) as e:
             report_proxy(px, False)
             last_err = short_err(e)
-            _bump_delay(host, 1.3, cap=10.0)          # wolniejszy host = większy odstęp
+            _bump_delay(host, 1.3, cap=10.0)
             _warn_rate_limited(host, type(e).__name__,
                                f"błąd sieci przez {mask(px)} (próba {attempt + 1}/{retries}): {url} | {last_err}", every=30)
-            if attempt >= 1:                          # timeout/conn error: max 2 próby zamiast 3
+            # KLUCZOWE: przez proxy timeout/przerwanie = to proxy jest złe -> próbuj kolejne.
+            # Bez proxy (px is None) timeout zwykle oznacza wolną stronę -> max 2 próby.
+            if px is None and attempt >= 1:
                 break
+            continue
         except requests.RequestException as e:
             report_proxy(px, False)
             last_err = short_err(e)
@@ -788,18 +776,15 @@ _ASSET_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg|ico|pdf|mp4|webm|css|js|zip
 
 
 def _is_loc(tag):
-    """<loc> ze standardowej przestrzeni sitemap; pomija <image:loc>, <video:loc>, <news:...> itp."""
     return tag == "loc" or (tag.endswith("}loc") and not any(x in tag.lower() for x in ("image", "video", "news", "xhtml")))
 
 
 def read_sitemap(url, headers=None):
-    """Zwraca (czy_indeks, lista_adresów) albo None. Gzip rozpoznaje po sygnaturze pliku, nie po rozszerzeniu
-    (np. sitemap.xml.gz bywa zwykłym XML-em), toleruje BOM i uszkodzony XML (np. niezakodowane '&' w adresach)."""
     r = get(url, headers=headers)
     if not r:
         return None
     data = r.content
-    for _ in range(2):  # także podwójnie spakowane
+    for _ in range(2):
         if data[:2] == b"\x1f\x8b":
             try:
                 data = gzip.decompress(data)
@@ -848,7 +833,6 @@ def _walk_sitemaps(roots, site, hdrs, info):
 
 
 def sitemap_urls(site, info=None, name=""):
-    """Adresy stron z sitemap sklepu: robots.txt (Sitemap:), a gdy brak - typowe lokalizacje."""
     info = info if info is not None else {}
     info.update({"sitemaps": 0, "children": 0, "failed": [], "reasons": [], "tried": []})
     hdrs = site_headers(name, site) if name else None
@@ -879,15 +863,11 @@ def sitemap_urls(site, info=None, name=""):
 
 
 # ----------------------------- parsowanie -----------------------------------
-# Cena w dowolnym zapisie. Kolejność alternatyw ma znaczenie:
-#  1) liczba z grupami tysięcy (spacja / kropka / przecinek + dokładnie 3 cyfry) i opcjonalnymi groszami 1-2 cyfry
-#  2) zwykła liczba z opcjonalnymi groszami
 _PRICE_RE = re.compile(
     r"(?<![\d.,])(?:[1-9]\d{0,2}(?:[ \u00a0\u202f.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)(?!\d)")
 
 
 def parse_price(text):
-    """Cena z tekstu: 1 299,00 | 1.299,00 | 1,299.00 | 1299.00 | 1,612.00 zł | 49,9 | 1299. None gdy brak ceny albo <= 0."""
     if text is None:
         return None
     if isinstance(text, (int, float)):
@@ -897,7 +877,7 @@ def parse_price(text):
         if not m:
             return None
         tok = m.group(0)
-        dec = re.search(r"[.,](\d{1,2})$", tok)  # ostatni separator + 1-2 cyfry = grosze
+        dec = re.search(r"[.,](\d{1,2})$", tok)
         whole, frac = (tok[:dec.start()], dec.group(1)) if dec else (tok, "")
         whole = re.sub(r"[ \u00a0\u202f.,]", "", whole)
         v = float(f"{whole}.{frac or '0'}")
@@ -918,7 +898,6 @@ def norm_availability(raw):
 
 
 def walk_jsonld(node):
-    """Węzły Product (bez wchodzenia w środek Product) oraz informacja, czy w danych jest lista ItemList."""
     if isinstance(node, list):
         for x in node:
             yield from walk_jsonld(x)
@@ -927,7 +906,7 @@ def walk_jsonld(node):
         types = t if isinstance(t, list) else [t]
         if "Product" in types:
             yield node
-            return  # produkty powiązane/warianty w środku nie liczą się jako osobne produkty strony
+            return
         if "ItemList" in types:
             yield {"@type": "ItemList", "n": len(node.get("itemListElement") or [])}
         for v in node.values():
@@ -947,7 +926,6 @@ def from_jsonld(soup):
                 has_list = has_list or node.get("n", 0) >= 3
             else:
                 prods.append(node)
-    # strona kategorii/listy: wiele Product w ItemList - to nie jest strona jednego produktu
     if not prods or (len(prods) >= 3 and has_list) or len(prods) >= 8:
         return None
     prod = prods[0]
@@ -961,7 +939,7 @@ def from_jsonld(soup):
     return {
         "_ld": True,
         "name": prod.get("name"),
-        "code_raw": prod.get("mpn"),  # kod producenta; SKU sklepu celowo pomijamy
+        "code_raw": prod.get("mpn"),
         "price": parse_price(price),
         "currency": offers.get("priceCurrency") or "PLN",
         "availability": norm_availability(offers.get("availability")),
@@ -999,7 +977,7 @@ def extract(html, site):
         d.setdefault("currency", meta(soup, "product:price:currency", "og:price:currency") or "PLN")
     if not d.get("availability"):
         d["availability"] = norm_availability(meta(soup, "product:availability", "og:availability", "availability"))
-    if d.get("price") is None:  # mikrodane: dokładnie jedna cena na stronie = strona produktu (lista ma ich wiele)
+    if d.get("price") is None:
         els = soup.find_all(attrs={"itemprop": "price"})
         if len(els) == 1:
             d["price"] = parse_price(els[0].get("content") or els[0].get_text(" ", strip=True))
@@ -1015,20 +993,17 @@ def extract(html, site):
             if v is not None and (d.get(k) is None or site.get("prefer_selectors")):
                 d[k] = v
     if not d.get("name"):
-        return None  # to nie jest strona produktu
+        return None
     if d.get("price") is None and not d.get("_ld"):
-        return None  # brak ceny i brak danych Product -> nie produkt
+        return None
     return d
 
 
 # ----------------------------- kody produktów -------------------------------
-# Kod = oznaczenie producenta/modelu (np. PXO310, TB118, PF-2/R). Wyciągamy go z nazwy, adresu, jawnych
-# oznaczeń ("Kod: ...") i opcjonalnego selektora sklepu. Śmieci typu "20 strzałów", "25mm", "36s",
-# "2x36", "F2", "T1", "1.4G", "CE1234" są odrzucane. Lepiej nie mieć kodu niż mieć zły.
 _UNITS = (r"MM|CM|M|G|KG|ML|L|SZT|S|SEK|SEC|MIN|H|X|V|W|HZ|PCS|SHOT|SHOTS|STRZ\w*|STRZAL\w*|ST|K|CAL|CALI|CALA|CALE|"
           r"INCH|PLN|ZL|LAT|KAL|KALIBER|KULI|KULA|KUL")
-_UNIT_RE = re.compile(rf"^\d+(?:X\d+)*(?:{_UNITS})?$")           # 36S, 25MM, 2X36, 5X20MM, 14G
-_UNIT_LEAD_RE = re.compile(rf"^(?:X)\d+(?:{_UNITS})?$")           # X36
+_UNIT_RE = re.compile(rf"^\d+(?:X\d+)*(?:{_UNITS})?$")
+_UNIT_LEAD_RE = re.compile(rf"^(?:X)\d+(?:{_UNITS})?$")
 _BLACK_RE = re.compile(r"^(?:F[1-4]|T[12]|P[12]|KAT\d|3D|4K|2K|HD|XL{1,2}|XS|RGB\d*|USB\d*|LED\d*|"
                        r"(?:CE|UN|EN|EAN|ISO|PN|DIN)\d*)$")
 _MARK_RE = re.compile(r"(?:kod(?:\s+produktu)?|nr\s*kat(?:alogowy)?\.?|numer\s+katalogowy|symbol|indeks|sku|"
@@ -1037,14 +1012,12 @@ _SLUG_CODE_RE = re.compile(r"^[a-z]{2,5}\d{2,6}[a-z]{0,2}$")
 
 
 def _fold(text):
-    """Wielkie litery bez polskich znaków - wspólna normalizacja dla kodów i wyszukiwania."""
     text = (text or "").upper().replace("Ł", "L")
     text = unicodedata.normalize("NFKD", text)
     return "".join(c for c in text if not unicodedata.combining(c))
 
 
 def _code_candidate(token, marker=False, trusted=False, slug=False):
-    """(wyświetlany, klucz, punkty) albo None. trusted = jawne źródło (kod z selektora/JSON-LD)."""
     disp = token.strip(" \t.,;:()[]{}<>\"'!?*+")
     if not 3 <= len(disp) <= 18 or not re.fullmatch(r"[\w][\w\-_/.]*[\w]", disp, re.U):
         return None
@@ -1054,13 +1027,12 @@ def _code_candidate(token, marker=False, trusted=False, slug=False):
     if _UNIT_RE.match(key) and not key.isdigit() or _UNIT_LEAD_RE.match(key) or _BLACK_RE.match(key):
         return None
     letters, digits = sum(c.isalpha() for c in key), sum(c.isdigit() for c in key)
-    if letters == 0:  # same cyfry: tylko jawny kod (>=4 cyfry) albo długi numer (EAN itp.), nie rok
+    if letters == 0:
         if not ((marker or trusted) and len(key) >= 4) and len(key) < 8:
             return None
         if re.fullmatch(r"(?:19|20)\d\d", key):
             return None
     elif not (marker or trusted or slug):
-        # z samej nazwy tylko tokeny "wyglądające jak kod": bez małych liter albo ze znakami łączącymi
         if any(c.islower() for c in disp) and not re.search(r"[-_/]", disp):
             return None
     score = 1
@@ -1082,7 +1054,6 @@ def _code_candidate(token, marker=False, trusted=False, slug=False):
 
 
 def extract_code(name, url=None, hint=None, sku=None, min_score=4):
-    """Zwraca (kod, klucz) albo (None, None). klucz = same wielkie litery i cyfry (do łączenia między sklepami)."""
     cands = []
     if sku:
         c = _code_candidate(str(sku), trusted=True)
@@ -1108,12 +1079,12 @@ def extract_code(name, url=None, hint=None, sku=None, min_score=4):
     cands = [c for c in cands if c[2] >= min_score]
     if not cands:
         return None, None
-    best = max(cands, key=lambda c: c[2])  # remis: pierwszy znaleziony
+    best = max(cands, key=lambda c: c[2])
     return best[0], best[1]
 
 
 # ----------------------------- baza -----------------------------------------
-PARSER_VERSION = 2  # zwiększ, gdy zmienia się sposób czytania cen: historia cen jest wtedy archiwizowana i liczona od nowa
+PARSER_VERSION = 2
 
 
 def db():
@@ -1129,11 +1100,11 @@ def db():
     CREATE TABLE IF NOT EXISTS nonproduct(url TEXT PRIMARY KEY, ts TEXT);
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(products)")}
-    if "code" not in cols:  # migracja starej bazy (kolumna sku) -> kody produktów
+    if "code" not in cols:
         con.execute("ALTER TABLE products ADD COLUMN code TEXT")
         con.execute("ALTER TABLE products ADD COLUMN code_key TEXT")
         rows = con.execute("SELECT url, name FROM products").fetchall()
-        for url, name in rows:  # stary SKU sklepu ignorujemy - kody liczymy z nazwy i adresu
+        for url, name in rows:
             code, key = extract_code(name, url)
             con.execute("UPDATE products SET code=?, code_key=? WHERE url=?", (code, key, url))
         log.info("migracja bazy: dodano kody produktów (%d produktów)", len(rows))
@@ -1141,13 +1112,13 @@ def db():
         try:
             con.execute("ALTER TABLE products DROP COLUMN sku")
         except sqlite3.OperationalError:
-            pass  # starszy SQLite: kolumna zostaje nieużywana
+            pass
     con.execute("CREATE INDEX IF NOT EXISTS ix_products_code ON products(code_key)")
     con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
     row = con.execute("SELECT v FROM meta WHERE k = 'parser_version'").fetchone()
     if not row or int(row[0]) < PARSER_VERSION:
         n = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
-        if n:  # ceny z poprzedniego parsera mogły być błędne (np. 1 zł zamiast 1612 zł) - nie mieszamy ich z nowymi
+        if n:
             con.execute("DROP TABLE IF EXISTS prices_backup")
             con.execute("DROP INDEX IF EXISTS ix_prices_url")
             con.execute("ALTER TABLE prices RENAME TO prices_backup")
@@ -1161,7 +1132,7 @@ def db():
     return con
 
 
-_suspicious = []  # (url, stara cena, nowa cena) - skoki >= 5x, zwykle znak błędu parsera cen
+_suspicious = []
 
 
 def save(con, site_name, url, d):
@@ -1188,8 +1159,6 @@ def save(con, site_name, url, d):
 
 # ----------------------------- komendy --------------------------------------
 def report_problems(problems, label):
-    """problems: lista (sklep, miejsce, powód). Grupuje takie same powody i zapisuje też w podsumowaniu przebiegu
-    (na telefonie to jedna strona zamiast przewijania logu)."""
     if not problems:
         return
     groups = {}
@@ -1215,7 +1184,6 @@ def fmt_dur(sec):
 
 # ----------------------------- tryb LISTING ---------------------------------
 def _pick(el, spec):
-    """Wartość z kafelka wg 'selektor' lub 'selektor@atrybut'. Spec może być listą = próbuj po kolei."""
     if not spec:
         return None
     for one in ([spec] if isinstance(spec, str) else spec):
@@ -1233,19 +1201,14 @@ def _pick(el, spec):
 
 
 def has(tile, css):
-    """Czy selektor pasuje do SAMEGO kafelka albo któregoś elementu w środku
-    (np. klasa 'instock' na <li>, atrybut data-product_disable, przycisk w środku)."""
     return tile.select_one(css) is not None or sv.match(css, tile)
 
 
 def parse_listing(html, page_url, cfg):
-    """Zwraca (liczba_kafelków, [produkty]) ze strony kategorii.
-    html: bajty (r.content) - kodowanie wykrywa BeautifulSoup, bo r.text myli polskie znaki
-    gdy serwer nie poda charsetu w nagłówku."""
     soup = BeautifulSoup(html, "lxml")
     sel = cfg["item"]
     tiles = []
-    for one in ([sel] if isinstance(sel, str) else sel):  # lista = pierwszy selektor, który coś znajdzie
+    for one in ([sel] if isinstance(sel, str) else sel):
         tiles = soup.select(one)
         if tiles:
             break
@@ -1262,7 +1225,7 @@ def parse_listing(html, page_url, cfg):
         text = raw_text.lower()
         out = False
         if cfg.get("in_stock") and not has(tile, cfg["in_stock"]):
-            out = True  # brak elementu "dostępny" (np. przycisku koszyka)
+            out = True
         if cfg.get("out_of_stock") and has(tile, cfg["out_of_stock"]):
             out = True
         if any(t.lower() in text for t in cfg.get("out_text", [])):
@@ -1278,8 +1241,6 @@ def parse_listing(html, page_url, cfg):
 
 
 def site_headers(name, site):
-    """Nagłówki sklepu. User-Agent przeglądarki tylko, gdy włączony: SCRAPER_BROWSER_UA=1 / lista sklepów,
-    albo "browser_ua": True w konfiguracji sklepu."""
     h = dict(site.get("headers") or {})
     wanted = {x.strip() for x in BROWSER_UA_SPEC.split(",") if x.strip()}
     if site.get("browser_ua") or "1" in wanted or name.lower() in wanted:
@@ -1290,7 +1251,6 @@ def site_headers(name, site):
 
 
 def diag(r):
-    """Krótki opis odpowiedzi, gdy strona ma 0 kafelków: tytuł, serwer, czy to ochrona anty-botowa."""
     m = re.search(rb"<title[^>]*>(.*?)</title>", r.content, re.I | re.S)
     title = re.sub(r"\s+", " ", m.group(1).decode("utf-8", "replace")).strip()[:80] if m else "?"
     hdr = r.headers
@@ -1310,7 +1270,6 @@ def _sig(t):
 
 
 def outline(tile, limit=12):
-    """Zarys kafelka: tagi/klasy elementów z tekstem, linkiem, alt albo data-price (pod konfigurację selektorów)."""
     parts = []
     for el in [tile] + tile.find_all(True):
         bits, info = _sig(el), False
@@ -1331,7 +1290,6 @@ def outline(tile, limit=12):
 
 
 def pagination_hint(content):
-    """Jak strona wskazuje kolejne strony: <link rel=next> albo link o tekście '2'."""
     try:
         soup = BeautifulSoup(content, "lxml")
         out = []
@@ -1348,8 +1306,6 @@ def pagination_hint(content):
 
 
 def suggest_selectors(content):
-    """Gdy selektor 'item' nic nie znajduje: zgaduje kafelek (powtarzający się element z ceną) i pokazuje
-    jego zarys, żeby dało się poprawić konfigurację bez wklejania całego HTML."""
     try:
         soup = BeautifulSoup(content, "lxml")
         price_re = re.compile(r"\d[\d\s.]*[,.]\d{2}(?:\s*(?:zł|pln))?", re.I)
@@ -1371,7 +1327,7 @@ def suggest_selectors(content):
         if not cands:
             return "brak powtarzalnych kafelków z ceną w HTML (produkty mogą się ładować przez JavaScript)"
         return " || ".join(f"item={k} ({n}x) kafelek: {outline(first[k])}" for k, n in cands.most_common(3))[:1500]
-    except Exception as e:  # diagnostyka nie może psuć scrapowania
+    except Exception as e:
         return f"nie udało się zanalizować ({e})"
 
 
@@ -1379,7 +1335,6 @@ _NEXT_TEXTS = {"»", "›", ">", "→", "następna", "następny", "następna str
 
 
 def find_next_link(content, cur_url, ordinal):
-    """Adres następnej strony listy: <link/a rel=next>, link o numerze ordinal+1 albo 'Następna'/'»'."""
     try:
         soup = BeautifulSoup(content, "lxml")
         cands = []
@@ -1402,7 +1357,6 @@ def find_next_link(content, cur_url, ordinal):
 
 
 def listing_category(name, site, cfg, cat_url, q, stats):
-    """Wątek roboczy: przechodzi strony jednej kategorii i wrzuca produkty do kolejki."""
     start = cfg.get("start", 1)
     nxt = cfg.get("next", "{url}?page={page}")
     first = cfg.get("first")
@@ -1435,12 +1389,11 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                 reason = f"{n_tiles} kafelków, ale selektory name/link nic nie wyciągają"
                 log.warning("[%s] %s: %s", name, reason, url)
             if not new:
-                break  # pusta strona albo ta sama co poprzednia (koniec paginacji)
+                break
             seen.update(it["url"] for it in new)
             total += len(new)
             q.put(("items", name, cat_url, page, new))
             page += 1
-        # szablon adresu stron nie zadziałał (1 strona), ale strona wskazuje kolejne: idziemy za linkami
         if total and page - start == 1 and last_r is not None:
             visited, cur, ordinal, extra = {last_r.url}, last_r, 1, 0
             while ordinal < max_pages:
@@ -1463,23 +1416,22 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                 page = start + ordinal
                 log.info("[%s] paginacja przez linki 'następna strona' (szablon adresu nie działał): +%d stron w %s",
                          name, extra, cat_url.rstrip("/").rsplit("/", 1)[-1])
-    except Exception as e:  # nigdy nie wieszamy głównego wątku
+    except Exception as e:
         reason = f"wyjątek: {e}"
         log.warning("[%s] błąd w kategorii %s: %s", name, cat_url, e)
     finally:
         if not reason and last_r is not None and total and page - start == 1:
             ph = pagination_hint(last_r.content)
-            if ph:  # strona wskazuje kolejne strony, a my skończyliśmy po jednej: zły parametr paginacji?
+            if ph:
                 reason = f"UWAGA tylko 1 strona ({total} prod.), ale strona wskazuje kolejne: {ph}"
         q.put(("done", name, cat_url, page - start, total, reason))
 
 
 def run_listing(con, names, args):
-    """Wszystkie sklepy 'listing' naraz: kategorie jako zadania, zapis do bazy w jednym wątku."""
     t0 = time.time()
     per_shop = {n: list(SITES[n]["listing"]["categories"]) for n in names}
     tasks = []
-    while any(per_shop.values()):  # na zmianę po sklepie, żeby wątki nie blokowały się na jednym hoście
+    while any(per_shop.values()):
         for n in names:
             if per_shop[n]:
                 tasks.append((n, per_shop[n].pop(0)))
@@ -1496,7 +1448,7 @@ def run_listing(con, names, args):
     for n, cat in tasks:
         cfg = dict(SITES[n]["listing"])
         if args.max:
-            cfg["max_pages"] = args.max  # w trybie listing --max = limit stron na kategorię
+            cfg["max_pages"] = args.max
         pool.submit(listing_category, n, SITES[n], cfg, cat, q, stats[n])
     pending, last_beat = len(tasks), time.time()
     try:
@@ -1514,7 +1466,7 @@ def run_listing(con, names, args):
                     if d["price"] is None:
                         st["bez_ceny"] += 1
                     if d["availability"] == "out_of_stock":
-                        st["niedostepne"] += 1  # kontrola: 0 niedostępnych przy setkach produktów = zły selektor dostępności
+                        st["niedostepne"] += 1
                     if save(con, n, d["url"], d):
                         st["zmiany_w_historii"] += 1
                         log.debug("zapisano: %s | %s | %s", d["name"], d["price"], d["availability"])
@@ -1559,7 +1511,6 @@ def resolve_sites(args):
 
 
 def url_group(url):
-    """Grupa adresów (pierwszy człon ścieżki, cyfry -> #; prefiks języka /pl/ + drugi człon)."""
     segs = [x for x in urlparse(url).path.split("/") if x]
     if not segs:
         return "/"
@@ -1570,7 +1521,6 @@ def url_group(url):
 
 
 def page_brief(content):
-    """Krótki opis strony bez produktu: tytuł i czy są dane JSON-LD (do diagnozy w logu)."""
     m = re.search(rb"<title[^>]*>(.*?)</title>", content, re.I | re.S)
     title = re.sub(r"\s+", " ", m.group(1).decode("utf-8", "replace")).strip()[:70] if m else "?"
     has_ld = b"application/ld+json" in content
@@ -1579,7 +1529,6 @@ def page_brief(content):
 
 
 def fetch_one(url, site, stats, hdrs=None, skip=None):
-    """Praca wątku roboczego: pobierz + sparsuj. Zwraca (url, dane, status, opis, grupa)."""
     grp = url_group(url)
     if skip is not None and grp in skip:
         return url, None, "skipped", "", grp
@@ -1596,11 +1545,10 @@ def fetch_one(url, site, stats, hdrs=None, skip=None):
     return url, None, "nonproduct", page_brief(r.content), grp
 
 
-GROUP_SKIP_AFTER = 40  # tyle stron z grupy bez ani jednego produktu = reszta grupy pomijana w tym przebiegu
+GROUP_SKIP_AFTER = 40
 
 
 def sitemap_driver(name, site, known_np, args, q):
-    """Wątek sklepu: sitemapa -> lista adresów -> równoległe pobieranie; wyniki trafiają do kolejki."""
     hdrs = site_headers(name, site)
     gets, skip, gstat = Counter(), set(), {}
     try:
@@ -1626,14 +1574,13 @@ def sitemap_driver(name, site, known_np, args, q):
                 q.put(("res", name, url, d, status, brief, grp))
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
-    except Exception as e:  # jeden sklep nie może zatrzymać reszty
+    except Exception as e:
         q.put(("error", name, f"{e.__class__.__name__}: {str(e)[:150]}"))
     finally:
         q.put(("done", name, gstat))
 
 
 def run_sitemap(con, names, args):
-    """Wszystkie sklepy naraz: sitemapa -> strony produktów (JSON-LD). Zapis do bazy w jednym wątku."""
     t0 = time.time()
     known = set()
     if not args.recheck:
@@ -1694,8 +1641,8 @@ def run_sitemap(con, names, args):
                     if info["total"] == 0:
                         reasons = sorted(set(info["reasons"]))
                         extra = f"; powód: {', '.join(reasons)}" if reasons else ""
-                        hint = (" | wskazówka: 403 = serwer odrzuca klienta (reguła na nazwę klienta albo blokada adresów serwerów GitHuba) - "
-                                "spróbuj SCRAPER_BROWSER_UA=" + n + " (nazwa przeglądarki), a jeśli to nie pomoże, proxy (use_proxy) albo pomiń sklep"
+                        hint = (" | wskazówka: 403 = serwer odrzuca klienta - spróbuj browser_ua w konfiguracji "
+                                "sklepu (User-Agent przeglądarki), a jeśli to nie pomoże, proxy (use_proxy) albo pomiń sklep"
                                 if any("403" in r for r in reasons) else "")
                         problems.append((n, "brak adresów w sitemapie; sprawdzone: " + (", ".join(info["tried"][:5]) or "-") + extra + hint))
                 elif kind == "res":
@@ -1774,7 +1721,7 @@ def cmd_scrape(args):
     setup_proxies(args)
     con = db()
     names = resolve_sites(args)
-    for n in names:  # ustawienia per sklep: 'delay' (min. odstęp) i 'use_proxy'
+    for n in names:
         site = SITES[n]
         hosts = {urlparse(site["base"]).netloc}
         hosts |= {urlparse(c).netloc for c in site.get("listing", {}).get("categories", [])}
@@ -1783,7 +1730,7 @@ def cmd_scrape(args):
                 _min_delay[h] = max(_min_delay.get(h, 0.0), float(site["delay"]))
             if site.get("use_proxy"):
                 _proxy_hosts.add(h)
-                _host_sem[h] = threading.Semaphore(int(site.get("max_parallel", 4)))  # proxy nie lubią 12 naraz
+                _host_sem[h] = threading.Semaphore(int(site.get("max_parallel", 4)))
     if (env("SCRAPER_PROXY_SOURCE", "") or "").lower() == "geonode":
         targets = free_proxy_targets(names)
         if not targets:
@@ -1799,14 +1746,14 @@ def cmd_scrape(args):
     mode = (args.mode or "auto").lower()
     if mode not in ("smart", "sitemap", "listing", "auto"):
         raise SystemExit(f"Nieznany tryb {mode!r}: użyj smart, sitemap, listing albo auto")
-    listing_names, sitemap_names, fallback_ok = [], [], []   # fallback_ok: sitemapa najpierw, a przy porażce kategorie
+    listing_names, sitemap_names, fallback_ok = [], [], []
     for n in names:
-        m_ = (SITES[n].get("mode") or mode).lower()          # "mode" w konfiguracji sklepu ma pierwszeństwo
+        m_ = (SITES[n].get("mode") or mode).lower()
         has_listing = bool(SITES[n].get("listing"))
         if m_ == "listing" and has_listing:
             listing_names.append(n)
         elif m_ == "auto" and has_listing:
-            listing_names.append(n)                           # auto: kategorie najpierw, sitemapa przy porażce
+            listing_names.append(n)
         else:
             sitemap_names.append(n)
             if m_ == "smart" and has_listing:
@@ -1911,7 +1858,7 @@ def main():
     h.set_defaults(fn=cmd_history)
     argv = sys.argv[1:]
     if not any(a in ("scrape", "export", "history") for a in argv):
-        argv.append("scrape")  # bez argumentów = scrape (GitHub Actions: samo `python fajerwerki_scraper.py`)
+        argv.append("scrape")
     args = ap.parse_args(argv)
     try:
         sys.stdout.reconfigure(line_buffering=True)

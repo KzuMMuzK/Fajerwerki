@@ -385,7 +385,6 @@ SITES = {
         "sitemaps": ["https://pironet.pl/product-sitemap.xml"],   # TYLKO produkty, bez tagów
         "url_regex": r"^https://pironet\.pl/sklep/[^/]+/[^/]+/?$",  # tylko polska wersja /sklep/<kategoria>/<produkt>/
     },
-    },
     "piroart": {
         # item li.product (fallback li), name a[href] (pierwszy z tekstem)
         "base": "https://piroart.pl", "use_proxy": True,

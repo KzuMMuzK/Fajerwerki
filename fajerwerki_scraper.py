@@ -318,6 +318,12 @@ _warn_count = Counter()
 _host_gate = {}
 _gate_lock = threading.Lock()
 
+# --- Fallback proxy z Proxifly (gdy proxy z sekretów zawiodą) ---------------
+PROXIFLY_TXT_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt"
+_fallback_lock = threading.Lock()
+_last_fallback_fetch = 0.0
+FALLBACK_INTERVAL = 300  # min. sekundy między pobraniami listy Proxifly
+
 
 class _AdaptiveGate:
     """Ogranicza liczbę równoległych zapytań do hosta; można zmniejszać w locie przy 429/timeoutach."""
@@ -496,6 +502,52 @@ def _socks_ok():
     except ImportError:
         return False
     return True
+
+
+def fetch_proxifly_proxies(limit=200):
+    """Fallback: pobiera listę proxy z Proxifly (TXT) i dodaje do rotacji.
+    Zwraca liczbę dodanych proxy. Wywoływane, gdy proxy z sekretów zawiodą (wszystkie w pauzie)."""
+    global _last_fallback_fetch
+    with _fallback_lock:
+        if time.time() - _last_fallback_fetch < FALLBACK_INTERVAL:
+            return 0
+        _last_fallback_fetch = time.time()
+    try:
+        r = requests.get(PROXIFLY_TXT_URL, timeout=20,
+                         headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.warning("fallback proxy (Proxifly): nie udało się pobrać listy: %s", short_err(e))
+        return 0
+    socks_ok = _socks_ok()
+    added = []
+    for line in r.text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("socks") and not socks_ok:
+            continue  # bez PySocks requests nie obsłuży socks://
+        if not re.match(r"^(https?|socks[45])://", line, re.I):
+            continue
+        added.append(line)
+        if len(added) >= limit:
+            break
+    if not added:
+        log.warning("fallback proxy (Proxifly): lista pusta lub bez obsługiwanych protokołów")
+        return 0
+    with _lock:
+        for px in added:
+            if px not in _proxies:
+                _proxies.append(px)
+                _free_proxies.add(px)  # traktujemy jak darmowe: żadnego ruchu HTTP przez nie
+    log.info("fallback proxy (Proxifly): dodano %d proxy do rotacji", len(added))
+    return len(added)
+
+
+def ensure_fallback_proxies():
+    """Jeśli nie ma żywych proxy (wszystkie w pauzie), dociąga listę z Proxifly."""
+    if not _proxies or _live_count() == 0:
+        fetch_proxifly_proxies()
 
 
 def geonode_candidates(countries=()):
@@ -699,6 +751,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         retries = max(retries, min(8, _live_count() + 1))
     gate = _gate(host)
     for attempt in range(retries):
+        ensure_fallback_proxies()  # jeśli proxy z sekretów padły, dociągnij listę Proxifly
         throttle(host)
         px = None
         try:
@@ -750,8 +803,6 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             _bump_delay(host, 1.3, cap=10.0)
             _warn_rate_limited(host, type(e).__name__,
                                f"błąd sieci przez {mask(px)} (próba {attempt + 1}/{retries}): {url} | {last_err}", every=30)
-            # KLUCZOWE: przez proxy timeout/przerwanie = to proxy jest złe -> próbuj kolejne.
-            # Bez proxy (px is None) timeout zwykle oznacza wolną stronę -> max 2 próby.
             if px is None and attempt >= 1:
                 break
             continue

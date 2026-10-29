@@ -169,7 +169,7 @@ SITES = {
     "lider": {
         "base": "https://fajerwerkilider.pl",
         "mode": "sitemap",
-        "delay": 0.2,          # było domyślne 0.5 = 2.5x szybciej
+        "delay": 0.35,          # było domyślne 0.5 = 2.5x szybciej
         "max_parallel": 24,    # więcej równoległych
         "headers": {"Referer": "https://fajerwerkilider.pl/",
                     "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"},
@@ -354,6 +354,7 @@ SITES = {
         # Custom (nieznana platforma): item .Okno, name z img@alt (bo a[href] łapie "zobacz szczegóły"),
         # price .CenaAktualna. Paginacja /s=N.
         "base": "https://piroandrzej.pl",
+        "mode": "sitemap",
         "listing": {"next": "{url}/s={page}", "start": 1,
             "item": "div.Okno.OknoRwd",
             "name": ["img@alt", "a[href]"],
@@ -377,16 +378,13 @@ SITES = {
     },
     "pironet": {
         "base": "https://pironet.pl",
-        "sitemaps": ["https://pironet.pl/product-sitemap.xml"],
-        "listing": {"next": "{url}page/{page}/", "start": 1,
-            "item": ["li.product", "div.product", "article.product"],
-            "name": ["h3.woocommerce-loop-product__title a", "h3.woocommerce-loop-product__title"],
-            "link": ["a.ct-media-container@href", "h3.woocommerce-loop-product__title a@href",
-                     "a.woocommerce-LoopProduct-link@href"],
-            "price": ["span.price bdi", "span.price .woocommerce-Price-amount bdi",
-                      ".woocommerce-Price-amount bdi", "span.price"],
-            "in_stock": "a.add_to_cart_button",
-            "categories": ["https://pironet.pl/sklep-z-fajerwerkami/"]},
+        "mode": "sitemap",
+        "browser_ua": True,                     # Cloudflare czasem przepuszcza Chrome UA
+        "use_proxy": True, "max_parallel": 2,
+        "delay": 1.0,                           # wolno, żeby nie dostać 429
+        "sitemaps": ["https://pironet.pl/product-sitemap.xml"],   # TYLKO produkty, bez tagów
+        "url_regex": r"^https://pironet\.pl/sklep/[^/]+/[^/]+/?$",  # tylko polska wersja /sklep/<kategoria>/<produkt>/
+    },
     },
     "piroart": {
         # item li.product (fallback li), name a[href] (pierwszy z tekstem)
@@ -451,7 +449,7 @@ _warn_last = {}
 _warn_count = Counter()
 _host_gate = {}
 _gate_lock = threading.Lock()
-
+_host_proxy_fails = Counter()   # host -> consecutive proxy fails (przez wywołania get)
 
 class _AdaptiveGate:
     def __init__(self, n):
@@ -966,6 +964,8 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             if code == 200:
                 report_proxy(px, True)
                 proxy_fails = 0
+                with _lock:
+                    _host_proxy_fails[host] = 0   # reset
                 _maybe_ease(host, gate)
                 bump("pobrane_ok")
                 return r
@@ -1016,12 +1016,12 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         except requests.exceptions.SSLError as e:
             report_proxy(px, False, dead=True)
             last_err = short_err(e)
-            proxy_fails += 1
-            if proxy_fails >= 20 and host in _proxy_hosts:
-                _proxy_hosts.discard(host)
-                log.warning("%s: 20 kolejnych SSL fails przez proxy – przełączam na direct", host)
-            _warn_rate_limited(host, "ssl_proxy",
-                               f"SSL przez {mask(px)} (zły proxy): {url}", every=60)
+            with _lock:
+                _host_proxy_fails[host] += 1
+                if _host_proxy_fails[host] >= 20 and host in _proxy_hosts:
+                    _proxy_hosts.discard(host)
+                    _host_proxy_fails[host] = 0
+                    log.warning("%s: 20 kolejnych failów proxy – przełączam na direct", host)
             continue
         except requests.Timeout as e:
             report_proxy(px, False, dead=(px is not None))
@@ -1029,12 +1029,12 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             if px is None:
                 _bump_delay(host, 1.3, cap=10.0)
             else:
-                proxy_fails += 1
-                if proxy_fails >= 20 and host in _proxy_hosts:
-                    _proxy_hosts.discard(host)
-                    log.warning("%s: 20 kolejnych timeoutów przez proxy – przełączam na direct", host)
-            _warn_rate_limited(host, "timeout",
-                               f"timeout przez {mask(px)} (próba {attempt + 1}/{retries}): {url}", every=30)
+                with _lock:
+                    _host_proxy_fails[host] += 1
+                    if _host_proxy_fails[host] >= 20 and host in _proxy_hosts:
+                        _proxy_hosts.discard(host)
+                        _host_proxy_fails[host] = 0
+                        log.warning("%s: 20 kolejnych failów proxy – przełączam na direct", host)
             if px is None and attempt >= 1:
                 break
             continue
@@ -1044,12 +1044,12 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             if px is None:
                 _bump_delay(host, 1.3, cap=10.0)
             else:
-                proxy_fails += 1
-                if proxy_fails >= 20 and host in _proxy_hosts:
-                    _proxy_hosts.discard(host)
-                    log.warning("%s: 20 kolejnych connection errors przez proxy – przełączam na direct", host)
-            _warn_rate_limited(host, type(e).__name__,
-                               f"błąd sieci przez {mask(px)} (próba {attempt + 1}/{retries}): {url} | {last_err}", every=30)
+                with _lock:
+                    _host_proxy_fails[host] += 1
+                    if _host_proxy_fails[host] >= 20 and host in _proxy_hosts:
+                        _proxy_hosts.discard(host)
+                        _host_proxy_fails[host] = 0
+                        log.warning("%s: 20 kolejnych failów proxy – przełączam na direct", host)
             continue
         except requests.RequestException as e:
             report_proxy(px, False)
@@ -1804,12 +1804,15 @@ def run_listing(con, names, args):
 
 def resolve_sites(args):
     if not args.site:
-        return list(SITES)
+        skipped = [n for n in SITES if SITES[n].get("skip")]
+        if skipped:
+            log.info("pomijam sklepy z flagą skip: %s (włącz przez --site nazwa)", ", ".join(skipped))
+        return [n for n in SITES if not SITES[n].get("skip")]
     wanted = [x.lower() for x in re.split(r"[,\s]+", args.site) if x]
     lookup = {k.lower(): k for k in SITES}
     bad = [w for w in wanted if w not in lookup]
     if bad:
-        raise SystemExit(f"Nieznane sklepy: {bad}. Dostępne: {', '.join(SITES)}")
+        raise SystemExit(f"Nieznane sklepy: {bad}")
     return [lookup[w] for w in wanted]
 
 

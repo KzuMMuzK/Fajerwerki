@@ -640,11 +640,14 @@ GEONODE_API = os.environ.get("GEONODE_API", "https://proxylist.geonode.com/api/p
 _free_proxies = set()
 
 # --- Proxifly fallback (multi-source: HTTPS -> SOCKS5 -> all) --------------
-PROXIFLY_URLS = (
-    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt",
-    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
-    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt",
+PROXIFLY_SOCKS5_JSON = (
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/"
+    "proxies/protocols/socks5/data.json"
 )
+# Kraje preferowane (blisko Polski = niższe opóźnienia)
+PROXIFLY_QUALITY_COUNTRIES = {"PL", "DE", "CZ", "SK", "NL", "FR", "GB"}
+# Ile maksymalnie dodać w jednym przebiegu (żeby nie zapchać rotacji)
+PROXIFLY_MAX_QUALITY = 200
 _fallback_lock = threading.Lock()
 _last_fallback_fetch = 0.0
 FALLBACK_INTERVAL = 180
@@ -667,38 +670,50 @@ def _socks_ok():
 
 
 def _do_fetch_proxifly(tag=""):
-    socks_ok = _socks_ok()
-    added, seen_in_batch = [], set()
-    for src_url in PROXIFLY_URLS:
-        proto = src_url.rsplit("/", 3)[-2] if "/protocols/" in src_url else "all"
-        try:
-            r = requests.get(src_url, timeout=25, headers={"User-Agent": USER_AGENT})
-            r.raise_for_status()
-        except requests.RequestException as e:
-            log.warning("Proxifly%s (%s): nie udało się pobrać: %s", tag, proto, short_err(e))
-            continue
-        got = 0
-        for line in r.text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("socks") and not socks_ok:
-                continue
-            if not re.match(r"^(https?|socks[45])://", line, re.I):
-                continue
-            if line in seen_in_batch:
-                continue
-            seen_in_batch.add(line)
-            added.append(line)
-            got += 1
-            if len(added) >= 2000:
-                break
-        log.info("Proxifly%s: źródło %s -> %d adresów", tag, proto, got)
-        if len(added) >= 2000:
-            break
-    if not added:
-        log.warning("Proxifly%s: lista pusta lub bez obsługiwanych protokołów", tag)
+    """Pobiera TYLKO SOCKS5 z Proxifly (bezpieczne dla HTTPS).
+    Filtruje po krajach blisko Polski, ogranicza liczbę.
+    """
+    if not _socks_ok():
+        log.warning("Proxifly%s: PySocks nie zainstalowany – pomijam SOCKS5", tag)
         return 0
+
+    try:
+        r = requests.get(PROXIFLY_SOCKS5_JSON, timeout=25,
+                         headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Proxifly%s: nie udało się pobrać JSON SOCKS5: %s",
+                    tag, short_err(e))
+        return 0
+
+    added = []
+    for item in data:
+        proxy = item.get("proxy")
+        if not proxy or not proxy.startswith("socks5://"):
+            continue
+        country = (item.get("geolocation") or {}).get("country", "")
+        # Preferuj kraje blisko Polski
+        if country and country not in PROXIFLY_QUALITY_COUNTRIES:
+            continue
+        # score obecnie zawsze 1, ale na przyszłość – odrzucaj śmieci
+        if item.get("score", 1) < 1:
+            continue
+        added.append(proxy)
+        if len(added) >= PROXIFLY_MAX_QUALITY:
+            break
+
+    # Jeśli filtr kraju dał 0 – awaryjnie bierz dowolne SOCKS5
+    if not added:
+        log.info("Proxifly%s: brak proxy z preferowanych krajów – "
+                 "biorę dowolne SOCKS5", tag)
+        for item in data:
+            proxy = item.get("proxy")
+            if proxy and proxy.startswith("socks5://"):
+                added.append(proxy)
+                if len(added) >= PROXIFLY_MAX_QUALITY:
+                    break
+
     with _lock:
         new_count = 0
         for px in added:
@@ -706,7 +721,9 @@ def _do_fetch_proxifly(tag=""):
                 _proxies.append(px)
                 _free_proxies.add(px)
                 new_count += 1
-    log.info("Proxifly%s: dodano %d nowych proxy (łącznie w puli: %d)", tag, new_count, len(_proxies))
+
+    log.info("Proxifly%s: dodano %d nowych SOCKS5 (łącznie w puli: %d)",
+             tag, new_count, len(_proxies))
     return new_count
 
 

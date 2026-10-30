@@ -59,6 +59,24 @@ class AccessHandlingTests(unittest.TestCase):
 
 
 class StoreApiTests(unittest.TestCase):
+    def test_only_verified_store_apis_are_enabled(self):
+        expected = {
+            "pyroking",
+            "hurtowniaas",
+            "pirozone",
+            "firefactory",
+            "obornicka",
+            "pironet",
+            "piroart",
+            "petardyshop",
+        }
+        configured = {
+            name for name, site in scraper.SITES.items()
+            if site.get("store_api") and site.get("mode") == "api"
+        }
+
+        self.assertEqual(configured, expected)
+
     def test_parses_store_api_minor_units_and_availability(self):
         product = scraper.parse_store_api_product({
             "name": "P20 Petardy Explosive &#8211; 10 szt.",

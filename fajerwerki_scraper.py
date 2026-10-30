@@ -238,6 +238,8 @@ SITES = {
     },
     "hurtowniaas": {
         "base": "https://fajerwerkigorzow.pl",
+        "mode": "api",
+        "store_api": {"endpoint": "https://fajerwerkigorzow.pl/wp-json/wc/store/v1/products"},
         "listing": {"first": "{url}", "next": "{url}?product-page={page}", "start": 1, "item": "li.product",
             "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
             "price": _WOO_PRICE, "in_stock": ".instock",
@@ -314,6 +316,8 @@ SITES = {
     "pirozone": {
         # item li.product, name z a.product-title (motyw custom z rating)
         "base": "https://pirozone.pl", "delay": 0.7,
+        "mode": "api",
+        "store_api": {"endpoint": "https://pirozone.pl/wp-json/wc/store/v1/products"},
         "browser_ua": True,
         "listing": {"next": "{url}page/{page}/", "start": 1,
             "item": "li.product",
@@ -327,12 +331,16 @@ SITES = {
     },
     "firefactory": {
         "base": "https://www.firefactory.pl",
+        "mode": "api",
+        "store_api": {"endpoint": "https://www.firefactory.pl/wp-json/wc/store/v1/products"},
         "listing": {**_WOO, "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
             "price": ["ins", "span.woocommerce-Price-amount"], "out_text": ["dowiedz się więcej"],
             "categories": ["https://www.firefactory.pl/sklep/"]},
     },
     "obornicka": {
         "base": "https://www.fajerwerki-obornicka.pl",
+        "mode": "api",
+        "store_api": {"endpoint": "https://www.fajerwerki-obornicka.pl/wp-json/wc/store/v1/products"},
         "listing": {**_WOO, "name": "h2.woocommerce-loop-product__title", "link": "a.woocommerce-LoopProduct-link@href",
             "price": ["span.price ins bdi", "span.price bdi"], "out_text": ["brak w magazynie"],
             "categories": ["https://www.fajerwerki-obornicka.pl/home/sklep/"]},
@@ -405,6 +413,8 @@ SITES = {
     },
     "petardyshop": {
         "base": "https://petardyshop.pl", "delay": 0.2,
+        "mode": "api",
+        "store_api": {"endpoint": "https://petardyshop.pl/wp-json/wc/store/v1/products"},
         "listing": {"next": "{url}page/{page}/", "start": 1,
             "item": "div.fusion-product-wrapper",
             "name": ["h3.product-title a", "h3.product-title"],

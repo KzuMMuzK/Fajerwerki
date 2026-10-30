@@ -17,7 +17,7 @@ Zmienne środowiskowe (GitHub Actions: Settings > Secrets and variables > Action
     SCRAPER_CONTACT     Twój e-mail/URL, wysyłany sklepom w nagłówku User-Agent
     DATA_REPO, DATA_REPO_TOKEN   (tylko workflow) prywatne repo na bazę i CSV oraz token do niego
   USTAWIENIA (opcjonalne):
-    SCRAPER_ONLY=pirohit,lider   SCRAPER_MAX=2   SCRAPER_WORKERS=12   SCRAPER_DELAY=0.5
+    SCRAPER_ONLY=pirohit,lider   SCRAPER_MAX=2   SCRAPER_WORKERS=16   SCRAPER_DELAY=0.5
     SCRAPER_PROXY_SOURCE=geonode   darmowe proxy z Geonode, tylko dla sklepów z use_proxy (opcje: SCRAPER_PROXY_COUNTRY=PL,DE  SCRAPER_FREE_PROXY_COUNT=12)
     SCRAPER_MODE=auto|smart|sitemap|listing   SCRAPER_VERBOSE=1   SCRAPER_RECHECK=1   SCRAPER_PROXY_ALL=1   SCRAPER_DB=sciezka/do/bazy.db
 
@@ -57,7 +57,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -76,7 +76,7 @@ def env(name, default=None):
 DB_PATH = env("SCRAPER_DB", "fajerwerki.db")  # w Actions: data/fajerwerki.db (prywatne repo z danymi)
 USER_AGENT = "Mozilla/5.0 (compatible; FajerwerkiPrices/1.0" + (f"; +kontakt: {env('SCRAPER_CONTACT')}" if env("SCRAPER_CONTACT") else "") + ")"
 DELAY = float(env('SCRAPER_DELAY', 0.5))   # min. odstęp (s) między ZAPYTANIAMI do jednego hosta (wspólny dla wszystkich wątków)
-WORKERS = int(env('SCRAPER_WORKERS', 12))   # równoległe wątki -> max ok. 1/DELAY zapytań na sekundę do sklepu
+WORKERS = int(env('SCRAPER_WORKERS', 16))   # większy bufor żądań; DELAY nadal ogranicza tempo per host
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
 BROWSER_UA_SPEC = (env("SCRAPER_BROWSER_UA", "") or "").lower()  # "" = nikt, "1" = wszystkie, albo lista sklepów
@@ -125,6 +125,8 @@ SITES = {
     "pyroking": {
         # item bez wd-loop-item-NNN (to ID produktu), name z .wd-entities-title, price z bdi
         "base": "https://pyroking.pl", "cookies": {"currency": "PLN"},
+        "mode": "api",
+        "store_api": {"endpoint": "https://pyroking.pl/wp-json/wc/store/v1/products"},
         "listing": {"next": "{url}page/{page}/", "start": 1,
             "item": "div.wd-product",
             "name": [".wd-entities-title a", "h3 a"],
@@ -254,7 +256,9 @@ SITES = {
         "listing": {"next": "{url}/{page}", "start": 1,
             "item": ["product-tile.product-tile", "product-tile"],
             "name": ["h3.product-tile__name", "a.link_no-underline", "h2", "h3"],
+            "name_fallback": ["img[alt]@alt"],
             "link": ["a.link_no-underline@href", "a[href*='.html']@href", "a@href"],
+            "link_fallback": ["a[href]@href"],
             "price": ["span.price__value.price__value_bold", "span.price__value"],
             "out_text": ["niedostępn", "powiadom o dostępności", "powiadom mnie", "brak towaru", "wyprzedan"],
             "categories": [
@@ -361,7 +365,8 @@ SITES = {
     },
     "pironet": {
         "base": "https://pironet.pl",
-        "mode": "sitemap",
+        "mode": "api",
+        "store_api": {"endpoint": "https://pironet.pl/wp-json/wc/store/v1/products"},
         "browser_ua": True,                     # Cloudflare czasem przepuszcza Chrome UA
         "use_proxy": True, "max_parallel": 2,
         "delay": 1.0,                           # wolno, żeby nie dostać 429
@@ -371,6 +376,8 @@ SITES = {
     "piroart": {
         # item li.product (fallback li), name a[href] (pierwszy z tekstem)
         "base": "https://piroart.pl", "use_proxy": True, "browser_ua": True,
+        "mode": "api",
+        "store_api": {"endpoint": "https://piroart.pl/wp-json/wc/store/v1/products"},
         "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
         "listing": {**_WOO,
             "item": ["li.product", "li"],
@@ -1550,7 +1557,8 @@ def parse_listing(html, page_url, cfg):
             break
     products = []
     for tile in tiles:
-        name, href = _pick(tile, cfg["name"]), _pick(tile, cfg["link"])
+        name = _pick(tile, cfg["name"]) or _pick(tile, cfg.get("name_fallback"))
+        href = _pick(tile, cfg["link"]) or _pick(tile, cfg.get("link_fallback"))
         if not name or not href:
             continue
         raw_price = _pick(tile, cfg.get("price"))
@@ -1839,6 +1847,138 @@ def run_listing(con, names, args):
     return [(n, stats[n]["strony"], stats[n]) for n in names]
 
 
+def parse_store_api_product(raw):
+    if not isinstance(raw, dict):
+        return None
+    name = htmllib.unescape(str(raw.get("name") or "")).strip()
+    url = str(raw.get("permalink") or "").strip()
+    if not name or not url:
+        return None
+
+    prices = raw.get("prices") or {}
+    price = None
+    raw_price = prices.get("price")
+    if raw_price is not None:
+        try:
+            minor_unit = max(0, min(6, int(prices.get("currency_minor_unit", 2))))
+            price = round(int(raw_price) / (10 ** minor_unit), 2)
+            if not 0 < price < 1_000_000:
+                price = None
+        except (TypeError, ValueError, OverflowError):
+            price = None
+
+    in_stock = raw.get("is_in_stock")
+    availability = "in_stock" if in_stock is True else (
+        "out_of_stock" if in_stock is False else None
+    )
+    return {
+        "name": name,
+        "currency": prices.get("currency_code") or "PLN",
+        "hint": "",
+        "code_raw": raw.get("sku"),
+        "availability": availability,
+        "price": price,
+        "url": url,
+    }
+
+
+def store_api_driver(name, site, args, q, stats):
+    cfg = site["store_api"]
+    endpoint = cfg["endpoint"]
+    page_size = min(100, max(1, int(cfg.get("per_page", 100))))
+    max_pages = args.max or int(cfg.get("max_pages", 10000))
+    headers = dict(site_headers(name, site) or {})
+    headers["Accept"] = "application/json"
+    pages = products = 0
+    reason = None
+    try:
+        for page in range(1, max_pages + 1):
+            url = endpoint + ("&" if "?" in endpoint else "?") + urlencode({
+                "per_page": page_size,
+                "page": page,
+                "_fields": "id,name,permalink,sku,prices,is_in_stock",
+            })
+            response = get(url, stats, headers=headers)
+            if response is None:
+                reason = getattr(_tls, "last_fail", "błąd pobierania API")
+                break
+            try:
+                payload = response.json()
+            except ValueError as e:
+                reason = f"niepoprawny JSON API: {e.__class__.__name__}"
+                break
+            if not isinstance(payload, list):
+                reason = "API zwróciło nieoczekiwany format (oczekiwano listy produktów)"
+                break
+            parsed = [item for item in (parse_store_api_product(row) for row in payload) if item]
+            skipped = len(payload) - len(parsed)
+            if skipped:
+                log.warning("[%s] API: pominięto %d niekompletnych rekordów na stronie %d",
+                            name, skipped, page)
+            pages += 1
+            products += len(parsed)
+            q.put(("api_page", name, page, parsed))
+            if len(payload) < page_size:
+                break
+        else:
+            reason = f"osiągnięto limit {max_pages} stron API"
+    except Exception as e:
+        reason = f"{e.__class__.__name__}: {str(e)[:150]}"
+    finally:
+        q.put(("api_done", name, pages, products, reason))
+
+
+def run_store_api(con, names, args):
+    t0 = time.time()
+    stats = {n: Counter() for n in names}
+    gets = {n: Counter() for n in names}
+    problems = []
+    q = queue.Queue()
+    log.info("TRYB STORE API: %d sklepów, stron na sklep maks.: %s, odstęp: %.2fs",
+             len(names), args.max or "bez limitu", DELAY)
+    shops = ThreadPoolExecutor(max_workers=max(1, len(names)))
+    for name in names:
+        shops.submit(store_api_driver, name, SITES[name], args, q, gets[name])
+    pending = len(names)
+    try:
+        while pending:
+            try:
+                msg = q.get(timeout=5)
+            except queue.Empty:
+                continue
+            if msg[0] == "api_page":
+                _, name, page, items = msg
+                stats[name]["strony"] += 1
+                for item in items:
+                    stats[name]["produkty"] += 1
+                    if item["price"] is None:
+                        stats[name]["bez_ceny"] += 1
+                    if item["availability"] == "out_of_stock":
+                        stats[name]["niedostepne"] += 1
+                    if save(con, name, item["url"], item):
+                        stats[name]["zmiany_w_historii"] += 1
+                    log.debug("[%s] API strona %d: %s | %s",
+                              name, page, item["name"], item["price"])
+            else:
+                _, name, pages, products, reason = msg
+                pending -= 1
+                if reason:
+                    problems.append((name, SITES[name]["store_api"]["endpoint"], reason))
+                elif not products:
+                    problems.append((name, SITES[name]["store_api"]["endpoint"],
+                                     "API zwróciło 0 produktów"))
+                stats[name]["nieudane"] += gets[name]["nieudane"] + int(bool(reason))
+                log.info("[%s] API gotowe: %d stron, %d produktów%s",
+                         name, pages, products, f" | problem: {reason}" if reason else "")
+                con.commit()
+    finally:
+        shops.shutdown(wait=False, cancel_futures=True)
+        con.commit()
+    report_problems(problems, "Store API")
+    log.info("TRYB STORE API zakończony w %s", fmt_dur(time.time() - t0))
+    return [(name, stats[name]["strony"], stats[name]) for name in names]
+
+
 def resolve_sites(args):
     if not args.site:
         skipped = [n for n in SITES if SITES[n].get("skip")]
@@ -2092,13 +2232,16 @@ def cmd_scrape(args):
         in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
         summary = []
         mode = (args.mode or "auto").lower()
-        if mode not in ("smart", "sitemap", "listing", "auto"):
-            raise SystemExit(f"Nieznany tryb {mode!r}: użyj smart, sitemap, listing albo auto")
-        listing_names, sitemap_names, fallback_ok = [], [], []
+        if mode not in ("smart", "sitemap", "listing", "api", "auto"):
+            raise SystemExit(f"Nieznany tryb {mode!r}: użyj smart, sitemap, listing, api albo auto")
+        api_names, listing_names, sitemap_names, fallback_ok = [], [], [], []
         for n in names:
             m_ = (SITES[n].get("mode") or mode).lower()
             has_listing = bool(SITES[n].get("listing"))
-            if m_ == "listing" and has_listing:
+            has_api = bool(SITES[n].get("store_api"))
+            if m_ == "api" and has_api:
+                api_names.append(n)
+            elif m_ == "listing" and has_listing:
                 listing_names.append(n)
             elif m_ == "auto" and has_listing:
                 listing_names.append(n)
@@ -2108,12 +2251,19 @@ def cmd_scrape(args):
                     fallback_ok.append(n)
         auto_names = [n for n in listing_names if (SITES[n].get("mode") or mode).lower() == "auto"]
         forced = [n for n in names if SITES[n].get("mode")]
-        log.info("tryb: %s | sitemapa: %d sklepów, kategorie: %d sklepów%s", mode, len(sitemap_names), len(listing_names),
+        log.info("tryb: %s | Store API: %d sklepów, sitemapa: %d sklepów, kategorie: %d sklepów%s",
+                 mode, len(api_names), len(sitemap_names), len(listing_names),
                  f" | tryb ustawiony w konfiguracji sklepu: {', '.join(n + '=' + SITES[n]['mode'] for n in forced)}" if forced else "")
         ua_shops = [n for n in names if "User-Agent" in (site_headers(n, SITES[n]) or {})]
         px_shops = [n for n in names if SITES[n].get("use_proxy") or PROXY_ALL]
         log.info("ustawienia: User-Agent przeglądarki dla: %s | proxy (%d szt.) dla: %s",
                  ", ".join(ua_shops) or "nikt", len(_proxies), ", ".join(px_shops) or "nikt")
+        if api_names:
+            if in_actions:
+                print("::group::tryb Store API", flush=True)
+            summary += run_store_api(con, api_names, args)
+            if in_actions:
+                print("::endgroup::", flush=True)
         if listing_names:
             if in_actions:
                 print("::group::tryb listing", flush=True)
@@ -2201,12 +2351,12 @@ def main():
     s = sub.add_parser("scrape")
     s.add_argument("--site", default=env("SCRAPER_ONLY"), help="sklepy po przecinku (domyślnie wszystkie; ENV: SCRAPER_ONLY)")
     s.add_argument("--max", type=int, default=int(env("SCRAPER_MAX", 0)) or None,
-                   help="limit: adresów na sklep (sitemap) / stron na kategorię (listing); ENV: SCRAPER_MAX")
+                   help="limit: adresów (sitemap) / stron na kategorię (listing) / stron API na sklep; ENV: SCRAPER_MAX")
     s.add_argument("--workers", type=int, default=WORKERS, help="liczba równoległych wątków")
     s.add_argument("--delay", type=float, default=DELAY, help="min. odstęp między zapytaniami do hosta (s)")
     s.add_argument("--proxy", action="append", help="adres proxy (http://user:haslo@host:port lub socks5://...), można podać wiele razy")
     s.add_argument("--proxy-file", help="plik z proxy, jedno na linię")
-    s.add_argument("--mode", default=env("SCRAPER_MODE", "auto"), help="auto (domyślnie) = kategorie najpierw, a gdy nic nie da - sitemapa | listing | sitemap | smart; ENV: SCRAPER_MODE")
+    s.add_argument("--mode", default=env("SCRAPER_MODE", "auto"), help="auto (domyślnie) = kategorie najpierw, a gdy nic nie da - sitemapa | listing | sitemap | api | smart; API jest wybierane automatycznie dla sklepów z obsługą Store API; ENV: SCRAPER_MODE")
     s.add_argument("--recheck", action="store_true", default=env("SCRAPER_RECHECK") == "1", help="sprawdź ponownie też adresy znane jako nie-produkty")
     s.set_defaults(fn=cmd_scrape)
     e = sub.add_parser("export")

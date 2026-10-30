@@ -1272,10 +1272,9 @@ TEMPLATES = {
   addEventListener('resize', resize);
 
   const isMobile = /Mobi|Android/i.test(navigator.userAgent) || innerWidth < 700;
-  const MAX_PARTICLES = isMobile ? 900 : 2400;
-  const MAX_ROCKETS   = 18;
+  const MAX_PARTICLES = isMobile ? 1000 : 2600;
+  const MAX_ROCKETS   = 20;
 
-  // ---------- palety (hue w HSL) ----------
   const PALETTES = {
     redGold: [0, 15, 40],
     gold:    [38, 45, 50],
@@ -1311,11 +1310,256 @@ TEMPLATES = {
       drag: o.drag != null ? o.drag : 0.985,
       trail: !!o.trail, trailLen: o.trailLen || 8,
       flicker: !!o.flicker, strobe: !!o.strobe,
+      swim: !!o.swim, swimPhase: o.swimPhase || 0, swimAmp: o.swimAmp || 2,
       hist: [],
       splitAt: o.splitAt || 0, splitType: o.splitType || null, splitDone: false,
       _colCache: null,
     };
   }
+
+  // ---------- wysokości ----------
+  function randomHeight(){
+    const r = Math.random();
+    if (r < 0.15) return H * rnd(0.05, 0.18);   // bardzo wysoko
+    if (r < 0.45) return H * rnd(0.18, 0.32);   // wysoko
+    if (r < 0.75) return H * rnd(0.32, 0.48);   // średnio
+    if (r < 0.92) return H * rnd(0.48, 0.62);   // nisko
+    return H * rnd(0.62, 0.75);                  // bardzo nisko
+  }
+  function heightPower(targetY){
+    return 0.85 + (1 - targetY / H) * 0.5; // im wyżej, tym większy bukiet
+  }
+
+  // ---------- efekty (wszystkie przyjmują power) ----------
+  function spawnSphere(x, y, pal, opts){
+    opts = opts || {};
+    const power = opts.power || 1;
+    const n = Math.floor((opts.count || 100) * (0.85 + power * 0.15));
+    const baseSpeed = (opts.speed || 5) * power;
+    const multi = opts.multi;
+    const color = pick(pal);
+    for (let i = 0; i < n; i++){
+      const ang = (Math.PI*2*i)/n + rnd(-0.08, 0.08);
+      const speedVar = 0.75 + Math.pow(Math.random(), 1.4) * 0.5;
+      const s = baseSpeed * speedVar;
+      const hue = multi ? pick(pal) : color;
+      const hueJitter = hue === null ? null : hue + rnd(-4, 4);
+      addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+        rnd(opts.lifeMin || 60, opts.lifeMax || 90), hueJitter,
+        { size: rnd(1.3, 2.3), gravity: opts.gravity || 0.045, drag: opts.drag || 0.985,
+          trail: opts.trail, trailLen: opts.trailLen,
+          flicker: opts.flicker, strobe: opts.strobe }));
+    }
+    if (!opts.noFlash){
+      for (let i = 0; i < 6; i++){
+        const ang = Math.random()*Math.PI*2, s = rnd(0.2, 0.9) * power;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(8, 18), null, { size: rnd(3, 5), gravity: 0, drag: 0.9 }));
+      }
+    }
+  }
+
+  const EFFECTS = {
+    peony: (x,y,p,pw) => spawnSphere(x,y,p,{ count:110, speed:5, power:pw, lifeMin:60, lifeMax:90 }),
+    peonyMulti: (x,y,p,pw) => spawnSphere(x,y,p,{ count:130, speed:5, power:pw, multi:true, lifeMin:60, lifeMax:90 }),
+    chrysanthemum: (x,y,p,pw) => spawnSphere(x,y,p,{ count:95, speed:4.4, power:pw, trail:true, trailLen:12, lifeMin:80, lifeMax:110, drag:0.978, gravity:0.05 }),
+    willow: (x,y,p,pw) => {
+      const n = Math.floor(70 * (0.85 + pw*0.15)), color = pick(p);
+      for (let i = 0; i < n; i++){
+        const ang = (Math.PI*2*i)/n + rnd(-0.15, 0.15);
+        const s = rnd(1.8, 3.2) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s - 0.7,
+          rnd(110, 150), color === null ? null : color + rnd(-3, 3),
+          { size: 1.8, gravity: 0.09, drag: 0.99, trail: true, trailLen: 16, flicker: true }));
+      }
+    },
+    ring: (x,y,p,pw) => {
+      const n = 70, color = pick(p);
+      const rot = rnd(0, Math.PI), tilt = rnd(0.4, 0.9);
+      for (let i = 0; i < n; i++){
+        const ang = (Math.PI*2*i)/n, s = rnd(3.5, 4.3) * pw;
+        const dx = Math.cos(ang)*s, dy = Math.sin(ang)*s;
+        const rx =  dx*Math.cos(rot) - dy*Math.sin(rot);
+        const ry = (dx*Math.sin(rot) + dy*Math.cos(rot)) * tilt;
+        addParticle(makeParticle(x, y, rx, ry, rnd(65, 85), color,
+          { size: 2, gravity: 0.055, drag: 0.982, trail: true, trailLen: 6 }));
+      }
+    },
+    doubleRing: (x,y,p,pw) => {
+      const c1 = pick(p), c2 = pick(p);
+      const rot = rnd(0, Math.PI), tilt = rnd(0.4, 0.9);
+      const ring = (color, baseSpeed, n) => {
+        for (let i = 0; i < n; i++){
+          const ang = (Math.PI*2*i)/n, s = baseSpeed * pw * rnd(0.95, 1.05);
+          const dx = Math.cos(ang)*s, dy = Math.sin(ang)*s;
+          const rx =  dx*Math.cos(rot) - dy*Math.sin(rot);
+          const ry = (dx*Math.sin(rot) + dy*Math.cos(rot)) * tilt;
+          addParticle(makeParticle(x, y, rx, ry, rnd(65, 85), color,
+            { size: 2, gravity: 0.055, drag: 0.982, trail: true, trailLen: 6 }));
+        }
+      };
+      ring(c1, 4.5, 70);
+      ring(c2, 2.5, 40);
+    },
+    palm: (x,y,p,pw) => {
+      const n = 10 + Math.floor(Math.random()*5), color = pick(p);
+      for (let i = 0; i < n; i++){
+        const ang = (Math.PI*2*i)/n + rnd(-0.15, 0.15);
+        const s = rnd(4, 5.5) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(90, 120), color,
+          { size: 2.8, gravity: 0.06, drag: 0.985, trail: true, trailLen: 14 }));
+      }
+    },
+    crossette: (x,y,p,pw) => {
+      const n = 30, color = pick(p);
+      for (let i = 0; i < n; i++){
+        const ang = (Math.PI*2*i)/n + rnd(-0.1, 0.1), s = 3.8 * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s, 50, color,
+          { size: 2, gravity: 0.05, drag: 0.97, trail: true,
+            splitAt: 0.55, splitType: 'crossette' }));
+      }
+    },
+    crackle: (x,y,p,pw) => {
+      const n = 130;
+      for (let i = 0; i < n; i++){
+        const ang = Math.random()*Math.PI*2, s = rnd(0.8, 4) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(45, 80), null,
+          { size: 1.2, gravity: 0.08, drag: 0.955, flicker: true }));
+      }
+    },
+    strobe: (x,y,p,pw) => {
+      const color = pick(p), n = 60;
+      for (let i = 0; i < n; i++){
+        const ang = (Math.PI*2*i)/n, s = rnd(2.6, 3.8) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(80, 105), color,
+          { size: 2, gravity: 0.03, drag: 0.99, strobe: true }));
+      }
+    },
+    multi: (x,y,p,pw) => {
+      EFFECTS.peony(x,y,p,pw);
+      setTimeout(() => { if (!document.hidden) EFFECTS.ring(x,y,[pick(p)],pw); }, 180);
+      setTimeout(() => { if (!document.hidden) EFFECTS.crackle(x,y,p,pw); }, 420);
+    },
+    pistil: (x,y,p,pw) => {
+      const outer = pick(p), inner = pick(p);
+      spawnSphere(x,y,[outer],{ count:90, speed:5, power:pw, lifeMin:60, lifeMax:90 });
+      spawnSphere(x,y,[inner],{ count:45, speed:2.5, power:pw, lifeMin:55, lifeMax:80, noFlash:true });
+    },
+    glitter: (x,y,p,pw) => {
+      const color = pick(p), n = Math.floor(180 * (0.8 + pw*0.2));
+      for (let i = 0; i < n; i++){
+        const ang = Math.random()*Math.PI*2, s = rnd(0.5, 4.5) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(90, 140), color === null ? null : color + rnd(-5, 5),
+          { size: rnd(0.8, 1.6), gravity: 0.06, drag: 0.96, flicker: true, trail: true, trailLen: 4 }));
+      }
+    },
+    horsetail: (x,y,p,pw) => {
+      const color = pick(p), n = 100;
+      for (let i = 0; i < n; i++){
+        const ang = (Math.PI*2*i)/n + rnd(-0.1, 0.1);
+        const s = rnd(2.5, 4) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(100, 130), color,
+          { size: 2.2, gravity: 0.09, drag: 0.99, trail: true, trailLen: 12 }));
+      }
+    },
+    fish: (x,y,p,pw) => {
+      const color = pick(p), n = 60;
+      for (let i = 0; i < n; i++){
+        const ang = Math.random()*Math.PI*2, s = rnd(1.5, 3) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(80, 120), color,
+          { size: 1.8, gravity: 0.06, drag: 0.985, swim: true, swimAmp: rnd(1.5, 3) }));
+      }
+    },
+    spiral: (x,y,p,pw) => {
+      const color = pick(p);
+      for (let arm = 0; arm < 3; arm++){
+        for (let i = 0; i < 25; i++){
+          const t = i / 25;
+          const ang = arm * (Math.PI*2/3) + t * Math.PI*2;
+          const s = (1 + t * 4) * pw;
+          addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+            rnd(70, 95), color,
+            { size: 1.8, gravity: 0.05, drag: 0.985, trail: true, trailLen: 8 }));
+        }
+      }
+    },
+    star: (x,y,p,pw) => {
+      const color = pick(p), points = 5;
+      for (let i = 0; i < 100; i++){
+        const ang = (Math.PI*2 * i) / 100;
+        const r = 1 + 0.5 * Math.cos(points * ang);
+        const s = 4 * r * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(60, 80), color,
+          { size: 1.8, gravity: 0.05, drag: 0.985, trail: true, trailLen: 6 }));
+      }
+    },
+    heart: (x,y,p,pw) => {
+      const color = pick(p);
+      for (let i = 0; i < 100; i++){
+        const t = (Math.PI*2 * i) / 100;
+        const hx = 16 * Math.pow(Math.sin(t), 3);
+        const hy = -(13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t));
+        const scale = 0.3 * pw;
+        addParticle(makeParticle(x, y, hx * scale, hy * scale,
+          rnd(70, 90), color,
+          { size: 2, gravity: 0.04, drag: 0.99, trail: true, trailLen: 6 }));
+      }
+    },
+    halfHalf: (x,y,p,pw) => {
+      const c1 = pick(p), c2 = pick(p), n = 100;
+      for (let i = 0; i < n; i++){
+        const ang = (Math.PI*2*i)/n;
+        const s = 5 * pw * rnd(0.85, 1.15);
+        const color = Math.sin(ang) < 0 ? c1 : c2;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(60, 85), color,
+          { size: 2, gravity: 0.05, drag: 0.985 }));
+      }
+    },
+    atomic: (x,y,p,pw) => {
+      const color = pick(p);
+      for (let i = 0; i < 30; i++){
+        const ang = Math.random()*Math.PI*2, s = rnd(0.3, 1) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(20, 40), null, { size: 2.5, gravity: 0.02, drag: 0.95, flicker: true }));
+      }
+      for (let i = 0; i < 70; i++){
+        const ang = (Math.PI*2*i)/70, s = rnd(3.5, 4.5) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(70, 95), color,
+          { size: 1.8, gravity: 0.05, drag: 0.985, trail: true, trailLen: 8 }));
+      }
+    },
+    brocade: (x,y,p,pw) => {
+      const color = 40, n = 120;
+      for (let i = 0; i < n; i++){
+        const ang = (Math.PI*2*i)/n + rnd(-0.1, 0.1);
+        const s = rnd(2.5, 4.5) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
+          rnd(110, 150), color,
+          { size: 1.8, gravity: 0.07, drag: 0.992, trail: true, trailLen: 16, flicker: true }));
+      }
+    },
+    cracklingWillow: (x,y,p,pw) => {
+      const color = pick(p), n = 60;
+      for (let i = 0; i < n; i++){
+        const ang = (Math.PI*2*i)/n + rnd(-0.15, 0.15);
+        const s = rnd(2, 3.2) * pw;
+        addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s - 0.5,
+          rnd(100, 130), color,
+          { size: 1.8, gravity: 0.09, drag: 0.99, trail: true, trailLen: 14,
+            splitAt: 0.7, splitType: 'crackle' }));
+      }
+    },
+  };
+  const EFFECT_KEYS = Object.keys(EFFECTS);
 
   // ---------- rakieta ----------
   function spawnRocket(x, baseY, targetY, effect, pal){
@@ -1325,135 +1569,25 @@ TEMPLATES = {
       targetY, hue: pick(pal), effect, pal,
       wobblePhase: rnd(0, Math.PI*2), wobbleAmp: rnd(0.15, 0.5),
       age: 0,
+      power: heightPower(targetY),
     });
   }
-
-  // ---------- efekty ----------
-  function spawnSphere(x, y, pal, opts){
-    opts = opts || {};
-    const n = opts.count || 100;
-    const baseSpeed = opts.speed || 5;
-    const multi = opts.multi;
-    const color = pick(pal);
-    for (let i = 0; i < n; i++){
-      const ang = (Math.PI*2*i)/n + rnd(-0.08, 0.08);
-      // 75–125% z odchyleniem ku dołowi → realistyczna nierówność
-      const speedVar = 0.75 + Math.pow(Math.random(), 1.4) * 0.5;
-      const s = baseSpeed * speedVar;
-      const hue = multi ? pick(pal) : color;
-      const hueJitter = hue === null ? null : hue + rnd(-4, 4);
-      addParticle(makeParticle(x, y,
-        Math.cos(ang)*s, Math.sin(ang)*s,
-        rnd(opts.lifeMin || 60, opts.lifeMax || 90),
-        hueJitter,
-        { size: rnd(1.3, 2.3), gravity: opts.gravity || 0.045, drag: opts.drag || 0.985,
-          trail: opts.trail, trailLen: opts.trailLen,
-          flicker: opts.flicker, strobe: opts.strobe }));
-    }
-    // biały błysk w środku (światło eksplozji)
-    for (let i = 0; i < 6; i++){
-      const ang = Math.random()*Math.PI*2, s = rnd(0.2, 0.9);
-      addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
-        rnd(8, 18), null, { size: rnd(3, 5), gravity: 0, drag: 0.9 }));
-    }
-  }
-
-  function spawnPeony(x, y, pal){
-    spawnSphere(x, y, pal, { count: 110, speed: 5, lifeMin: 60, lifeMax: 90 });
-  }
-  function spawnPeonyMulti(x, y, pal){
-    spawnSphere(x, y, pal, { count: 130, speed: 5, multi: true, lifeMin: 60, lifeMax: 90 });
-  }
-  function spawnChrysanthemum(x, y, pal){
-    spawnSphere(x, y, pal, { count: 95, speed: 4.4, trail: true, trailLen: 12,
-      lifeMin: 80, lifeMax: 110, drag: 0.978, gravity: 0.05 });
-  }
-  function spawnWillow(x, y, pal){
-    const n = 70, color = pick(pal);
-    for (let i = 0; i < n; i++){
-      const ang = (Math.PI*2*i)/n + rnd(-0.15, 0.15);
-      const s = rnd(1.8, 3.2);
-      addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s - 0.7,
-        rnd(110, 150), color === null ? null : color + rnd(-3, 3),
-        { size: 1.8, gravity: 0.09, drag: 0.99, trail: true, trailLen: 16, flicker: true }));
-    }
-  }
-  function spawnRing(x, y, pal){
-    const n = 70, color = pick(pal);
-    const rot = rnd(0, Math.PI), tilt = rnd(0.4, 0.9);
-    for (let i = 0; i < n; i++){
-      const ang = (Math.PI*2*i)/n, s = rnd(3.5, 4.3);
-      const dx = Math.cos(ang)*s, dy = Math.sin(ang)*s;
-      const rx =  dx*Math.cos(rot) - dy*Math.sin(rot);
-      const ry = (dx*Math.sin(rot) + dy*Math.cos(rot)) * tilt;
-      addParticle(makeParticle(x, y, rx, ry, rnd(65, 85), color,
-        { size: 2, gravity: 0.055, drag: 0.982, trail: true, trailLen: 6 }));
-    }
-  }
-  function spawnPalm(x, y, pal){
-    const n = 10 + Math.floor(Math.random()*5), color = pick(pal);
-    for (let i = 0; i < n; i++){
-      const ang = (Math.PI*2*i)/n + rnd(-0.15, 0.15);
-      const s = rnd(4, 5.5);
-      addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
-        rnd(90, 120), color,
-        { size: 2.8, gravity: 0.06, drag: 0.985, trail: true, trailLen: 14 }));
-    }
-  }
-  function spawnCrossette(x, y, pal){
-    const n = 30, color = pick(pal);
-    for (let i = 0; i < n; i++){
-      const ang = (Math.PI*2*i)/n + rnd(-0.1, 0.1), s = 3.8;
-      addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s, 50, color,
-        { size: 2, gravity: 0.05, drag: 0.97, trail: true,
-          splitAt: 0.55, splitType: 'crossette' }));
-    }
-  }
-  function spawnCrackle(x, y, pal){
-    const n = 130;
-    for (let i = 0; i < n; i++){
-      const ang = Math.random()*Math.PI*2, s = rnd(0.8, 4);
-      addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
-        rnd(45, 80), null,
-        { size: 1.2, gravity: 0.08, drag: 0.955, flicker: true }));
-    }
-  }
-  function spawnStrobe(x, y, pal){
-    const color = pick(pal), n = 60;
-    for (let i = 0; i < n; i++){
-      const ang = (Math.PI*2*i)/n, s = rnd(2.6, 3.8);
-      addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
-        rnd(80, 105), color,
-        { size: 2, gravity: 0.03, drag: 0.99, strobe: true }));
-    }
-  }
-  function spawnMulti(x, y, pal){
-    spawnPeony(x, y, pal);
-    setTimeout(() => { if (!document.hidden) spawnRing(x, y, [pick(pal)]); }, 180);
-    setTimeout(() => { if (!document.hidden) spawnCrackle(x, y, pal); }, 420);
-  }
-
-  const EFFECTS = {
-    peony: spawnPeony, peonyMulti: spawnPeonyMulti,
-    chrysanthemum: spawnChrysanthemum, willow: spawnWillow,
-    ring: spawnRing, palm: spawnPalm, crossette: spawnCrossette,
-    crackle: spawnCrackle, strobe: spawnStrobe, multi: spawnMulti,
-  };
-  const EFFECT_KEYS = Object.keys(EFFECTS);
 
   // ---------- wyrzutnie ----------
   function launchSingle(){
     const effect = EFFECT_KEYS[Math.floor(Math.random()*EFFECT_KEYS.length)];
-    spawnRocket(rnd(80, W-80), H + 10, rnd(H*0.12, H*0.42), effect, palette());
+    const targetY = randomHeight();
+    spawnRocket(rnd(80, W-80), H + 10, targetY, effect, palette());
   }
   function launchBarrage(){
     const n = 3 + Math.floor(Math.random()*4);
     const baseX = rnd(120, W-120), pal = palette();
     const effect = EFFECT_KEYS[Math.floor(Math.random()*EFFECT_KEYS.length)];
+    const baseY = randomHeight();
     for (let i = 0; i < n; i++){
       setTimeout(() => {
         if (document.hidden) return;
-        spawnRocket(baseX + rnd(-80, 80), H + 10, rnd(H*0.15, H*0.4), effect, pal);
+        spawnRocket(baseX + rnd(-80, 80), H + 10, baseY + rnd(-30, 30), effect, pal);
       }, i*220);
     }
   }
@@ -1463,7 +1597,8 @@ TEMPLATES = {
     for (let i = 0; i < n; i++){
       setTimeout(() => {
         if (document.hidden) return;
-        spawnRocket(x + rnd(-15, 15), H + 10, H*0.75 - i*(H*0.03), 'crackle', pal);
+        const targetY = H * (0.55 - i * 0.04) + rnd(-20, 20);
+        spawnRocket(x + rnd(-15, 15), H + 10, targetY, 'crackle', pal);
       }, i*110);
     }
   }
@@ -1473,11 +1608,48 @@ TEMPLATES = {
       if (!document.hidden) launchSingle();
     }, i*140);
   }
+  function launchFan(){
+    const n = 4 + Math.floor(Math.random()*3);
+    const baseX = rnd(150, W-150), pal = palette();
+    const baseY = randomHeight();
+    const effect = EFFECT_KEYS[Math.floor(Math.random()*EFFECT_KEYS.length)];
+    for (let i = 0; i < n; i++){
+      setTimeout(() => {
+        if (document.hidden) return;
+        const offset = (i - (n-1)/2) * 60;
+        spawnRocket(baseX + offset, H + 10, baseY + rnd(-15, 15), effect, pal);
+      }, i*100);
+    }
+  }
+  function launchColumn(){
+    const x = rnd(100, W-100), pal = palette();
+    const n = 3 + Math.floor(Math.random()*3);
+    const effect = EFFECT_KEYS[Math.floor(Math.random()*EFFECT_KEYS.length)];
+    for (let i = 0; i < n; i++){
+      setTimeout(() => {
+        if (document.hidden) return;
+        spawnRocket(x + rnd(-30, 30), H + 10, H * (0.15 + i * 0.15), effect, pal);
+      }, i*280);
+    }
+  }
+  function launchScatter(){
+    const n = 3 + Math.floor(Math.random()*3);
+    for (let i = 0; i < n; i++){
+      setTimeout(() => {
+        if (document.hidden) return;
+        launchSingle();
+      }, i*180);
+    }
+  }
+
   const LAUNCHERS = [
-    { fn: launchSingle,       w: 55 },
-    { fn: launchBarrage,      w: 20 },
-    { fn: launchRomanCandle,  w: 15 },
-    { fn: launchFinale,       w: 10 },
+    { fn: launchSingle,       w: 38 },
+    { fn: launchBarrage,      w: 14 },
+    { fn: launchRomanCandle,  w: 12 },
+    { fn: launchFinale,       w: 8 },
+    { fn: launchFan,          w: 10 },
+    { fn: launchColumn,       w: 8 },
+    { fn: launchScatter,      w: 10 },
   ];
   const TW = LAUNCHERS.reduce((s,l)=>s+l.w,0);
   function launchRandom(){
@@ -1491,6 +1663,16 @@ TEMPLATES = {
     p.vx *= p.drag;
     p.vy *= p.drag;
     p.vy += p.gravity * dt;
+
+    if (p.swim){
+      p.swimPhase += 0.15 * dt;
+      const speed = Math.hypot(p.vx, p.vy) || 1;
+      const perpX = -p.vy / speed, perpY = p.vx / speed;
+      const wob = Math.sin(p.swimPhase) * p.swimAmp * 0.05;
+      p.vx += perpX * wob * dt;
+      p.vy += perpY * wob * dt;
+    }
+
     if (p.trail){
       p.hist.push(p.x, p.y);
       const max = (p.trailLen || 8) * 2;
@@ -1507,26 +1689,27 @@ TEMPLATES = {
           const ang = (Math.PI/2)*i + rnd(-0.25, 0.25), s = 1.8;
           addParticle(makeParticle(p.x, p.y,
             p.vx*0.25 + Math.cos(ang)*s, p.vy*0.25 + Math.sin(ang)*s,
-            30, p.hue,
-            { size: 1.5, gravity: 0.06, drag: 0.97, trail: true, trailLen: 5 }));
+            30, p.hue, { size: 1.5, gravity: 0.06, drag: 0.97, trail: true, trailLen: 5 }));
+        }
+      } else if (p.splitType === 'crackle'){
+        for (let i = 0; i < 3; i++){
+          const ang = Math.random()*Math.PI*2, s = rnd(0.5, 1.5);
+          addParticle(makeParticle(p.x, p.y, Math.cos(ang)*s, Math.sin(ang)*s,
+            15, null, { size: 1, gravity: 0.05, drag: 0.95, flicker: true }));
         }
       }
     }
   }
 
-  // kolor: iskra rodzi się biało-gorąca, przechodzi w kolor, ciemnieje i gaśnie
   function particleColor(p, age){
-    if (p.hue === null){
-      // białe iskry (crackle, błysk) po prostu gasną przez alpha
-      return '#ffffff';
-    }
+    if (p.hue === null) return '#ffffff';
     const bucket = Math.min(19, Math.floor(age * 19));
     if (!p._colCache) p._colCache = [];
     if (p._colCache[bucket]) return p._colCache[bucket];
     const a = bucket / 19;
     let L;
-    if (a < 0.12)      L = 100 - (a / 0.12) * 38;          // 100 → 62 (biało-gorąca → kolor)
-    else               L = Math.max(0, 62 - (a - 0.12) * 62); // 62 → 0 (kolor → czerń)
+    if (a < 0.12) L = 100 - (a / 0.12) * 38;
+    else          L = Math.max(0, 62 - (a - 0.12) * 62);
     const c = `hsl(${p.hue}, ${p.sat}%, ${L}%)`;
     p._colCache[bucket] = c;
     return c;
@@ -1537,20 +1720,15 @@ TEMPLATES = {
     if (age < 0 || age > 1) return;
 
     let alpha = 1 - Math.pow(age, 2.4);
-    if (p.strobe){
-      alpha *= (Math.floor(p.life / 3) % 2 === 0) ? 1 : 0.08;
-    } else if (p.flicker){
-      alpha *= 0.55 + Math.random() * 0.6;
-    }
+    if (p.strobe) alpha *= (Math.floor(p.life / 3) % 2 === 0) ? 1 : 0.08;
+    else if (p.flicker) alpha *= 0.55 + Math.random() * 0.6;
     if (alpha <= 0.01) return;
 
     const color = particleColor(p, age);
 
-    // smuga: 2 segmenty o różnej intensywności (stara część ciemniejsza)
     if (p.trail && p.hist.length >= 4){
       const N = p.hist.length;
-      const mid = (N >> 2) << 1; // parzysty środek
-      // daleka część
+      const mid = (N >> 2) << 1;
       ctx.strokeStyle = color;
       ctx.globalAlpha = alpha * 0.22;
       ctx.lineWidth = p.size * 0.55;
@@ -1558,7 +1736,6 @@ TEMPLATES = {
       ctx.moveTo(p.hist[0], p.hist[1]);
       for (let i = 2; i < mid; i += 2) ctx.lineTo(p.hist[i], p.hist[i+1]);
       ctx.stroke();
-      // bliska część (jaśniejsza)
       ctx.globalAlpha = alpha * 0.7;
       ctx.lineWidth = p.size * 0.9;
       ctx.beginPath();
@@ -1568,14 +1745,12 @@ TEMPLATES = {
       ctx.stroke();
     }
 
-    // halo (poświata) — duże, półprzezroczyste
     ctx.fillStyle = color;
     ctx.globalAlpha = alpha * 0.18;
     ctx.beginPath();
     ctx.arc(p.x, p.y, p.size * 3.2, 0, Math.PI*2);
     ctx.fill();
 
-    // rdzeń
     ctx.globalAlpha = alpha;
     ctx.beginPath();
     ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
@@ -1592,20 +1767,16 @@ TEMPLATES = {
     lastT = t;
 
     ctx.clearRect(0, 0, W, H);
-
-    // KLUCZ: additive blending — kolor sumuje się przy nakładaniu, daje naturalną poświatę
     ctx.globalCompositeOperation = 'lighter';
 
-    // rakiety
     for (let i = rockets.length - 1; i >= 0; i--){
       const r = rockets[i];
       r.age += dt;
       const wob = Math.sin(r.age * 0.15 + r.wobblePhase) * r.wobbleAmp;
       r.x += (r.vx + wob * 0.1) * dt;
       r.y += r.vy * dt;
-      r.vy += 0.09 * dt; // rakieta zwalnia (grawitacja)
+      r.vy += 0.09 * dt;
 
-      // iskry sypiące się z ogona
       if (Math.random() < 0.85){
         addParticle(makeParticle(
           r.x + rnd(-1, 1), r.y + rnd(0, 4),
@@ -1614,7 +1785,6 @@ TEMPLATES = {
           { size: rnd(0.7, 1.4), gravity: 0.05, drag: 0.93 }));
       }
 
-      // rakieta: poświata + rdzeń
       const rc = r.hue === null ? '#ffffff' : `hsl(${r.hue}, 100%, 78%)`;
       ctx.fillStyle = rc;
       ctx.globalAlpha = 0.35;
@@ -1622,14 +1792,12 @@ TEMPLATES = {
       ctx.globalAlpha = 1;
       ctx.beginPath(); ctx.arc(r.x, r.y, 2.4, 0, Math.PI*2); ctx.fill();
 
-      // eksplozja
       if (r.y <= r.targetY || r.vy >= -0.5){
-        (EFFECTS[r.effect] || spawnPeony)(r.x, r.y, r.pal);
+        (EFFECTS[r.effect] || EFFECTS.peony)(r.x, r.y, r.pal, r.power);
         rockets.splice(i, 1);
       }
     }
 
-    // cząstki
     for (let i = particles.length - 1; i >= 0; i--){
       const p = particles[i];
       updateParticle(p, dt);
@@ -1643,7 +1811,6 @@ TEMPLATES = {
   }
   requestAnimationFrame(tick);
 
-  // auto-odpalanie
   let nextLaunch;
   function autoLaunch(){
     if (document.hidden){ nextLaunch = setTimeout(autoLaunch, 1000); return; }

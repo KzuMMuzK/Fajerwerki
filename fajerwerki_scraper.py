@@ -194,6 +194,10 @@ SITES = {
     },
     "sklepzpetardami": {
         "base": "https://sklepzpetardami.pl",
+        "mode": "listing",
+        "max_parallel": 2,
+        "delay": 1.0,
+        "browser_ua": True,
         "listing": {**_PRESTA, "categories": ["https://sklepzpetardami.pl/kategoria-produktu/oferta/"],
             "item": "article.product-miniature",
             "name": "div.tvproduct-name a", "link": "div.tvproduct-name a@href", "price": "span.price",
@@ -366,7 +370,7 @@ SITES = {
     },
     "piroart": {
         # item li.product (fallback li), name a[href] (pierwszy z tekstem)
-        "base": "https://piroart.pl", "use_proxy": True,
+        "base": "https://piroart.pl", "use_proxy": True, "browser_ua": True,
         "sitemaps": ["https://piroart.pl/sitemap_index.xml"],
         "listing": {**_WOO,
             "item": ["li.product", "li"],
@@ -562,7 +566,6 @@ def _is_safe_proxy_for_https(px):
     interception - dla HTTPS ich unikamy (poza proxy z sekretów)."""
     return px.startswith(("socks5", "socks4"))
 
-
 def pick_proxy(url_scheme="https"):
     global _proxy_i
     if not _proxies:
@@ -576,13 +579,16 @@ def pick_proxy(url_scheme="https"):
                 px = safe[_proxy_i % len(safe)]
                 _proxy_i += 1
                 return px
-            user_proxies = [px for px in _proxies
-                           if px not in _free_proxies and _proxy_dead.get(px, 0) <= now]
-            if user_proxies:
-                px = user_proxies[_proxy_i % len(user_proxies)]
+            # Fallback: TYLKO user proxy z SOCKS (bez HTTP - robi MITM na HTTPS)
+            user_socks = [px for px in _proxies
+                         if px not in _free_proxies
+                         and _is_safe_proxy_for_https(px)
+                         and _proxy_dead.get(px, 0) <= now]
+            if user_socks:
+                px = user_socks[_proxy_i % len(user_socks)]
                 _proxy_i += 1
                 return px
-            return None  # direct, lepiej niż HTTP proxy z MITM
+            return None  # direct lepiej niż HTTPS przez HTTP proxy (MITM)
         for _ in range(len(_proxies)):
             px = _proxies[_proxy_i % len(_proxies)]
             _proxy_i += 1

@@ -556,7 +556,7 @@ def history(url):
 
 
 # ----------------------------------------------------------------------------- dostęp: sesja, CSRF, Discord
-PUBLIC = {"health", "robots", "login", "invite_page", "auth_discord", "auth_callback", "logout"}
+PUBLIC = {"health", "robots", "login", "invite_page", "auth_discord", "auth_callback", "logout", "favicon"}
 
 
 def csrf_token():
@@ -627,8 +627,10 @@ def headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Content-Security-Policy"] = ("default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data: "
-                                               "https://cdn.discordapp.com; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+        "img-src 'self' data: https://cdn.discordapp.com; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    )
     return resp
 
 
@@ -1183,9 +1185,10 @@ def admin_quick():
     apply_live(url)
     return redirect(safe_next(request.form.get("back")))
 
-@app.route('/favicon.ico')
+
+@app.route("/favicon.ico")
 def favicon():
-    return '', 204
+    return "", 204
 
 
 # ----------------------------------------------------------------------------- wygląd
@@ -1221,11 +1224,31 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:6px 4px;b
 .badge{font-size:11px;font-weight:700;border-radius:6px;padding:1px 7px;background:var(--chip)}.badge.a{background:#d1fadf;color:#05603a}.badge.r{background:#fee4e2;color:#b42318}
 @media(prefers-color-scheme:dark){.badge.a{background:#0b3d2a;color:#75e0a7}.badge.r{background:#4a1a15;color:#fda29b}}
 ul.clean{padding-left:18px;margin:6px 0}.who{display:flex;gap:8px;align-items:center}
+/* ---------- fajerwerki w tle ---------- */
+.fw-layer{position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:-1;overflow:hidden}
+.fw-layer .rocket{position:absolute;width:3px;height:14px;border-radius:50%;
+  background:linear-gradient(to bottom,rgba(255,255,255,0),#ffd76a);
+  box-shadow:0 0 8px 2px #ffb800;animation:fw-rise 1.1s ease-out forwards}
+.fw-layer .spark{position:absolute;width:4px;height:4px;border-radius:50%;animation:fw-burst 1s ease-out forwards}
+@keyframes fw-rise{from{transform:translateY(0);opacity:1}to{transform:translateY(-60vh);opacity:0}}
+@keyframes fw-burst{
+  0%{transform:translate(0,0) scale(1);opacity:1}
+  100%{transform:translate(var(--dx),var(--dy)) scale(.2);opacity:0}
+}
+body{position:relative;isolation:isolate}
+body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;
+  background:radial-gradient(1200px 600px at 20% -10%,rgba(217,45,32,.10),transparent 60%),
+             radial-gradient(1000px 500px at 90% 110%,rgba(88,101,242,.10),transparent 60%)}
+@media(prefers-reduced-motion:reduce){.fw-layer{display:none}}
 """
 
+
+# ----------------------------------------------------------------------------- szablony
 TEMPLATES = {
     "base.html": """<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="robots" content="noindex,nofollow"><title>{% block title %}Ceny fajerwerków{% endblock %}</title><style>{{ css|safe }}</style></head><body><div class="wrap">
+<meta name="robots" content="noindex,nofollow"><title>{% block title %}Ceny fajerwerków{% endblock %}</title><style>{{ css|safe }}</style></head><body>
+<div class="fw-layer" id="fw" aria-hidden="true"></div>
+<div class="wrap">
 {% if user %}<div class="userbar"><span class="who"><img class="av" src="{{ user.avatar }}" alt="" width="24" height="24"><span class="un">{{ user.name }}</span></span>
 <a href="{{ url_for('invites') }}">Zaproszenia</a>{% if is_admin %}<a href="{{ url_for('admin_home') }}">Admin</a>{% endif %}
 <form method="post" action="{{ url_for('logout') }}" class="inl"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="lnk">Wyloguj</button></form></div>{% endif %}
@@ -1234,7 +1257,50 @@ TEMPLATES = {
 {% if refresh_error %}<div class="err">Nie udało się odświeżyć danych ({{ refresh_error }}). Pokazuję poprzednią wersję.</div>{% endif %}
 {% block body %}{% endblock %}
 {% if last_seen %}<p class="note">Dane z: {{ last_seen|dt('%d.%m.%Y %H:%M') }}. Kody produktów są wyciągane z nazw i mogą się mylić - przed zakupem sprawdź, czy to ten sam model.</p>{% endif %}
-</div></body></html>""",
+</div>
+<script>
+(function(){
+  var layer=document.getElementById('fw');
+  if(!layer||matchMedia('(prefers-reduced-motion: reduce)').matches)return;
+  var colors=['#ff4d4d','#ffd93d','#4dd2ff','#a78bfa','#4ade80','#ff8a3d','#ffffff'];
+  function rnd(a,b){return a+Math.random()*(b-a)}
+  function burst(x,y){
+    var n=14+Math.floor(rnd(0,10));
+    var color=colors[Math.floor(rnd(0,colors.length))];
+    for(var i=0;i<n;i++){
+      var s=document.createElement('span');
+      s.className='spark';
+      var ang=(Math.PI*2/n)*i+rnd(-.2,.2);
+      var dist=rnd(40,110);
+      s.style.left=x+'px';s.style.top=y+'px';
+      s.style.background=color;
+      s.style.boxShadow='0 0 6px 1px '+color;
+      s.style.setProperty('--dx',(Math.cos(ang)*dist).toFixed(1)+'px');
+      s.style.setProperty('--dy',(Math.sin(ang)*dist).toFixed(1)+'px');
+      s.style.animationDelay=(Math.random()*60)+'ms';
+      layer.appendChild(s);
+      (function(el){setTimeout(function(){el.remove()},1200)})(s);
+    }
+  }
+  function launch(){
+    var r=document.createElement('span');
+    r.className='rocket';
+    var x=rnd(8,92), y=rnd(45,80);
+    r.style.left=x+'vw';r.style.bottom='0';
+    var col=colors[Math.floor(rnd(0,colors.length))];
+    r.style.background='linear-gradient(to bottom,rgba(255,255,255,0),'+col+')';
+    r.style.boxShadow='0 0 8px 2px '+col;
+    layer.appendChild(r);
+    setTimeout(function(){
+      r.remove();
+      burst(x/100*innerWidth, innerHeight*(1-y/100));
+    },1050);
+    setTimeout(launch, rnd(700,2200));
+  }
+  setTimeout(launch, 600);
+})();
+</script>
+</body></html>""",
 
     "card.html": """{% macro card(it) %}<div class="card{{ ' dim' if it.hidden }}"><div class="top"><span class="shop">{{ it.site }}</span>{% if it.code %}<span class="code">{{ it.code }}</span>{% endif %}
 {% if it.rank is not none %}<span class="code">przypięty</span>{% endif %}{% if it.hidden %}<span class="code">ukryty</span>{% endif %}{% if it.note %}<span class="best">{{ it.note }}</span>{% endif %}

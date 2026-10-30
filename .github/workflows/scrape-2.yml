@@ -13,11 +13,11 @@ on:
         required: false
         default: ""
       max:
-        description: "Limit do testów: stron na kategorię (listing) / adresów na sklep (sitemap). Puste = bez limitu"
+        description: "Limit do testów: stron/kategorii, adresów sitemap lub stron API na sklep. Puste = bez limitu"
         required: false
         default: ""
       workers:
-        description: "Liczba wątków (puste = 12)"
+        description: "Liczba wątków (puste = 16)"
         required: false
         default: ""
       delay:
@@ -25,11 +25,11 @@ on:
         required: false
         default: ""
       mode:
-        description: "Tryb: smart (domyślnie: sitemapa, a gdy się nie da - kategorie), sitemap (tylko sitemapy), listing (tylko kategorie) albo auto"
+        description: "Tryb: smart, sitemap, listing, api albo auto; sklepy z skonfigurowanym Store API używają go automatycznie"
         required: false
         default: ""
       free_proxy:
-        description: "Darmowe proxy z Geonode (tylko dla sklepów z use_proxy: Pirohit, Szopik); sprawdzane przed użyciem"
+        description: "Darmowe proxy z Geonode (tylko dla sklepów z use_proxy); sprawdzane przed użyciem"
         type: boolean
         default: false
       browser_ua:
@@ -89,6 +89,9 @@ jobs:
           python-version: "3.12"
 
       - run: pip install "requests[socks]" beautifulsoup4 lxml
+
+      - name: Testy scraper
+        run: python -m unittest discover -s tests -v
 
       - name: Scrape
         env:

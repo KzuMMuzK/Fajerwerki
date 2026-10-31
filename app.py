@@ -449,8 +449,16 @@ def _deduplicate_product_rows(rows):
             identity = ("url", url)
         rank = (last_seen or "", changed_at or "", -len(url or ""), url or "")
         previous = unique.get(identity)
-        if previous is None or rank > previous[0]:
+        if previous is None:
             unique[identity] = (rank, row)
+            continue
+        selected = row if rank > previous[0] else previous[1]
+        merged = list(selected)
+        historical_mins = [value for value in (previous[1][13], row[13]) if value is not None]
+        historical_maxes = [value for value in (previous[1][14], row[14]) if value is not None]
+        merged[13] = min(historical_mins) if historical_mins else None
+        merged[14] = max(historical_maxes) if historical_maxes else None
+        unique[identity] = (max(rank, previous[0]), tuple(merged))
     return [entry[1] for entry in unique.values()]
 
 
@@ -942,27 +950,78 @@ def compare():
 def deals():
     c = conn()
     try:
-        ms = float(request.args.get("ms", "5").replace(",", "."))
+        ms = min(max(float(request.args.get("ms", "0").replace(",", ".")), 0), 95)
     except ValueError:
-        ms = 5.0
-    rows = c.execute(f"""
+        ms = 0.0
+    try:
+        min_shops = min(max(int(request.args.get("shops", "2")), 2), 20)
+    except ValueError:
+        min_shops = 2
+    try:
+        min_saving = min(max(float(request.args.get("saving", "0").replace(",", ".")), 0), 100000)
+    except ValueError:
+        min_saving = 0.0
+    query = " ".join(request.args.get("q", "").split())[:100]
+    sort = request.args.get("sort", "percent")
+    sort_orders = {
+        "percent": "saving_pct DESC, saving DESC",
+        "amount": "saving DESC, saving_pct DESC",
+        "shops": "n_avail DESC, saving_pct DESC",
+        "name": "name COLLATE NOCASE ASC",
+    }
+    if sort not in sort_orders:
+        sort = "percent"
+    try:
+        page = max(int(request.args.get("page", "1")), 1)
+    except ValueError:
+        page = 1
+    visible = vis()
+    cte = f"""
         WITH ranked AS (
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY code_key, site
                 ORDER BY CASE WHEN avail = 'in_stock' AND price IS NOT NULL THEN 0 ELSE 1 END,
                          price IS NULL, price ASC, changed_at DESC
             ) AS offer_rank
-            FROM items WHERE code_key IS NOT NULL{vis()}
+            FROM items WHERE code_key IS NOT NULL{visible}
+        ), offers AS (
+            SELECT * FROM ranked WHERE offer_rank = 1
+        ), grouped AS (
+            SELECT code_key, MIN(code) AS code, MIN(name) AS name,
+                   MIN(name_norm) AS name_norm,
+                   COUNT(DISTINCT site) AS shops,
+                   COUNT(DISTINCT CASE WHEN avail = 'in_stock' AND price IS NOT NULL THEN site END) AS n_avail,
+                   MIN(CASE WHEN avail = 'in_stock' AND price IS NOT NULL THEN price END) AS pmin,
+                   MAX(CASE WHEN avail = 'in_stock' AND price IS NOT NULL THEN price END) AS pmax
+            FROM offers GROUP BY code_key
+        ), opportunities AS (
+            SELECT *, pmax - pmin AS saving,
+                   (pmax - pmin) * 100.0 / pmax AS saving_pct
+            FROM grouped WHERE n_avail >= ? AND pmax > pmin AND pmax > 0
         )
-        SELECT code_key, MIN(code) AS code, MIN(name) AS name, COUNT(DISTINCT site) AS shops,
-               COUNT(DISTINCT CASE WHEN avail = 'in_stock' AND price IS NOT NULL THEN site END) AS n_avail,
-               MIN(CASE WHEN avail = 'in_stock' THEN price END) AS pmin,
-               MAX(CASE WHEN avail = 'in_stock' THEN price END) AS pmax
-        FROM ranked WHERE offer_rank = 1
-        GROUP BY code_key
-        HAVING n_avail >= 2 AND pmax > pmin * (1 + ? / 100.0)
-        ORDER BY (pmax - pmin) / pmin DESC LIMIT 100""", (ms,)).fetchall()
-    return render_template("deals.html", rows=rows, ms=ms, tab="deals", **common_ctx(c))
+    """
+    filters = ["saving_pct >= ?", "saving >= ?"]
+    params = [min_shops, ms, min_saving]
+    if query:
+        folded_query = fold(query)
+        code_query = keyify(query)
+        filters.append("(name_norm LIKE ? OR code_key LIKE ?)")
+        params.extend([f"%{folded_query}%", f"%{code_query or query.upper()}%"])
+    where = " WHERE " + " AND ".join(filters)
+    total = c.execute(cte + " SELECT COUNT(*) FROM opportunities" + where, params).fetchone()[0]
+    per_page = 100
+    pages = max((total + per_page - 1) // per_page, 1)
+    page = min(page, pages)
+    rows = c.execute(
+        cte + " SELECT * FROM opportunities" + where
+        + f" ORDER BY {sort_orders[sort]}, code_key LIMIT ? OFFSET ?",
+        params + [per_page, (page - 1) * per_page],
+    ).fetchall()
+    return render_template(
+        "deals.html", rows=rows, ms=ms, min_shops=min_shops, min_saving=min_saving,
+        query=query, sort=sort, page=page, pages=pages, total=total, tab="deals",
+        **common_ctx(c),
+    )
 
 
 def _best_shop_offers(rows):
@@ -977,7 +1036,7 @@ def _best_shop_offers(rows):
     return [entry[1] for entry in sorted(best.values(), key=lambda entry: entry[1]["site"])]
 
 
-def _basket_product(c, query):
+def _basket_product(c, query, price_mode="current", include_unavailable=False):
     normalized = " ".join(fold(query).split())
     code = keyify(query)
     if len(code) >= 3:
@@ -989,7 +1048,7 @@ def _basket_product(c, query):
             warning = ("Ten kod oznacza kilka nazw/wariantów w jednym sklepie; "
                        "sprawdź, czy wybrana oferta odpowiada dokładnie temu produktowi."
                        if any(len(names) > 1 for names in variants.values()) else None)
-            return code, _best_shop_offers(matches), matches[0]["name"], warning
+            return code, _basket_shop_offers(matches, price_mode, include_unavailable), matches[0]["name"], warning
 
     pattern = "%" + normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     matches = c.execute(
@@ -1022,38 +1081,57 @@ def _basket_product(c, query):
         matched = c.execute("SELECT * FROM items WHERE code_key = ? AND hidden = 0", (identity[1],)).fetchall()
     else:
         matched = c.execute("SELECT * FROM items WHERE name_norm = ? AND hidden = 0", (identity[1],)).fetchall()
-    offers = _best_shop_offers(matched)
+    offers = _basket_shop_offers(matched, price_mode, include_unavailable)
     warning = "Dopasowanie po fragmencie nazwy — sprawdź, czy to właściwy produkt." if score < 0.75 else None
     return identity[1] if identity[0] == "code" else None, offers, representative["name"], warning
 
 
-def _plan_basket(c, products, selected_site):
+def _basket_shop_offers(rows, price_mode, include_unavailable):
+    best = {}
+    price_field = "min_price" if price_mode == "historical" else "price"
+    for row in rows:
+        if not include_unavailable and row["avail"] != "in_stock":
+            continue
+        price = row[price_field]
+        if price is None:
+            continue
+        offer = dict(row)
+        offer["basket_price"] = price
+        offer["historical_price"] = price_mode == "historical"
+        current = best.get(row["site"])
+        if current is None or price < current["basket_price"]:
+            best[row["site"]] = offer
+    return [best[site] for site in sorted(best)]
+
+
+def _plan_basket(c, products, selected_site, price_mode="current", include_unavailable=False):
     shops = [row["site"] for row in c.execute("SELECT DISTINCT site FROM items WHERE hidden = 0 ORDER BY site")]
     lines = []
     for query in products:
-        code, offers, name, warning = _basket_product(c, query)
-        available = [offer for offer in offers if offer["avail"] == "in_stock" and offer["price"] is not None]
-        cheapest = min(available, key=lambda offer: offer["price"]) if available else None
+        code, offers, name, warning = _basket_product(
+            c, query, price_mode, include_unavailable
+        )
+        cheapest = min(offers, key=lambda offer: offer["basket_price"]) if offers else None
         lines.append({"query": query, "code": code, "name": name, "offers": offers,
                       "cheapest": cheapest, "warning": warning,
-                      "error": warning if not offers else None})
+                      "error": warning if not name else None})
 
-    mix_total = sum(line["cheapest"]["price"] for line in lines if line["cheapest"])
+    mix_total = sum(line["cheapest"]["basket_price"] for line in lines if line["cheapest"])
     mix_missing = sum(line["cheapest"] is None for line in lines)
     shop_totals = []
     for shop in shops:
-        selected = [next((offer for offer in line["offers"]
-                          if offer["site"] == shop and offer["avail"] == "in_stock"
-                          and offer["price"] is not None), None) for line in lines]
+        selected = [next((offer for offer in line["offers"] if offer["site"] == shop), None)
+                    for line in lines]
         missing = sum(offer is None for offer in selected)
-        shop_totals.append({"site": shop, "total": sum(offer["price"] for offer in selected if offer),
+        shop_totals.append({"site": shop, "total": sum(offer["basket_price"] for offer in selected if offer),
                             "missing": missing})
     complete = [total for total in shop_totals if total["missing"] == 0]
     best_store = min(complete, key=lambda total: total["total"]) if complete else None
     selected_total = next((total for total in shop_totals if total["site"] == selected_site), None)
     return {"lines": lines, "mix_total": mix_total, "mix_missing": mix_missing,
             "shop_totals": sorted(shop_totals, key=lambda total: (total["missing"], total["total"])),
-            "best_store": best_store, "selected_total": selected_total}
+            "best_store": best_store, "selected_total": selected_total,
+            "price_mode": price_mode, "include_unavailable": include_unavailable}
 
 
 @app.route("/basket")
@@ -1066,9 +1144,14 @@ def basket():
     selected_site = request.args.get("site", "").strip()
     if selected_site not in {shop["site"] for shop in shops}:
         selected_site = ""
-    plan = _plan_basket(c, products, selected_site) if products else None
+    price_mode = request.args.get("price_mode", "current")
+    if price_mode not in ("current", "historical"):
+        price_mode = "current"
+    include_unavailable = request.args.get("unavailable") == "1"
+    plan = _plan_basket(c, products, selected_site, price_mode, include_unavailable) if products else None
     return render_template("basket.html", products_text=products_text,
-                           selected_site=selected_site, plan=plan, tab="basket",
+                           selected_site=selected_site, price_mode=price_mode,
+                           include_unavailable=include_unavailable, plan=plan, tab="basket",
                            **context)
 
 
@@ -1386,7 +1469,7 @@ TEMPLATES = {
 {% if user %}<div class="userbar"><span class="who"><img class="av" src="{{ user.avatar }}" alt="" width="24" height="24"><span class="un">{{ user.name }}</span></span>
 <a href="{{ url_for('invites') }}">Zaproszenia</a>{% if is_admin %}<a href="{{ url_for('admin_home') }}">Admin</a>{% endif %}
 <form method="post" action="{{ url_for('logout') }}" class="inl"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="lnk">Wyloguj</button></form></div>{% endif %}
-<header>{% if user %}<nav class="tabs"><a href="{{ url_for('index') }}" class="{{ 'on' if tab=='list' }}">Produkty</a><a href="{{ url_for('deals') }}" class="{{ 'on' if tab=='deals' }}">Porównanie</a><a href="{{ url_for('basket') }}" class="{{ 'on' if tab=='basket' }}">Koszyk</a><a href="{{ url_for('changes') }}" class="{{ 'on' if tab=='changes' }}">Zmiany</a></nav>{% endif %}{% block head %}{% endblock %}</header>
+<header>{% if user %}<nav class="tabs"><a href="{{ url_for('index') }}" class="{{ 'on' if tab=='list' }}">Produkty</a><a href="{{ url_for('deals') }}" class="{{ 'on' if tab=='deals' }}">Okazje</a><a href="{{ url_for('basket') }}" class="{{ 'on' if tab=='basket' }}">Koszyk</a><a href="{{ url_for('changes') }}" class="{{ 'on' if tab=='changes' }}">Zmiany</a></nav>{% endif %}{% block head %}{% endblock %}</header>
 {% for cat, msg in messages %}<div class="{{ 'err' if cat == 'err' else 'okm' }}">{{ msg }}</div>{% endfor %}
 {% if refresh_error %}<div class="err">Nie udało się odświeżyć danych ({{ refresh_error }}). Pokazuję poprzednią wersję.</div>{% endif %}
 {% block body %}{% endblock %}
@@ -2035,21 +2118,29 @@ TEMPLATES = {
     "basket.html": """{% extends 'base.html' %}
 {% block body %}<h1>Planer koszyka</h1><p class="note">Wpisz po jednej nazwie lub kodzie produktu w wierszu. Sumy nie uwzględniają dostawy.</p>
 <form method="get" class="f"><label style="grid-column:1/3">Produkty<textarea name="products" rows="7" placeholder="PXO310&#10;Nazwa produktu">{{ products_text }}</textarea></label>
-<label>Porównaj z konkretnym sklepem<select name="site"><option value="">Wybierz sklep</option>{% for sh in shops %}<option value="{{ sh.site }}" {{ 'selected' if sh.site==selected_site }}>{{ sh.site }}</option>{% endfor %}</select></label><button style="grid-column:1/3">Policz koszyk</button></form>
-{% if plan %}<h2>Najtańszy koszyk (zakupy w różnych sklepach)</h2><p class="meta">Suma: <b>{{ plan.mix_total|pln }}</b>{% if plan.mix_missing %} · brak ofert dla {{ plan.mix_missing }} pozycji{% endif %}</p>
-{% for line in plan.lines %}<div class="card"><div class="top"><span class="code">{{ line.query }}</span>{% if line.cheapest %}<span class="best">{{ line.cheapest.site }} · {{ line.cheapest.price|pln }}</span>{% endif %}</div>
-{% if line.name %}<div>{{ line.name }}</div>{% endif %}{% if line.error %}<div class="err">{{ line.error }}</div>{% elif line.warning %}<div class="note">{{ line.warning }}</div>{% endif %}
-{% if line.cheapest %}<a class="btn sm" href="{{ line.cheapest.url }}" target="_blank" rel="noopener noreferrer">Otwórz najtańszą ofertę</a>{% else %}<div class="note">Brak dostępnej oferty.</div>{% endif %}</div>{% endfor %}
-<h2>Cały koszyk w jednym sklepie</h2>{% if plan.best_store %}<div class="card"><b>Najtaniej: {{ plan.best_store.site }} · {{ plan.best_store.total|pln }}</b></div>{% else %}<div class="card">Żaden sklep nie ma wszystkich produktów dostępnych.</div>{% endif %}
+<label>Ceny<select name="price_mode"><option value="current" {{ 'selected' if price_mode=='current' }}>Aktualne</option><option value="historical" {{ 'selected' if price_mode=='historical' }}>Najniższe historyczne</option></select></label>
+<label>Sklep do sprawdzenia<select name="site"><option value="">Wszystkie sklepy</option>{% for sh in shops %}<option value="{{ sh.site }}" {{ 'selected' if sh.site==selected_site }}>{{ sh.site }}</option>{% endfor %}</select></label>
+<label class="chk" style="grid-column:1/3"><input type="checkbox" name="unavailable" value="1" {{ 'checked' if include_unavailable }}> Uwzględnij produkty obecnie niedostępne</label>
+<button style="grid-column:1/3">Policz koszyk</button></form>
+{% if plan %}<h2>Porównanie sum</h2><div class="stats"><div class="stat"><span class="note">Najtańszy miks sklepów</span><b>{{ plan.mix_total|pln }}</b><span class="note">{% if plan.mix_missing %}brak {{ plan.mix_missing }} pozycji{% else %}wszystkie pozycje{% endif %}</span></div>
+<div class="stat"><span class="note">Najtaniej w jednym sklepie</span><b>{{ plan.best_store.total|pln if plan.best_store else 'brak pełnej oferty' }}</b><span class="note">{{ plan.best_store.site if plan.best_store else 'żaden sklep nie ma wszystkich pozycji' }}{% if plan.best_store and plan.best_store.missing %} · brak {{ plan.best_store.missing }}{% endif %}</span></div></div>
+<p class="note">Tryb: {{ 'historyczne minimum' if plan.price_mode=='historical' else 'aktualne ceny' }}{% if plan.include_unavailable %}; uwzględniono także niedostępne{% else %}; tylko dostępne{% endif %}. Historyczna cena nie oznacza, że produkt można teraz kupić.</p>
 {% if selected_site %}<div class="card"><b>{{ selected_site }}:</b> {% if plan.selected_total and not plan.selected_total.missing %}{{ plan.selected_total.total|pln }}{% elif plan.selected_total %}brakuje {{ plan.selected_total.missing }} pozycji{% else %}brak danych{% endif %}</div>{% endif %}
-<details><summary>Porównaj koszyk w sklepach</summary>{% for total in plan.shop_totals %}<div class="row"><span>{{ total.site }}</span><span>{% if total.missing %}brakuje {{ total.missing }} pozycji · częściowo {{ total.total|pln}}{% else %}{{ total.total|pln }}{% endif %}</span></div>{% endfor %}</details>{% endif %}{% endblock %}""",
+{% for line in plan.lines %}<div class="card"><div class="top"><span class="code">{{ line.query }}</span>{% if line.cheapest %}<span class="best">{{ line.cheapest.site }} · {{ line.cheapest.basket_price|pln }}</span>{% endif %}</div>
+{% if line.name %}<div>{{ line.name }}</div>{% endif %}{% if line.error %}<div class="err">{{ line.error }}</div>{% elif line.warning %}<div class="note">{{ line.warning }}</div>{% endif %}
+{% if line.cheapest %}<div class="note">{% if line.cheapest.historical_price %}najniższa cena historyczna{% elif line.cheapest.avail=='in_stock' %}dostępny{% else %}obecnie niedostępny{% endif %}</div><a class="btn sm" href="{{ line.cheapest.url }}" target="_blank" rel="noopener noreferrer">Otwórz ofertę</a>{% elif line.name %}<div class="note">Brak oferty pasującej do wybranych przełączników.</div>{% endif %}</div>{% endfor %}
+<details><summary>Porównaj sumy we wszystkich sklepach</summary>{% for total in plan.shop_totals %}<div class="row"><span>{{ total.site }}</span><span>{% if total.missing %}brakuje {{ total.missing }} pozycji · suma częściowa {{ total.total|pln }}{% else %}{{ total.total|pln }}{% endif %}</span></div>{% endfor %}</details>{% endif %}{% endblock %}""",
 
     "deals.html": """{% extends 'base.html' %}
-{% block head %}<form method="get" class="s"><input name="ms" inputmode="decimal" value="{{ ms|int if ms==ms|int else ms }}" style="width:90px"><span class="note" style="align-self:center">min. różnica % między sklepami</span><button style="width:auto">OK</button></form>{% endblock %}
-{% block body %}{% if not has_codes %}<div class="err">Baza nie ma jeszcze kodów produktów - uruchom scraper, żeby je wyliczył.</div>{% endif %}
-<div class="meta">Produkty z tym samym kodem dostępne w co najmniej 2 sklepach, od największej różnicy cen.</div>
-{% for r in rows %}<div class="card"><div class="top"><span class="code">{{ r.code }}</span><span class="note">{{ r.n_avail|shops }} z towarem</span></div><a class="name" href="{{ url_for('compare', k=r.code_key) }}">{{ r.name }}</a>
-<div class="row"><span class="price">{{ r.pmin|pln }}</span><span class="old">{{ r.pmax|pln }}</span><span class="down">−{{ ((r.pmax-r.pmin)*100/r.pmax)|round|int }}%</span></div></div>{% else %}<div class="card">Brak takich produktów.</div>{% endfor %}{% endblock %}""",
+{% block body %}<h1>Okazje</h1><p class="note">Porównanie dostępnych ofert między sklepami. Procent pokazuje oszczędność względem najwyższej ceny.</p>
+<form method="get" class="f"><label style="grid-column:1/3">Szukaj nazwy lub kodu<input type="search" name="q" value="{{ query }}" placeholder="np. PXO310 albo wyrzutnia"></label>
+<label>Min. różnica ceny (%)<input name="ms" type="number" min="0" max="95" step="0.5" value="{{ ms }}"></label><label>Min. oszczędność (zł)<input name="saving" type="number" min="0" step="1" value="{{ min_saving }}"></label>
+<label>Min. sklepów z ofertą<select name="shops">{% for n in (2,3,4,5) %}<option value="{{ n }}" {{ 'selected' if min_shops==n }}>{{ n }}+</option>{% endfor %}</select></label>
+<label>Sortuj<select name="sort"><option value="percent" {{ 'selected' if sort=='percent' }}>Największy procent</option><option value="amount" {{ 'selected' if sort=='amount' }}>Największa oszczędność zł</option><option value="shops" {{ 'selected' if sort=='shops' }}>Najwięcej sklepów</option><option value="name" {{ 'selected' if sort=='name' }}>Nazwa A-Z</option></select></label><button style="grid-column:1/3">Szukaj okazji</button></form>
+<div class="meta">{{ total }} okazji · strona {{ page }} / {{ pages }} ({{ rows|length }} na stronie)</div>
+{% for r in rows %}<div class="card"><div class="top"><span class="code">{{ r.code }}</span><span class="best">{{ r.saving_pct|round(1) }}% taniej</span><span class="note">{{ r.n_avail }} z {{ r.shops }} sklepów</span></div><a class="name" href="{{ url_for('compare', k=r.code_key) }}">{{ r.name }}</a>
+<div class="row"><span class="price">{{ r.pmin|pln }}</span><span class="old">{{ r.pmax|pln }}</span><span class="down">oszczędzasz {{ r.saving|pln }}</span></div></div>{% else %}<div class="card">Brak okazji dla tych filtrów.</div>{% endfor %}
+<div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1) if page<pages else '#' }}">dalej →</a></div>{% endblock %}""",
 
     "changes.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}
 {% block head %}<nav class="tabs">{% for k,l in [('drops','Obniżki'),('rises','Podwyżki'),('back','Wróciły'),('gone','Zniknęły')] %}<a class="{{ 'on' if t==k }}" href="{{ url_for('changes', t=k, days=days, site=site or None) }}">{{ l }} {{ counts[k] }}</a>{% endfor %}</nav>

@@ -1434,8 +1434,11 @@ def db():
       first_seen TEXT, last_seen TEXT);
     CREATE TABLE IF NOT EXISTS prices(
       id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT, ts TEXT,
-      price REAL, currency TEXT, availability TEXT);
+      price REAL, currency TEXT, availability TEXT, scan_id INTEGER);
     CREATE INDEX IF NOT EXISTS ix_prices_url ON prices(url, ts);
+    CREATE TABLE IF NOT EXISTS scrape_runs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, site TEXT, started_at TEXT,
+      completed_at TEXT, status TEXT, products_checked INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nonproduct(url TEXT PRIMARY KEY, ts TEXT);
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(products)")}
@@ -1467,11 +1470,16 @@ def db():
             log.warning("zmiana parsera cen: historia (%d wpisów) przeniesiona do tabeli prices_backup, "
                         "ceny liczone od nowa", n)
         con.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('parser_version', ?)", (str(PARSER_VERSION),))
+    price_cols = {r[1] for r in con.execute("PRAGMA table_info(prices)")}
+    if "scan_id" not in price_cols:
+        con.execute("ALTER TABLE prices ADD COLUMN scan_id INTEGER")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_scrape_runs_site_start ON scrape_runs(site, started_at)")
     con.commit()
     return con
 
 
 _suspicious = []
+_active_scan_ids = {}
 
 
 def save(con, site_name, url, d):
@@ -1482,6 +1490,10 @@ def save(con, site_name, url, d):
                    ON CONFLICT(url) DO UPDATE SET name=excluded.name, code=excluded.code,
                    code_key=excluded.code_key, last_seen=excluded.last_seen""",
                 (url, site_name, d["name"], code, key, now, now))
+    scan_id = _active_scan_ids.get(site_name)
+    if scan_id is not None:
+        con.execute("UPDATE scrape_runs SET products_checked = products_checked + 1 WHERE id = ?",
+                    (scan_id,))
     last = con.execute("SELECT price, availability FROM prices WHERE url=? "
                        "ORDER BY id DESC LIMIT 1", (url,)).fetchone()
     cur = (d["price"], d.get("availability"))
@@ -1502,8 +1514,10 @@ def save(con, site_name, url, d):
         if len(_suspicious) <= 25:
             log.warning("PODEJRZANA ZMIANA CENY %.2f -> %.2f | %s | %s", last[0], d["price"], d["name"], url)
     if changed:
-        con.execute("INSERT INTO prices(url,ts,price,currency,availability) VALUES(?,?,?,?,?)",
-                    (url, now, d["price"], d.get("currency", "PLN"), d.get("availability")))
+        con.execute(
+            "INSERT INTO prices(url,ts,price,currency,availability,scan_id) VALUES(?,?,?,?,?,?)",
+            (url, now, d["price"], d.get("currency", "PLN"), d.get("availability"), scan_id),
+        )
         return True
     return False
 
@@ -2215,8 +2229,19 @@ def cmd_scrape(args):
     DELAY = args.delay
     setup_proxies(args)
     con = db()
+    scan_ids = {}
+    scan_completed = False
     try:
         names = resolve_sites(args)
+        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for name in names:
+            cursor = con.execute(
+                "INSERT INTO scrape_runs(site,started_at,status) VALUES(?,?,'running')",
+                (name, started_at),
+            )
+            scan_ids[name] = cursor.lastrowid
+        _active_scan_ids.update(scan_ids)
+        con.commit()
         for n in names:
             site = SITES[n]
             hosts = {urlparse(site["base"]).netloc}
@@ -2321,7 +2346,16 @@ def cmd_scrape(args):
                 for name, n, st in summary:
                     f.write(f"| {name} | {n} | {st['produkty']} | {st['zmiany_w_historii']} | "
                             f"{st['nieudane'] + st['blad_parsowania'] + st['nieudane_strony']} |\n")
+        scan_completed = True
     finally:
+        completed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for name, scan_id in scan_ids.items():
+            con.execute(
+                "UPDATE scrape_runs SET completed_at = ?, status = ? WHERE id = ?",
+                (completed_at, "complete" if scan_completed else "failed", scan_id),
+            )
+            _active_scan_ids.pop(name, None)
+        con.commit()
         con.close()
 
 

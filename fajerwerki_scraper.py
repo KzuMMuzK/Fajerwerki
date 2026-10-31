@@ -428,7 +428,7 @@ SITES = {
     },
     "biegun": {
         "base": "https://fajerwerkibiegun.pl",
-        "delay": 0.5, "max_parallel": 4, "use_proxy": True, "browser_ua": True,
+        "delay": 1, "max_parallel": 2, "use_proxy": True, "browser_ua": True,
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
@@ -496,6 +496,7 @@ SITES = {
     },
     "funkezone": {
         "base": "https://funkezone.com",
+        "use_proxy": True, "browser_ua": True,
         "mode": "api",
         "store_api": {"endpoint": "https://funkezone.com/wp-json/wc/store/v1/products"},
     },
@@ -834,10 +835,14 @@ PROXIFLY_SOCKS5_JSON = (
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/"
     "proxies/protocols/socks5/data.json"
 )
+PROXIFLY_SOCKS5_TXT = (
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/"
+    "proxies/protocols/socks5/data.txt"
+)
 # Kraje preferowane (blisko Polski = niższe opóźnienia)
 PROXIFLY_QUALITY_COUNTRIES = {"PL", "DE", "CZ", "SK", "NL", "FR", "GB"}
 # Ile maksymalnie dodać w jednym przebiegu (żeby nie zapchać rotacji)
-PROXIFLY_MAX_QUALITY = 200
+PROXIFLY_MAX_QUALITY = 300
 _fallback_lock = threading.Lock()
 _last_fallback_fetch = 0.0
 FALLBACK_INTERVAL = 180
@@ -859,48 +864,73 @@ def _socks_ok():
     return _socks_cached
 
 
+
+def _proxifly_load_json():
+    """Próbuje JSON z geolokalizacją. Zwraca listę dictów albo None."""
+    try:
+        r = requests.get(PROXIFLY_SOCKS5_JSON, timeout=30,
+                         headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        return r.json()
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Proxifly: JSON niedostępny (%s) – fallback na .txt", short_err(e))
+        return None
+
+
+def _proxifly_load_txt():
+    """Fallback: parsuje data.txt (jedna linia = jedno proxy)."""
+    try:
+        r = requests.get(PROXIFLY_SOCKS5_TXT, timeout=30,
+                         headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        return [
+            {"proxy": line.strip()}
+            for line in r.text.splitlines()
+            if line.strip().startswith("socks5://")
+        ]
+    except requests.RequestException as e:
+        log.warning("Proxifly: nie udało się pobrać data.txt: %s", short_err(e))
+        return []
+
+
 def _do_fetch_proxifly(tag=""):
     """Pobiera TYLKO SOCKS5 z Proxifly (bezpieczne dla HTTPS).
-    Filtruje po krajach blisko Polski, ogranicza liczbę.
+    Najpierw próbuje JSON (z krajem), potem fallback na .txt.
     """
     if not _socks_ok():
         log.warning("Proxifly%s: PySocks nie zainstalowany – pomijam SOCKS5", tag)
         return 0
 
-    try:
-        r = requests.get(PROXIFLY_SOCKS5_JSON, timeout=25,
-                         headers={"User-Agent": USER_AGENT})
-        r.raise_for_status()
-        data = r.json()
-    except (requests.RequestException, ValueError) as e:
-        log.warning("Proxifly%s: nie udało się pobrać JSON SOCKS5: %s",
-                    tag, short_err(e))
+    data = _proxifly_load_json() or _proxifly_load_txt()
+    if not data:
+        log.warning("Proxifly%s: brak danych z żadnego źródła", tag)
         return 0
 
     added = []
+    # 1) Preferuj proxy z krajów blisko Polski
     for item in data:
         proxy = item.get("proxy")
         if not proxy or not proxy.startswith("socks5://"):
             continue
         country = (item.get("geolocation") or {}).get("country", "")
-        # Preferuj kraje blisko Polski
         if country and country not in PROXIFLY_QUALITY_COUNTRIES:
             continue
-        # score obecnie zawsze 1, ale na przyszłość – odrzucaj śmieci
         if item.get("score", 1) < 1:
             continue
         added.append(proxy)
         if len(added) >= PROXIFLY_MAX_QUALITY:
             break
 
-    # Jeśli filtr kraju dał 0 – awaryjnie bierz dowolne SOCKS5
-    if not added:
-        log.info("Proxifly%s: brak proxy z preferowanych krajów – "
-                 "biorę dowolne SOCKS5", tag)
+    # 2) Za mało preferowanych – dobierz dowolne SOCKS5
+    if len(added) < PROXIFLY_MAX_QUALITY // 2:
+        log.info("Proxifly%s: tylko %d proxy z preferowanych krajów – "
+                 "dobieram dowolne SOCKS5", tag, len(added))
+        seen = set(added)
         for item in data:
             proxy = item.get("proxy")
-            if proxy and proxy.startswith("socks5://"):
+            if proxy and proxy.startswith("socks5://") and proxy not in seen:
                 added.append(proxy)
+                seen.add(proxy)
                 if len(added) >= PROXIFLY_MAX_QUALITY:
                     break
 
@@ -912,8 +942,9 @@ def _do_fetch_proxifly(tag=""):
                 _free_proxies.add(px)
                 new_count += 1
 
-    log.info("Proxifly%s: dodano %d nowych SOCKS5 (łącznie w puli: %d)",
-             tag, new_count, len(_proxies))
+    log.info("Proxifly%s: źródło %s, dodano %d nowych SOCKS5 (łącznie w puli: %d)",
+             tag, "json" if isinstance(data[0], dict) and "geolocation" in data[0] else "txt",
+             new_count, len(_proxies))
     return new_count
 
 
@@ -932,15 +963,20 @@ def _on_403_detected():
     with _403_lock:
         if now - _last_403_fetch < _403_INTERVAL:
             return
-        _last_403_fetch = now
+        _last_403_fetch = now  
     log.info("wykryto 403 (blokada?) – pobieram świeże proxy z Proxifly w tle")
     threading.Thread(target=_do_fetch_proxifly, args=(" (403)",), daemon=True).start()
 
 
 def ensure_fallback_proxies():
-    if not _proxies or _live_count() == 0:
+    # Zawsze próbuj dociągnąć SOCKS5 z Proxifly, jeśli nie mamy ich wystarczająco
+    now = time.time()
+    socks_live = sum(
+        1 for px in _proxies
+        if _is_safe_proxy_for_https(px) and _proxy_dead.get(px, 0) <= time.time()
+    )
+    if socks_live < 50:  # próg – możesz dostosować
         fetch_proxifly_proxies()
-
 
 def geonode_candidates(countries=()):
     try:

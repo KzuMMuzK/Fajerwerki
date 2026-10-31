@@ -195,7 +195,7 @@ SITES = {
             "out_text": ["nie ma takiej ilości", "wyprzedan", "brak w magazynie"]},
     },
     "sklepzpetardami": {
-        "base": "https://sklepzpetardami.pl",
+        "base": "https://sklepzpetardami.pl", "use_proxy": True,
         "mode": "listing",
         "max_parallel": 2,
         "delay": 1.0,
@@ -315,7 +315,7 @@ SITES = {
     },
     "pirozone": {
         # item li.product, name z a.product-title (motyw custom z rating)
-        "base": "https://pirozone.pl", "delay": 0.7,
+        "base": "https://pirozone.pl", "delay": 0.7, "use_proxy": True,
         "mode": "api",
         "store_api": {"endpoint": "https://pirozone.pl/wp-json/wc/store/v1/products"},
         "browser_ua": True,
@@ -428,7 +428,7 @@ SITES = {
     },
     "biegun": {
         "base": "https://fajerwerkibiegun.pl",
-        "delay": 0.5, "max_parallel": 4,
+        "delay": 0.5, "max_parallel": 4, "use_proxy": True, "browser_ua": True,
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
@@ -490,6 +490,7 @@ SITES = {
     },
     "funke-store": {
         "base": "https://funke-store.com",
+        "use_proxy": True, "browser_ua": True,
         "mode": "api",
         "store_api": {"endpoint": "https://funke-store.com/wp-json/wc/store/v1/products"},
     },

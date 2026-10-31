@@ -493,6 +493,19 @@ def _build_derived(src, dst):
         CREATE INDEX ix_site ON items(site); CREATE INDEX ix_key ON items(code_key);
         CREATE INDEX ix_changed ON items(changed_at);
         CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE change_events(
+            url TEXT, site TEXT, name TEXT, name_norm TEXT, code TEXT, code_key TEXT,
+            ts TEXT, price REAL, availability TEXT, currency TEXT,
+            prev_price REAL, prev_availability TEXT, scan_id INTEGER
+        );
+        CREATE INDEX ix_change_events_ts ON change_events(ts);
+        CREATE INDEX ix_change_events_site_ts ON change_events(site, ts);
+        CREATE INDEX ix_change_events_date ON change_events(substr(ts, 1, 10));
+        CREATE INDEX ix_change_events_scan ON change_events(scan_id);
+        CREATE TABLE scan_options(
+            scan_id INTEGER PRIMARY KEY, site TEXT, started_at TEXT,
+            completed_at TEXT, status TEXT
+        );
     """)
     batch = []
     for (url, site, name, code, key, first, last, price, av, ts, cur, prev, prev_av, mn, mx, n) in rows:
@@ -500,6 +513,52 @@ def _build_derived(src, dst):
         batch.append((url, site, name, fold(name), code, key, first, last, price, av, ts, cur or "PLN", prev, prev_av,
                       mn, mx, n, pct, None, None, name, price, av, code, key, prev, pct, 0, None, None, 0))
     out.executemany("INSERT INTO items VALUES(" + ",".join("?" * 31) + ")", batch)
+    out.execute("ATTACH DATABASE ? AS source_db", (src,))
+    source_tables = {row[0] for row in out.execute(
+        "SELECT name FROM source_db.sqlite_master WHERE type = 'table'"
+    )}
+    price_columns = {row[1] for row in out.execute("PRAGMA source_db.table_info(prices)")}
+    source_scan_expr = "p.scan_id" if "scan_id" in price_columns else "NULL"
+    if "scrape_runs" in source_tables:
+        out.execute("""
+            INSERT OR IGNORE INTO scan_options(scan_id,site,started_at,completed_at,status)
+            SELECT id,site,started_at,completed_at,status FROM source_db.scrape_runs
+        """)
+    out.execute(f"""
+        WITH legacy_days AS (
+            SELECT DISTINCT i.site, substr(p.ts, 1, 10) AS scan_day
+            FROM source_db.prices p JOIN items i ON i.url = p.url
+            WHERE p.ts IS NOT NULL AND COALESCE({source_scan_expr}, 0) = 0
+        ), numbered_days AS (
+            SELECT -ROW_NUMBER() OVER (ORDER BY site, scan_day) AS scan_id,
+                   site, scan_day
+            FROM legacy_days
+        )
+        INSERT OR IGNORE INTO scan_options(scan_id,site,started_at,completed_at,status)
+        SELECT scan_id,site,scan_day || 'T00:00:00+00:00',
+               scan_day || 'T23:59:59+00:00','legacy'
+        FROM numbered_days
+    """)
+    out.execute(f"""
+        INSERT INTO change_events
+        WITH ordered_prices AS (
+            SELECT url, ts, price, availability, currency, {source_scan_expr} AS scan_id,
+                   LAG(price) OVER (PARTITION BY url ORDER BY id) AS prev_price,
+                   LAG(availability) OVER (PARTITION BY url ORDER BY id) AS prev_availability,
+                   ROW_NUMBER() OVER (PARTITION BY url ORDER BY id) AS event_number
+            FROM source_db.prices p
+        )
+        SELECT i.url, i.site, i.name, i.name_norm, i.code, i.code_key,
+               p.ts, p.price, p.availability, p.currency, p.prev_price, p.prev_availability,
+               COALESCE(p.scan_id, (
+                   SELECT s.scan_id FROM scan_options s
+                   WHERE s.site = i.site AND s.status = 'legacy'
+                     AND substr(s.started_at, 1, 10) = substr(p.ts, 1, 10)
+                   LIMIT 1
+               ))
+        FROM ordered_prices p JOIN items i ON i.url = p.url
+        WHERE p.event_number > 1
+    """)
     try:  # ręczne zmiany z magazynu aplikacji; brak magazynu nie blokuje pokazania cen
         overrides = store.read(lambda d: copy.deepcopy(d["overrides"]))
     except Exception:
@@ -782,6 +841,7 @@ def f_pct(x):
 def helpers():
     def url_with(**kw):
         args = request.args.to_dict(flat=False)
+        args.pop("_partial", None)
         for k, v in kw.items():
             if v is None:
                 args.pop(k, None)
@@ -791,7 +851,7 @@ def helpers():
 
     def export_url():
         args = request.args.to_dict(flat=False)
-        for k in ("page", "s"):
+        for k in ("page", "s", "_partial"):
             args.pop(k, None)
         return url_for("export_csv") + ("?" + urlencode(args, doseq=True) if args else "")
     user = g.get("user")
@@ -899,8 +959,12 @@ def index():
     total = c.execute("SELECT COUNT(*) FROM items" + where, args).fetchone()[0]
     items = c.execute(f"SELECT * FROM items{where} ORDER BY {order} LIMIT ? OFFSET ?",
                       args + [PER_PAGE, (page - 1) * PER_PAGE]).fetchall()
-    return render_template("index.html", items=items, total=total, page=page, pages=max((total + PER_PAGE - 1) // PER_PAGE, 1),
-                           q=q, s=s, sorts=SORTS, sel_sites=request.args.getlist("site"), tab="list", **common_ctx(c))
+    context = dict(items=items, total=total, page=page,
+                   pages=max((total + PER_PAGE - 1) // PER_PAGE, 1),
+                   q=q, s=s, sorts=SORTS, sel_sites=request.args.getlist("site"),
+                   tab="list", **common_ctx(c))
+    template = "product_results.html" if request.args.get("_partial") == "1" else "index.html"
+    return render_template(template, **context)
 
 
 @app.route("/export.csv")
@@ -1149,7 +1213,8 @@ def basket():
         price_mode = "current"
     include_unavailable = request.args.get("unavailable") == "1"
     plan = _plan_basket(c, products, selected_site, price_mode, include_unavailable) if products else None
-    return render_template("basket.html", products_text=products_text,
+    template = "basket_results.html" if request.args.get("_partial") == "1" else "basket.html"
+    return render_template(template, products_text=products_text,
                            selected_site=selected_site, price_mode=price_mode,
                            include_unavailable=include_unavailable, plan=plan, tab="basket",
                            **context)
@@ -1162,29 +1227,97 @@ def changes():
     site = request.args.get("site", "").strip()
     if site not in {shop["site"] for shop in context["shops"]}:
         site = ""
-    site_filter = " AND site = ?" if site else ""
+    site_filter = " AND e.site = ?" if site else ""
     site_args = [site] if site else []
     t = request.args.get("t", "drops")
-    try:
-        days = min(max(int(request.args.get("days", "7")), 1), 90)
-    except ValueError:
-        days = 7
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
     conds = {
-        "drops": ("prev_price IS NOT NULL AND price < prev_price", "drop_pct DESC"),
-        "rises": ("prev_price IS NOT NULL AND price > prev_price", "drop_pct ASC"),
-        "back": ("prev_avail = 'out_of_stock' AND avail = 'in_stock'", "changed_at DESC"),
-        "gone": ("prev_avail = 'in_stock' AND avail = 'out_of_stock'", "changed_at DESC"),
+        "drops": ("e.prev_price IS NOT NULL AND e.price < e.prev_price",
+                  "e.prev_price - e.price DESC, e.ts DESC"),
+        "rises": ("e.prev_price IS NOT NULL AND e.price > e.prev_price",
+                  "e.price - e.prev_price DESC, e.ts DESC"),
+        "back": ("e.prev_availability = 'out_of_stock' AND e.availability = 'in_stock'", "e.ts DESC"),
+        "gone": ("e.prev_availability = 'in_stock' AND e.availability = 'out_of_stock'", "e.ts DESC"),
     }
     if t not in conds:
         t = "drops"
-    counts = {k: c.execute(f"SELECT COUNT(*) FROM items WHERE changed_at >= ? AND {cond}{site_filter}{vis()}",
-                           [cutoff] + site_args).fetchone()[0]
-              for k, (cond, _) in conds.items()}
-    rows = c.execute(f"SELECT * FROM items WHERE changed_at >= ? AND {conds[t][0]}{site_filter}{vis()} "
-                     f"ORDER BY {conds[t][1]} LIMIT 200", [cutoff] + site_args).fetchall()
-    return render_template("changes.html", rows=rows, t=t, days=days, counts=counts, site=site,
-                           tab="changes", **context)
+    scan_options = [dict(row) for row in c.execute(
+        "SELECT scan_id, site, started_at, completed_at, status FROM scan_options "
+        "ORDER BY started_at DESC, site LIMIT 365"
+    )]
+    scan_mode = request.args.get("scan_mode", "last")
+    if scan_mode not in ("last", "selected", "range"):
+        scan_mode = "last"
+    valid_scan_ids = {str(scan["scan_id"]) for scan in scan_options}
+    selected_scans = [value for value in request.args.getlist("scan")
+                      if value in valid_scan_ids]
+    date_from = request.args.get("date_from", "")
+    date_to = request.args.get("date_to", "")
+    valid_dates = []
+    for value in (date_from, date_to):
+        try:
+            value = datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            value = ""
+        valid_dates.append(value)
+    date_from, date_to = valid_dates
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
+    if scan_mode == "last":
+        latest_start = scan_options[0]["started_at"] if scan_options else None
+        selected_scans = [
+            str(scan["scan_id"]) for scan in scan_options
+            if latest_start and scan["started_at"] == latest_start
+        ]
+    elif scan_mode == "range":
+        selected_scans = [
+            str(scan["scan_id"]) for scan in scan_options
+            if (not date_from or scan["started_at"][:10] >= date_from)
+            and (not date_to or scan["started_at"][:10] <= date_to)
+        ]
+    scan_filter = ""
+    scan_args = []
+    if selected_scans:
+        scan_filter = " AND e.scan_id IN (" + ",".join("?" * len(selected_scans)) + ")"
+        scan_args = [int(scan_id) for scan_id in selected_scans]
+    else:
+        scan_filter = " AND 0"
+    visibility = "" if is_admin(g.user) else " AND i.hidden = 0"
+    counts = {
+        key: c.execute(
+            "SELECT COUNT(*) FROM change_events e JOIN items i ON i.url = e.url "
+            f"WHERE {condition}{scan_filter}{site_filter}{visibility}",
+            scan_args + site_args,
+        ).fetchone()[0]
+        for key, (condition, _) in conds.items()
+    }
+    rows = c.execute(
+        "SELECT i.*, e.ts AS event_ts, e.price AS event_price, "
+        "e.availability AS event_availability, e.prev_price AS event_prev_price, "
+        "e.prev_availability AS event_prev_availability "
+        "FROM change_events e JOIN items i ON i.url = e.url "
+        f"WHERE {conds[t][0]}{scan_filter}{site_filter}{visibility} "
+        f"ORDER BY {conds[t][1]} LIMIT 200",
+        scan_args + site_args,
+    ).fetchall()
+    display_rows = []
+    for row in rows:
+        item = dict(row)
+        item["changed_at"] = item["event_ts"]
+        item["price"] = item["event_price"]
+        item["avail"] = item["event_availability"]
+        item["prev_price"] = item["event_prev_price"]
+        item["prev_avail"] = item["event_prev_availability"]
+        previous, current = item["prev_price"], item["price"]
+        item["drop_pct"] = (
+            (previous - current) * 100 / previous
+            if previous and current is not None and previous > 0 else None
+        )
+        display_rows.append(item)
+    return render_template(
+        "changes.html", rows=display_rows, t=t, counts=counts, site=site,
+        scan_options=scan_options, scan_mode=scan_mode, selected_scans=selected_scans,
+        date_from=date_from, date_to=date_to, tab="changes", **context,
+    )
 
 
 # ----------------------------------------------------------------------------- zaproszenia (członkowie)
@@ -2088,8 +2221,8 @@ TEMPLATES = {
 
     "denied.html": """{% extends 'base.html' %}{% block body %}<div class="center"><h1>Brak dostępu</h1><p>{{ msg }}</p><p><a class="btn" href="{{ url_for('login') }}">Wróć do logowania</a></p></div>{% endblock %}""",
 
-    "index.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}
-{% block head %}<form class="s" method="get" action="{{ url_for('index') }}"><input type="search" name="q" value="{{ q }}" placeholder="nazwa lub kod, np. PXO310" autocomplete="off"><button style="width:auto">Szukaj</button></form>
+    "index.html": """{% extends 'base.html' %}
+{% block head %}<form class="s" method="get" action="{{ url_for('index') }}" data-product-search><input type="search" name="q" value="{{ q }}" placeholder="nazwa lub kod, np. PXO310" autocomplete="off"><button style="width:auto">Szukaj</button></form><p id="search-status" class="note" aria-live="polite">Wyniki aktualizują się podczas wpisywania.</p>
 <details {{ 'open' if request.args.get('site') or request.args.get('a') or request.args.get('d') or request.args.get('min') or request.args.get('max') or request.args.get('s') or request.args.get('cheapest') }}><summary>Filtry i sortowanie</summary>
 <form method="get" class="f"><input type="hidden" name="q" value="{{ q }}">
 <label>Sortuj<select name="s">{% for k,(label,_) in sorts.items() %}<option value="{{ k }}" {{ 'selected' if k==s }}>{{ label }}</option>{% endfor %}</select></label>
@@ -2098,9 +2231,49 @@ TEMPLATES = {
 <label class="chk"><input type="checkbox" name="a" value="1" {{ 'checked' if request.args.get('a')=='1' }}> tylko dostępne</label><label class="chk"><input type="checkbox" name="d" value="1" {{ 'checked' if request.args.get('d')=='1' }}> tylko obniżki (14 dni)</label>
 <label class="chk"><input type="checkbox" name="cheapest" value="1" {{ 'checked' if request.args.get('cheapest')=='1' }}> tylko najtańsze wśród sklepów</label>
 <button style="grid-column:1/3">Zastosuj</button></form></details>{% endblock %}
-{% block body %}<div class="meta">{{ total }} produktów · <a href="{{ export_url() }}" style="text-decoration:underline">pobierz CSV</a></div>
+{% block body %}{% include 'product_results.html' %}
+<script>
+(() => {
+  const form = document.querySelector('[data-product-search]');
+  const input = form.elements.q;
+  const status = document.getElementById('search-status');
+  let timer;
+  let controller;
+  async function updateResults() {
+    if (controller) controller.abort();
+    controller = new AbortController();
+    const url = new URL(form.action, location.href);
+    const current = new URL(location.href);
+    current.searchParams.forEach((value, key) => {
+      if (key !== 'q' && key !== 'page' && key !== '_partial') url.searchParams.append(key, value);
+    });
+    url.searchParams.set('q', input.value);
+    url.searchParams.set('_partial', '1');
+    status.textContent = 'Szukam…';
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const parsed = new DOMParser().parseFromString(await response.text(), 'text/html');
+      const next = parsed.getElementById('product-results');
+      const currentResults = document.getElementById('product-results');
+      if (!next || !currentResults) throw new Error('Nieprawidłowa odpowiedź serwera.');
+      currentResults.replaceWith(next);
+      const filterQuery = document.querySelector('.f input[name="q"]');
+      if (filterQuery) filterQuery.value = input.value;
+      url.searchParams.delete('_partial');
+      history.replaceState(null, '', url);
+      status.textContent = 'Wyniki zaktualizowane.';
+    } catch (error) {
+      if (error.name !== 'AbortError') status.textContent = 'Nie udało się odświeżyć wyników. Użyj przycisku Szukaj.';
+    }
+  }
+  form.addEventListener('submit', event => { event.preventDefault(); clearTimeout(timer); updateResults(); });
+  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(updateResults, 250); });
+})();
+</script>{% endblock %}""",
+    "product_results.html": """{% from 'card.html' import card with context %}<div id="product-results"><div class="meta">{{ total }} produktów · <a href="{{ export_url() }}" style="text-decoration:underline">pobierz CSV</a></div>
 {% for it in items %}{{ card(it) }}{% else %}<div class="card">Brak wyników.</div>{% endfor %}
-<div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1) if page<pages else '#' }}">dalej →</a></div>{% endblock %}""",
+<div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1) if page<pages else '#' }}">dalej →</a></div></div>""",
 
     "product.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}
 {% block body %}<h1>{{ it.name }}</h1><div class="top"><span class="shop">{{ it.site }}</span>{% if it.code %}<span class="code">{{ it.code }}</span>{% endif %}<span class="note">{{ 'dostępny' if it.avail=='in_stock' else 'niedostępny' }}</span>{% if it.note %}<span class="best">{{ it.note }}</span>{% endif %}</div>
@@ -2117,19 +2290,57 @@ TEMPLATES = {
 
     "basket.html": """{% extends 'base.html' %}
 {% block body %}<h1>Planer koszyka</h1><p class="note">Wpisz po jednej nazwie lub kodzie produktu w wierszu. Sumy nie uwzględniają dostawy.</p>
-<form method="get" class="f"><label style="grid-column:1/3">Produkty<textarea name="products" rows="7" placeholder="PXO310&#10;Nazwa produktu">{{ products_text }}</textarea></label>
+<form method="get" action="{{ url_for('basket') }}" class="f" data-basket-form><label style="grid-column:1/3">Produkty<textarea name="products" rows="7" placeholder="PXO310&#10;Nazwa produktu">{{ products_text }}</textarea></label>
 <label>Ceny<select name="price_mode"><option value="current" {{ 'selected' if price_mode=='current' }}>Aktualne</option><option value="historical" {{ 'selected' if price_mode=='historical' }}>Najniższe historyczne</option></select></label>
 <label>Sklep do sprawdzenia<select name="site"><option value="">Wszystkie sklepy</option>{% for sh in shops %}<option value="{{ sh.site }}" {{ 'selected' if sh.site==selected_site }}>{{ sh.site }}</option>{% endfor %}</select></label>
 <label class="chk" style="grid-column:1/3"><input type="checkbox" name="unavailable" value="1" {{ 'checked' if include_unavailable }}> Uwzględnij produkty obecnie niedostępne</label>
 <button style="grid-column:1/3">Policz koszyk</button></form>
-{% if plan %}<h2>Porównanie sum</h2><div class="stats"><div class="stat"><span class="note">Najtańszy miks sklepów</span><b>{{ plan.mix_total|pln }}</b><span class="note">{% if plan.mix_missing %}brak {{ plan.mix_missing }} pozycji{% else %}wszystkie pozycje{% endif %}</span></div>
+{% include 'basket_results.html' %}
+<script>
+(() => {
+  const form = document.querySelector('[data-basket-form]');
+  const products = form.elements.products;
+  let result = document.getElementById('basket-results');
+  let timer;
+  let controller;
+  async function updateBasket() {
+    if (controller) controller.abort();
+    controller = new AbortController();
+    const url = new URL(form.action, location.href);
+    for (const [key, value] of new FormData(form)) {
+      if (key !== 'unavailable' || form.elements.unavailable.checked) url.searchParams.append(key, value);
+    }
+    if (form.elements.unavailable.checked) url.searchParams.set('unavailable', '1');
+    url.searchParams.set('_partial', '1');
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const parsed = new DOMParser().parseFromString(await response.text(), 'text/html');
+      const next = parsed.getElementById('basket-results');
+      if (!next || !result.isConnected) throw new Error('Nieprawidłowa odpowiedź serwera.');
+      result.replaceWith(next);
+      result = next;
+      url.searchParams.delete('_partial');
+      history.replaceState(null, '', url);
+    } catch (error) {
+      if (error.name !== 'AbortError') result.textContent = 'Nie udało się przeliczyć koszyka. Spróbuj ponownie.';
+    }
+  }
+  form.addEventListener('submit', event => { event.preventDefault(); clearTimeout(timer); updateBasket(); });
+  form.addEventListener('input', event => {
+    if (event.target === products) { clearTimeout(timer); timer = setTimeout(updateBasket, 350); }
+  });
+  form.addEventListener('change', () => { clearTimeout(timer); updateBasket(); });
+})();
+</script>{% endblock %}""",
+    "basket_results.html": """<div id="basket-results">{% if plan %}<h2>Porównanie sum</h2><div class="stats"><div class="stat"><span class="note">Najtańszy miks sklepów</span><b>{{ plan.mix_total|pln }}</b><span class="note">{% if plan.mix_missing %}brak {{ plan.mix_missing }} pozycji{% else %}wszystkie pozycje{% endif %}</span></div>
 <div class="stat"><span class="note">Najtaniej w jednym sklepie</span><b>{{ plan.best_store.total|pln if plan.best_store else 'brak pełnej oferty' }}</b><span class="note">{{ plan.best_store.site if plan.best_store else 'żaden sklep nie ma wszystkich pozycji' }}{% if plan.best_store and plan.best_store.missing %} · brak {{ plan.best_store.missing }}{% endif %}</span></div></div>
 <p class="note">Tryb: {{ 'historyczne minimum' if plan.price_mode=='historical' else 'aktualne ceny' }}{% if plan.include_unavailable %}; uwzględniono także niedostępne{% else %}; tylko dostępne{% endif %}. Historyczna cena nie oznacza, że produkt można teraz kupić.</p>
 {% if selected_site %}<div class="card"><b>{{ selected_site }}:</b> {% if plan.selected_total and not plan.selected_total.missing %}{{ plan.selected_total.total|pln }}{% elif plan.selected_total %}brakuje {{ plan.selected_total.missing }} pozycji{% else %}brak danych{% endif %}</div>{% endif %}
 {% for line in plan.lines %}<div class="card"><div class="top"><span class="code">{{ line.query }}</span>{% if line.cheapest %}<span class="best">{{ line.cheapest.site }} · {{ line.cheapest.basket_price|pln }}</span>{% endif %}</div>
 {% if line.name %}<div>{{ line.name }}</div>{% endif %}{% if line.error %}<div class="err">{{ line.error }}</div>{% elif line.warning %}<div class="note">{{ line.warning }}</div>{% endif %}
 {% if line.cheapest %}<div class="note">{% if line.cheapest.historical_price %}najniższa cena historyczna{% elif line.cheapest.avail=='in_stock' %}dostępny{% else %}obecnie niedostępny{% endif %}</div><a class="btn sm" href="{{ line.cheapest.url }}" target="_blank" rel="noopener noreferrer">Otwórz ofertę</a>{% elif line.name %}<div class="note">Brak oferty pasującej do wybranych przełączników.</div>{% endif %}</div>{% endfor %}
-<details><summary>Porównaj sumy we wszystkich sklepach</summary>{% for total in plan.shop_totals %}<div class="row"><span>{{ total.site }}</span><span>{% if total.missing %}brakuje {{ total.missing }} pozycji · suma częściowa {{ total.total|pln }}{% else %}{{ total.total|pln }}{% endif %}</span></div>{% endfor %}</details>{% endif %}{% endblock %}""",
+<details><summary>Porównaj sumy we wszystkich sklepach</summary>{% for total in plan.shop_totals %}<div class="row"><span>{{ total.site }}</span><span>{% if total.missing %}brakuje {{ total.missing }} pozycji · suma częściowa {{ total.total|pln }}{% else %}{{ total.total|pln }}{% endif %}</span></div>{% endfor %}</details>{% endif %}</div>""",
 
     "deals.html": """{% extends 'base.html' %}
 {% block body %}<h1>Okazje</h1><p class="note">Porównanie dostępnych ofert między sklepami. Procent pokazuje oszczędność względem najwyższej ceny.</p>
@@ -2143,9 +2354,15 @@ TEMPLATES = {
 <div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1) if page<pages else '#' }}">dalej →</a></div>{% endblock %}""",
 
     "changes.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}
-{% block head %}<nav class="tabs">{% for k,l in [('drops','Obniżki'),('rises','Podwyżki'),('back','Wróciły'),('gone','Zniknęły')] %}<a class="{{ 'on' if t==k }}" href="{{ url_for('changes', t=k, days=days, site=site or None) }}">{{ l }} {{ counts[k] }}</a>{% endfor %}</nav>
-<form class="s" method="get"><input type="hidden" name="t" value="{{ t }}"><select name="days">{% for d in (1,3,7,14,30) %}<option value="{{ d }}" {{ 'selected' if d==days }}>ostatnie {{ d }} dni</option>{% endfor %}</select><select name="site"><option value="">Wszystkie sklepy</option>{% for sh in shops %}<option value="{{ sh.site }}" {{ 'selected' if sh.site==site }}>{{ sh.site }}</option>{% endfor %}</select><button style="width:auto">Filtruj</button></form>{% endblock %}
-{% block body %}{% for r in rows %}{{ card(r) }}{% else %}<div class="card">Brak zmian w tym okresie.</div>{% endfor %}{% endblock %}""",
+{% block head %}<nav class="tabs">{% for k,l in [('drops','Obniżki'),('rises','Podwyżki'),('back','Wróciły'),('gone','Zniknęły')] %}<a class="{{ 'on' if t==k }}" href="{{ url_with(t=k) }}">{{ l }} {{ counts[k] }}</a>{% endfor %}</nav>
+<form class="f" method="get"><input type="hidden" name="t" value="{{ t }}">
+<label>Wybór skanów<select name="scan_mode" id="scan-mode"><option value="last" {{ 'selected' if scan_mode=='last' }}>Ostatni skan</option><option value="selected" {{ 'selected' if scan_mode=='selected' }}>Wybierz skany</option><option value="range" {{ 'selected' if scan_mode=='range' }}>Skan od–do</option></select></label>
+<label>Sklep<select name="site"><option value="">Wszystkie sklepy</option>{% for sh in shops %}<option value="{{ sh.site }}" {{ 'selected' if sh.site==site }}>{{ sh.site }}</option>{% endfor %}</select></label>
+<label id="scan-selection" style="{{ '' if scan_mode=='selected' else 'display:none' }}">Skany — możesz wybrać kilka<select name="scan" multiple size="5">{% for scan in scan_options %}<option value="{{ scan.scan_id }}" {{ 'selected' if scan.scan_id|string in selected_scans }}>{{ scan.site }} · {{ scan.started_at|dt('%d.%m.%Y %H:%M') }}{% if scan.status=='legacy' %} (historia dzienna){% elif scan.status=='failed' %} (niepełny){% endif %}</option>{% endfor %}</select></label>
+<label id="scan-from" style="{{ '' if scan_mode=='range' else 'display:none' }}">Od<input type="date" name="date_from" value="{{ date_from }}"></label><label id="scan-to" style="{{ '' if scan_mode=='range' else 'display:none' }}">Do<input type="date" name="date_to" value="{{ date_to }}"></label>
+<button style="grid-column:1/3">Filtruj zmiany</button></form><p class="note">Starsza historia sprzed dodania rejestru skanów jest grupowana według dnia.</p>
+<script>document.getElementById('scan-mode').addEventListener('change', event => { const selected=event.target.value==='selected'; const range=event.target.value==='range'; document.getElementById('scan-selection').style.display=selected?'flex':'none'; document.getElementById('scan-from').style.display=range?'flex':'none'; document.getElementById('scan-to').style.display=range?'flex':'none'; });</script>{% endblock %}
+{% block body %}{% for r in rows %}{{ card(r) }}{% else %}<div class="card">Brak zmian dla wybranych skanów.</div>{% endfor %}{% endblock %}""",
 
     "invites.html": """{% extends 'base.html' %}{% block body %}<h1>Zaproszenia</h1>
 {% if allowed %}<form method="post" class="f"><input type="hidden" name="csrf" value="{{ csrf }}">

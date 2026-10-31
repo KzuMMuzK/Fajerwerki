@@ -59,6 +59,24 @@ class AccessHandlingTests(unittest.TestCase):
         session.return_value.get.assert_called_once()
         report_proxy.assert_not_called()
 
+    def test_reported_403_stores_are_eligible_for_browser_headers_and_proxy_fallback(self):
+        names = {
+            "pironet", "funke-store", "pirozone", "sklepzpetardami", "biegun",
+        }
+
+        for name in names:
+            with self.subTest(shop=name):
+                site = scraper.SITES[name]
+                self.assertTrue(site.get("use_proxy"))
+                self.assertTrue(site.get("browser_ua"))
+                self.assertIn("User-Agent", scraper.site_headers(name, site))
+
+        targets = {urlparse(url).netloc for url, _headers in scraper.free_proxy_targets(names)}
+        self.assertEqual(targets, {
+            "pironet.pl", "funke-store.com", "pirozone.pl",
+            "sklepzpetardami.pl", "fajerwerkibiegun.pl",
+        })
+
 
 class StoreApiTests(unittest.TestCase):
     def test_only_verified_store_apis_are_enabled(self):

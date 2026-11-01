@@ -118,6 +118,36 @@ class AccessHandlingTests(unittest.TestCase):
         self.assertEqual(stats["http_403"], 1)
         self.assertEqual(stats["nieudane"], 1)
 
+    def test_403_rotates_through_all_configured_proxies(self):
+        proxies = [f"socks5://proxy{index}:1080" for index in range(9)]
+        responses = [Mock(status_code=403, headers={"server": "Cloudflare"}) for _ in range(8)]
+        responses.append(Mock(status_code=200, headers={}))
+        session = Mock()
+        session.return_value.get.side_effect = responses
+        host = "blocked.example"
+
+        with (
+            patch.object(scraper, "allowed", return_value=True),
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "throttle"),
+            patch.object(scraper, "session", session),
+            patch.object(scraper, "_proxies", proxies),
+            patch.object(scraper, "_proxy_hosts", {host}),
+            patch.object(scraper, "_free_proxies", set()),
+            patch.object(scraper, "_proxy_dead", {}),
+            patch.object(scraper, "_proxy_fail", Counter()),
+            patch.object(scraper, "_proxy_strikes", Counter()),
+            patch.object(scraper, "_proxy_i", 0),
+        ):
+            result = scraper.get(f"https://{host}/", retries=3)
+
+        self.assertEqual(result.status_code, 200)
+        requests = session.return_value.get.call_args_list
+        self.assertEqual(len(requests), 9)
+        attempted = [request.kwargs["proxies"]["https"] for request in requests]
+        self.assertEqual(len(set(attempted[:8])), 8)
+        self.assertNotIn(attempted[-1], attempted[:8])
+
     def test_reported_403_stores_keep_proxy_and_browser_ua_fallback(self):
         names = {
             "pironet", "funke-store", "pirozone", "sklepzpetardami", "biegun",

@@ -1297,15 +1297,12 @@ def changes():
     if t not in conds:
         t = "drops"
     scan_options = [dict(row) for row in c.execute(
-        "SELECT scan_id, site, started_at, completed_at, status FROM scan_options "
+        "SELECT scan_id, site, started_at FROM scan_options "
         "ORDER BY started_at DESC, site LIMIT 365"
     )]
     scan_mode = request.args.get("scan_mode", "last")
-    if scan_mode not in ("last", "selected", "range"):
+    if scan_mode not in ("last", "range"):
         scan_mode = "last"
-    valid_scan_ids = {str(scan["scan_id"]) for scan in scan_options}
-    selected_scans = [value for value in request.args.getlist("scan")
-                      if value in valid_scan_ids]
     date_from = request.args.get("date_from", "")
     date_to = request.args.get("date_to", "")
     valid_dates = []
@@ -1318,25 +1315,31 @@ def changes():
     date_from, date_to = valid_dates
     if date_from and date_to and date_from > date_to:
         date_from, date_to = date_to, date_from
-    if scan_mode == "last":
-        latest_start = scan_options[0]["started_at"] if scan_options else None
-        selected_scans = [
-            str(scan["scan_id"]) for scan in scan_options
-            if latest_start and scan["started_at"] == latest_start
-        ]
-    elif scan_mode == "range":
-        selected_scans = [
-            str(scan["scan_id"]) for scan in scan_options
-            if (not date_from or scan["started_at"][:10] >= date_from)
-            and (not date_to or scan["started_at"][:10] <= date_to)
-        ]
     scan_filter = ""
     scan_args = []
-    if selected_scans:
-        scan_filter = " AND e.scan_id IN (" + ",".join("?" * len(selected_scans)) + ")"
-        scan_args = [int(scan_id) for scan_id in selected_scans]
+    if scan_mode == "last":
+        relevant_scans = [
+            scan for scan in scan_options
+            if not site or scan["site"] == site
+        ]
+        latest_start = relevant_scans[0]["started_at"] if relevant_scans else None
+        latest_scans = [
+            scan["scan_id"] for scan in scan_options
+            if latest_start and scan["started_at"] == latest_start
+            and (not site or scan["site"] == site)
+        ]
+        if latest_scans:
+            scan_filter = " AND e.scan_id IN (" + ",".join("?" * len(latest_scans)) + ")"
+            scan_args = latest_scans
+        else:
+            scan_filter = " AND 0"
     else:
-        scan_filter = " AND 0"
+        if date_from:
+            scan_filter += " AND substr(e.ts, 1, 10) >= ?"
+            scan_args.append(date_from)
+        if date_to:
+            scan_filter += " AND substr(e.ts, 1, 10) <= ?"
+            scan_args.append(date_to)
     visibility = "" if is_admin(g.user) else " AND i.hidden = 0"
     counts = {
         key: c.execute(
@@ -1379,8 +1382,8 @@ def changes():
         display_rows.append(item)
     return render_template(
         "changes.html", rows=display_rows, t=t, counts=counts, site=site,
-        scan_options=scan_options, scan_mode=scan_mode, selected_scans=selected_scans,
-        date_from=date_from, date_to=date_to, page=page, pages=pages,
+        scan_mode=scan_mode, date_from=date_from, date_to=date_to,
+        page=page, pages=pages,
         total=total, per_page=per_page, tab="changes", **context,
     )
 
@@ -2526,17 +2529,16 @@ TEMPLATES = {
 <div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1) if page<pages else '#' }}">dalej →</a></div>{% endblock %}""",
 
     "changes.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}
-{% block head %}<nav class="tabs">{% for k,l in [('drops','Obniżki'),('rises','Podwyżki'),('back','Wróciły'),('gone','Zniknęły')] %}<a class="{{ 'on' if t==k }}" href="{{ url_with(t=k) }}">{{ l }} {{ counts[k] }}</a>{% endfor %}</nav>
+{% block head %}<nav class="tabs">{% for k,l in [('drops','Obniżki'),('rises','Podwyżki'),('back','Wróciły'),('gone','Zniknęły')] %}<a class="{{ 'on' if t==k }}" href="{{ url_with(t=k, scan=None, page=None) }}">{{ l }} {{ counts[k] }}</a>{% endfor %}</nav>
 <form class="f" method="get"><input type="hidden" name="t" value="{{ t }}">
-<label>Wybór skanów<select name="scan_mode" id="scan-mode"><option value="last" {{ 'selected' if scan_mode=='last' }}>Ostatni skan</option><option value="selected" {{ 'selected' if scan_mode=='selected' }}>Wybierz skany</option><option value="range" {{ 'selected' if scan_mode=='range' }}>Skan od–do</option></select></label>
+<label>Zakres skanów<select name="scan_mode" id="scan-mode"><option value="last" {{ 'selected' if scan_mode=='last' }}>Ostatni skan</option><option value="range" {{ 'selected' if scan_mode=='range' }}>Od–do</option></select></label>
 <label>Sklep<select name="site"><option value="">Wszystkie sklepy</option>{% for sh in shops %}<option value="{{ sh.site }}" {{ 'selected' if sh.site==site }}>{{ sh.site }}</option>{% endfor %}</select></label>
-<label id="scan-selection" style="{{ '' if scan_mode=='selected' else 'display:none' }}">Skany — możesz wybrać kilka<select name="scan" multiple size="5">{% for scan in scan_options %}<option value="{{ scan.scan_id }}" {{ 'selected' if scan.scan_id|string in selected_scans }}>{{ scan.site }} · {{ scan.started_at|dt('%d.%m.%Y %H:%M') }}{% if scan.status=='legacy' %} (historia dzienna){% elif scan.status=='failed' %} (niepełny){% endif %}</option>{% endfor %}</select></label>
 <label id="scan-from" style="{{ '' if scan_mode=='range' else 'display:none' }}">Od<input type="date" name="date_from" value="{{ date_from }}"></label><label id="scan-to" style="{{ '' if scan_mode=='range' else 'display:none' }}">Do<input type="date" name="date_to" value="{{ date_to }}"></label>
-<button style="grid-column:1/3">Filtruj zmiany</button></form><p class="note">Starsza historia sprzed dodania rejestru skanów jest grupowana według dnia.</p>
-<script>document.getElementById('scan-mode').addEventListener('change', event => { const selected=event.target.value==='selected'; const range=event.target.value==='range'; document.getElementById('scan-selection').style.display=selected?'flex':'none'; document.getElementById('scan-from').style.display=range?'flex':'none'; document.getElementById('scan-to').style.display=range?'flex':'none'; });</script>{% endblock %}
+<button>Filtruj zmiany</button></form><p class="note">{% if scan_mode=='last' %}Wyświetlane są zmiany z ostatniego skanu.{% else %}Wyświetlane są zmiany z wybranego zakresu dat.{% endif %}</p>
+<script>document.getElementById('scan-mode').addEventListener('change', event => { const range=event.target.value==='range'; document.getElementById('scan-from').style.display=range?'flex':'none'; document.getElementById('scan-to').style.display=range?'flex':'none'; });</script>{% endblock %}
 {% block body %}<div class="meta">{{ total }} zmian · strona {{ page }} / {{ pages }} ({{ rows|length }} na stronie)</div>
 {% for r in rows %}{{ card(r) }}{% else %}<div class="card">Brak zmian dla wybranych skanów.</div>{% endfor %}
-<div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1) if page<pages else '#' }}">dalej →</a></div>{% endblock %}""",
+<div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1, scan=None) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1, scan=None) if page<pages else '#' }}">dalej →</a></div>{% endblock %}""",
 
     "invites.html": """{% extends 'base.html' %}{% block body %}<h1>Zaproszenia</h1>
 {% if allowed %}<form method="post" class="f"><input type="hidden" name="csrf" value="{{ csrf }}">

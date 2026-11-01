@@ -34,6 +34,39 @@ class ListingParserTests(unittest.TestCase):
         self.assertEqual(products[0]["url"], "https://fajerwerki.shop.pl/produkt/test.html")
         self.assertEqual(products[0]["price"], 109.0)
 
+    def test_listing_detects_sale_price_and_explicit_sale_badges(self):
+        examples = (
+            ("""<article class="product"><a href="/sale">Produkt</a><span class="price">
+                <del><span class="woocommerce-Price-amount">199,00 zł</span></del>
+                <ins><span class="woocommerce-Price-amount">149,00 zł</span></ins></span></article>""",
+             ".woocommerce-Price-amount", 149.0),
+            ("""<article class="product"><a href="/sale">Produkt</a>
+                <span class="badge onsale">Promocja</span><span class="price">149,00 zł</span></article>""",
+             ".price", 149.0),
+        )
+
+        for html, price_selector, expected_price in examples:
+            with self.subTest(html=html):
+                cfg = {
+                    "item": "article.product", "name": "a", "link": "a@href",
+                    "price": price_selector,
+                }
+                count, products = scraper.parse_listing(html, "https://shop.example/", cfg)
+                self.assertEqual(count, 1)
+                self.assertEqual(products[0]["price"], expected_price)
+                self.assertEqual(products[0]["promo"], 1)
+
+    def test_listing_keeps_sale_status_unknown_without_a_promotion_marker(self):
+        count, products = scraper.parse_listing(
+            """<article class="product"><a href="/item">Produkt</a>
+               <span class="price">149,00 zł</span></article>""",
+            "https://shop.example/",
+            {"item": "article.product", "name": "a", "link": "a@href", "price": ".price"},
+        )
+
+        self.assertEqual(count, 1)
+        self.assertIsNone(products[0]["promo"])
+
 
 class AccessHandlingTests(unittest.TestCase):
     def test_direct_403_is_reported_as_failed_request(self):
@@ -49,17 +82,19 @@ class AccessHandlingTests(unittest.TestCase):
             patch.object(scraper, "session", session),
             patch.object(scraper, "proxy_for", return_value=None),
             patch.object(scraper, "report_proxy") as report_proxy,
-            patch.object(scraper, "_on_403_detected"),
             patch.object(scraper, "_proxies", []),
             patch.object(scraper, "_proxy_hosts", set()),
         ):
-            result = scraper.get(f"https://{host}/", retries=5)
+            stats = Counter()
+            result = scraper.get(f"https://{host}/", stats=stats, retries=5)
 
         self.assertIsNone(result)
         session.return_value.get.assert_called_once()
         report_proxy.assert_not_called()
+        self.assertEqual(stats["http_403"], 1)
+        self.assertEqual(stats["nieudane"], 1)
 
-    def test_reported_403_stores_are_eligible_for_browser_headers_and_proxy_fallback(self):
+    def test_reported_403_stores_do_not_enable_proxy_or_browser_ua_fallback(self):
         names = {
             "pironet", "funke-store", "pirozone", "sklepzpetardami", "biegun",
         }
@@ -67,15 +102,12 @@ class AccessHandlingTests(unittest.TestCase):
         for name in names:
             with self.subTest(shop=name):
                 site = scraper.SITES[name]
-                self.assertTrue(site.get("use_proxy"))
-                self.assertTrue(site.get("browser_ua"))
-                self.assertIn("User-Agent", scraper.site_headers(name, site))
+                self.assertFalse(site.get("use_proxy"))
+                self.assertFalse(site.get("browser_ua"))
+                self.assertNotIn("User-Agent", scraper.site_headers(name, site) or {})
 
         targets = {urlparse(url).netloc for url, _headers in scraper.free_proxy_targets(names)}
-        self.assertEqual(targets, {
-            "pironet.pl", "funke-store.com", "pirozone.pl",
-            "sklepzpetardami.pl", "fajerwerkibiegun.pl",
-        })
+        self.assertEqual(targets, set())
 
 
 class StoreApiTests(unittest.TestCase):
@@ -208,6 +240,20 @@ class StoreApiTests(unittest.TestCase):
         self.assertEqual(product["code_raw"], "4412")
         self.assertEqual(product["availability"], "out_of_stock")
 
+    def test_store_api_detects_sale_price_from_regular_price(self):
+        product = scraper.parse_store_api_product({
+            "name": "Promocyjny produkt",
+            "permalink": "https://piroart.pl/shop/promo/",
+            "prices": {
+                "price": "14900", "regular_price": "19900", "sale_price": "14900",
+                "currency_code": "PLN", "currency_minor_unit": 2,
+            },
+            "is_in_stock": True,
+        })
+
+        self.assertEqual(product["price"], 149.0)
+        self.assertEqual(product["promo"], 1)
+
     def test_driver_paginates_until_api_returns_partial_page(self):
         site = {
             "base": "https://example.test",
@@ -296,6 +342,10 @@ class ScanHistoryTests(unittest.TestCase):
                 try:
                     columns = {row[1] for row in connection.execute("PRAGMA table_info(prices)")}
                     self.assertIn("scan_id", columns)
+                    product_columns = {
+                        row[1] for row in connection.execute("PRAGMA table_info(products)")
+                    }
+                    self.assertIn("promo", product_columns)
                     cursor = connection.execute(
                         "INSERT INTO scrape_runs(site,started_at,status) VALUES('shop','2026-10-31','running')"
                     )
@@ -303,7 +353,7 @@ class ScanHistoryTests(unittest.TestCase):
                     scraper._active_scan_ids["shop"] = scan_id
                     scraper.save(connection, "shop", "https://shop.example/item", {
                         "name": "Produkt test", "price": 12.5, "availability": "in_stock",
-                        "currency": "PLN",
+                        "currency": "PLN", "promo": 1,
                     })
                     connection.commit()
                     self.assertEqual(
@@ -312,6 +362,10 @@ class ScanHistoryTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         connection.execute("SELECT products_checked FROM scrape_runs").fetchone()[0],
+                        1,
+                    )
+                    self.assertEqual(
+                        connection.execute("SELECT promo FROM products").fetchone()[0],
                         1,
                     )
                 finally:

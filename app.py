@@ -1346,14 +1346,22 @@ def changes():
         ).fetchone()[0]
         for key, (condition, _) in conds.items()
     }
+    per_page = 50
+    total = counts[t]
+    pages = max((total + per_page - 1) // per_page, 1)
+    try:
+        page = max(int(request.args.get("page", "1")), 1)
+    except ValueError:
+        page = 1
+    page = min(page, pages)
     rows = c.execute(
         "SELECT i.*, e.ts AS event_ts, e.price AS event_price, "
         "e.availability AS event_availability, e.prev_price AS event_prev_price, "
         "e.prev_availability AS event_prev_availability "
         "FROM change_events e JOIN items i ON i.url = e.url "
         f"WHERE {conds[t][0]}{scan_filter}{site_filter}{visibility} "
-        f"ORDER BY {conds[t][1]} LIMIT 200",
-        scan_args + site_args,
+        f"ORDER BY {conds[t][1]}, e.url, e.ts DESC LIMIT ? OFFSET ?",
+        scan_args + site_args + [per_page, (page - 1) * per_page],
     ).fetchall()
     display_rows = []
     for row in rows:
@@ -1372,7 +1380,8 @@ def changes():
     return render_template(
         "changes.html", rows=display_rows, t=t, counts=counts, site=site,
         scan_options=scan_options, scan_mode=scan_mode, selected_scans=selected_scans,
-        date_from=date_from, date_to=date_to, tab="changes", **context,
+        date_from=date_from, date_to=date_to, page=page, pages=pages,
+        total=total, per_page=per_page, tab="changes", **context,
     )
 
 
@@ -2525,7 +2534,9 @@ TEMPLATES = {
 <label id="scan-from" style="{{ '' if scan_mode=='range' else 'display:none' }}">Od<input type="date" name="date_from" value="{{ date_from }}"></label><label id="scan-to" style="{{ '' if scan_mode=='range' else 'display:none' }}">Do<input type="date" name="date_to" value="{{ date_to }}"></label>
 <button style="grid-column:1/3">Filtruj zmiany</button></form><p class="note">Starsza historia sprzed dodania rejestru skanów jest grupowana według dnia.</p>
 <script>document.getElementById('scan-mode').addEventListener('change', event => { const selected=event.target.value==='selected'; const range=event.target.value==='range'; document.getElementById('scan-selection').style.display=selected?'flex':'none'; document.getElementById('scan-from').style.display=range?'flex':'none'; document.getElementById('scan-to').style.display=range?'flex':'none'; });</script>{% endblock %}
-{% block body %}{% for r in rows %}{{ card(r) }}{% else %}<div class="card">Brak zmian dla wybranych skanów.</div>{% endfor %}{% endblock %}""",
+{% block body %}<div class="meta">{{ total }} zmian · strona {{ page }} / {{ pages }} ({{ rows|length }} na stronie)</div>
+{% for r in rows %}{{ card(r) }}{% else %}<div class="card">Brak zmian dla wybranych skanów.</div>{% endfor %}
+<div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1) if page<pages else '#' }}">dalej →</a></div>{% endblock %}""",
 
     "invites.html": """{% extends 'base.html' %}{% block body %}<h1>Zaproszenia</h1>
 {% if allowed %}<form method="post" class="f"><input type="hidden" name="csrf" value="{{ csrf }}">

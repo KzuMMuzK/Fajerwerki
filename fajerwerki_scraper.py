@@ -38,6 +38,7 @@ Uwagi o proxy:
 import argparse
 import contextlib
 import csv
+import copy
 import gzip
 import html as htmllib
 import itertools
@@ -1529,6 +1530,8 @@ def meta(soup, *names):
 def from_selectors(soup, sel):
     def txt(key):
         if key in sel:
+            if key == "price":
+                return _pick_price(soup, sel[key])
             el = soup.select_one(sel[key])
             if el:
                 return el.get("content") or el.get_text(" ", strip=True)
@@ -1802,6 +1805,53 @@ def _pick(el, spec):
     return None
 
 
+_OLD_PRICE_SELECTOR = (
+    "del, s, strike, [class*='old-price'], [class*='price-old'], "
+    "[class*='was-price'], [class*='price-was'], [class*='old_price'], "
+    "[class*='price_old'], [class*='was_price'], [class*='price_was']"
+)
+
+
+def _is_old_price(node):
+    if node.name in ("del", "s", "strike"):
+        return True
+    classes = node.get("class", [])
+    if isinstance(classes, str):
+        classes = classes.split()
+    markers = ("old-price", "price-old", "was-price", "price-was",
+               "old_price", "price_old", "was_price", "price_was")
+    return any(any(marker in token.lower() for marker in markers) for token in classes)
+
+
+def _pick_price(el, spec):
+    if not spec:
+        return None
+    for one in ([spec] if isinstance(spec, str) else spec):
+        if not isinstance(one, str):
+            continue
+        css, attr = one, None
+        match = re.match(r"^(.*)@([\w-]+)$", one)
+        if match:
+            css, attr = match.group(1), match.group(2)
+        for node in el.select(css) if css else [el]:
+            ancestor = node
+            while ancestor is not None and ancestor is not el:
+                if _is_old_price(ancestor):
+                    break
+                ancestor = ancestor.parent
+            else:
+                if attr:
+                    value = node.get(attr)
+                else:
+                    clean = copy.deepcopy(node)
+                    for old_price in clean.select(_OLD_PRICE_SELECTOR):
+                        old_price.decompose()
+                    value = clean.get_text(" ", strip=True)
+                if value:
+                    return value
+    return None
+
+
 def has(tile, css):
     return tile.select_one(css) is not None or sv.match(css, tile)
 
@@ -1820,7 +1870,7 @@ def parse_listing(html, page_url, cfg):
         href = _pick(tile, cfg["link"]) or _pick(tile, cfg.get("link_fallback"))
         if not name or not href:
             continue
-        raw_price = _pick(tile, cfg.get("price"))
+        raw_price = _pick_price(tile, cfg.get("price"))
         if raw_price:
             for pat in cfg.get("price_strip", []):
                 raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)

@@ -434,7 +434,8 @@ SITES = {
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
             "name": "h3.product-title a", "link": "h3.product-title a@href",
-            "price": "span.product-price", "in_stock": "button.add-to-cart",
+            "price": ["span.product-price@content", "span.product-price"],
+            "in_stock": "button.add-to-cart",
             "categories": [
                 "https://fajerwerkibiegun.pl/pl/3-wyrzutnie",
                 "https://fajerwerkibiegun.pl/pl/27-wyrzutnie-do-200-pln",
@@ -1876,9 +1877,6 @@ def parse_listing(html, page_url, cfg):
             for pat in cfg.get("price_strip", []):
                 raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
         price = parse_price(raw_price)
-        inserted_price = parse_price(_pick(tile, "ins"))
-        if inserted_price is not None and price is None:
-            price = inserted_price
         raw_text = tile.get_text(" ", strip=True)
         text = raw_text.lower()
         out = False

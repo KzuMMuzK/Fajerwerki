@@ -1179,7 +1179,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     url_scheme = urlparse(url).scheme
     last_err = "?"
     if _proxies and (PROXY_ALL or host in _proxy_hosts):
-        retries = max(retries, min(8, _live_count() + 1))
+        retries = max(retries, _live_count() + 1)
     gate = _gate(host)
     proxy_fails = 0
     for attempt in range(retries):
@@ -1246,6 +1246,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                         _host_sem[host] = threading.Semaphore(4)
                     continue
                 log.debug("HTTP 403 (bez proxy, brak proxy do przełączenia): %s", url)
+                bump("nieudane")
                 return None
             if code in (404, 410):
                 bump(f"http_{code}")
@@ -1876,7 +1877,7 @@ def parse_listing(html, page_url, cfg):
                 raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
         price = parse_price(raw_price)
         inserted_price = parse_price(_pick(tile, "ins"))
-        if inserted_price is not None and (price is None or inserted_price < price):
+        if inserted_price is not None and price is None:
             price = inserted_price
         raw_text = tile.get_text(" ", strip=True)
         text = raw_text.lower()

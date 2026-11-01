@@ -846,7 +846,7 @@ PROXIFLY_SOCKS5_TXT = (
 # Kraje preferowane (blisko Polski = niższe opóźnienia)
 PROXIFLY_QUALITY_COUNTRIES = {"PL", "DE", "CZ", "SK", "NL", "FR", "GB"}
 # Ile maksymalnie dodać w jednym przebiegu (żeby nie zapchać rotacji)
-PROXIFLY_MAX_QUALITY = 300
+PROXIFLY_MAX_QUALITY = 200
 _fallback_lock = threading.Lock()
 _last_fallback_fetch = 0.0
 FALLBACK_INTERVAL = 180

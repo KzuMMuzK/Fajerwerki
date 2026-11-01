@@ -1,4 +1,6 @@
 flask>=3.0,<4
 gunicorn>=22.0
+Pillow>=10.0
+pytesseract>=0.3.13
 requests>=2.31
 tzdata

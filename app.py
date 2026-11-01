@@ -1,6 +1,6 @@
 """
 Prywatna strona z cenami fajerwerków (Flask, Render): wejście tylko na zaproszenie, logowanie przez Discorda,
-panel administratora (użytkownicy, zaproszenia, ręczna edycja produktów i cen, kolejność).
+panel administratora (użytkownicy, zaproszenia, kupony, ręczna edycja produktów i cen, kolejność).
 
 Dane o cenach: plik fajerwerki.db z prywatnego repo z danymi (GitHub API). Dane aplikacji (użytkownicy, zaproszenia,
 ręczne zmiany): plik JSON na osobnej gałęzi tego samego repo (domyślnie app-data) - Render na darmowym planie nie
@@ -34,9 +34,11 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import quote, urlencode, urlparse
 
+from PIL import Image, ImageOps, UnidentifiedImageError
+import pytesseract
 import requests
-from flask import (Flask, Response, abort, flash, g, get_flashed_messages, redirect, render_template, request,
-                   session, url_for)
+from flask import (Flask, Response, abort, flash, g, get_flashed_messages, jsonify, redirect, render_template,
+                   request, session, url_for)
 from jinja2 import DictLoader
 
 try:
@@ -70,7 +72,7 @@ app.secret_key = SECRET_KEY or None
 app.config.update(
     SESSION_COOKIE_NAME="fj_session", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=BASE_URL.startswith("https://") and not _env("INSECURE_COOKIES"),
-    PERMANENT_SESSION_LIFETIME=timedelta(days=30), MAX_CONTENT_LENGTH=64 * 1024,
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30), MAX_CONTENT_LENGTH=6 * 1024 * 1024,
 )
 
 
@@ -111,7 +113,7 @@ class Denied(Exception):
     """Odmowa z komunikatem dla użytkownika (np. zaproszenie wygasło)."""
 
 
-DEFAULT_STATE = {"users": {}, "invites": {}, "overrides": {}, "audit": [],
+DEFAULT_STATE = {"users": {}, "invites": {}, "overrides": {}, "coupons": {}, "audit": [],
                  "settings": {"member_invites": True, "default_quota": 3, "invite_days": 7}}
 
 
@@ -243,6 +245,56 @@ store = Store()
 def audit(data, who, action, target=""):
     data["audit"].append({"ts": now_iso(), "who": who, "action": action, "target": target[:120]})
     del data["audit"][:-500]
+
+
+def _coupon_image(upload):
+    if not upload or not upload.filename:
+        return None
+    raw = upload.stream.read(5 * 1024 * 1024 + 1)
+    if len(raw) > 5 * 1024 * 1024:
+        raise ValueError("Zdjęcie może mieć maksymalnie 5 MB.")
+    try:
+        image = Image.open(io.BytesIO(raw))
+        if image.format not in ("JPEG", "PNG", "WEBP"):
+            raise ValueError("Dozwolone są zdjęcia JPG, PNG i WebP.")
+        if image.width * image.height > 30_000_000:
+            raise ValueError("Zdjęcie ma zbyt dużą rozdzielczość.")
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        image.thumbnail((1600, 1600))
+        out = io.BytesIO()
+        for quality in (85, 75, 65, 55):
+            out.seek(0)
+            out.truncate()
+            image.save(out, format="JPEG", quality=quality, optimize=True)
+            if out.tell() <= 1_500_000:
+                return out.getvalue()
+        raise ValueError("Nie udało się zmniejszyć zdjęcia do bezpiecznego rozmiaru.")
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as e:
+        raise ValueError("Nie udało się odczytać zdjęcia. Wybierz poprawny plik JPG, PNG lub WebP.") from e
+
+
+def _coupon_code_candidates(text):
+    candidates = []
+    seen = set()
+    for match in re.finditer(r"(?<![A-Z0-9])([A-Z0-9][A-Z0-9_-]{3,19})(?![A-Z0-9])", text.upper()):
+        code = match.group(1).strip("-_")
+        if (len(code) >= 4 and (any(char.isdigit() for char in code) or len(code) >= 6)
+                and code not in seen):
+            seen.add(code)
+            candidates.append(code)
+    return candidates[:20]
+
+
+def _coupon_rows(data, active_only=False):
+    today = datetime.now(timezone.utc).date().isoformat()
+    rows = []
+    for coupon_id, coupon in data["coupons"].items():
+        expired = bool(coupon.get("valid_until") and coupon["valid_until"] < today)
+        if active_only and (not coupon.get("active", True) or expired):
+            continue
+        rows.append({**coupon, "id": coupon_id, "expired": expired})
+    return sorted(rows, key=lambda row: (row["expired"], row.get("valid_until") or "9999-12-31",
+                                         row.get("created", "")), reverse=False)
 
 
 def is_admin(u):
@@ -458,6 +510,8 @@ def _deduplicate_product_rows(rows):
         historical_maxes = [value for value in (previous[1][14], row[14]) if value is not None]
         merged[13] = min(historical_mins) if historical_mins else None
         merged[14] = max(historical_maxes) if historical_maxes else None
+        if len(merged) > 16:
+            merged[16] = 1 if previous[1][16] or row[16] else None
         unique[identity] = (max(rank, previous[0]), tuple(merged))
     return [entry[1] for entry in unique.values()]
 
@@ -467,6 +521,7 @@ def _build_derived(src, dst):
     con = sqlite3.connect(src)
     cols = {r[1] for r in con.execute("PRAGMA table_info(products)")}
     code_sel = "p.code, p.code_key" if "code_key" in cols else "NULL, NULL"
+    promo_sel = "p.promo" if "promo" in cols else "NULL"
     rows = con.execute(f"""
         SELECT p.url, p.site, p.name, {code_sel}, p.first_seen, p.last_seen,
                cur.price, cur.availability, cur.ts, cur.currency,
@@ -475,7 +530,7 @@ def _build_derived(src, dst):
                (SELECT availability FROM prices WHERE url = p.url AND id < cur.id ORDER BY id DESC LIMIT 1),
                (SELECT MIN(price) FROM prices WHERE url = p.url AND price IS NOT NULL),
                (SELECT MAX(price) FROM prices WHERE url = p.url AND price IS NOT NULL),
-               (SELECT COUNT(*) FROM prices WHERE url = p.url)
+               (SELECT COUNT(*) FROM prices WHERE url = p.url), {promo_sel}
         FROM products p JOIN prices cur ON cur.id = (SELECT MAX(id) FROM prices WHERE url = p.url)
     """).fetchall()
     con.close()
@@ -489,7 +544,7 @@ def _build_derived(src, dst):
             prev_price REAL, prev_avail TEXT, min_price REAL, max_price REAL, n_changes INTEGER,
             drop_pct REAL, key_shops INTEGER, key_min REAL,
             o_name TEXT, o_price REAL, o_avail TEXT, o_code TEXT, o_key TEXT, o_prev REAL, o_drop REAL,
-            hidden INTEGER DEFAULT 0, rank INTEGER, note TEXT, edited INTEGER DEFAULT 0);
+            hidden INTEGER DEFAULT 0, rank INTEGER, note TEXT, edited INTEGER DEFAULT 0, promo INTEGER);
         CREATE INDEX ix_site ON items(site); CREATE INDEX ix_key ON items(code_key);
         CREATE INDEX ix_changed ON items(changed_at);
         CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
@@ -508,11 +563,12 @@ def _build_derived(src, dst):
         );
     """)
     batch = []
-    for (url, site, name, code, key, first, last, price, av, ts, cur, prev, prev_av, mn, mx, n) in rows:
+    for (url, site, name, code, key, first, last, price, av, ts, cur, prev, prev_av, mn, mx, n,
+         promo) in rows:
         pct = (prev - price) * 100.0 / prev if (prev and price is not None and prev > 0) else None
         batch.append((url, site, name, fold(name), code, key, first, last, price, av, ts, cur or "PLN", prev, prev_av,
-                      mn, mx, n, pct, None, None, name, price, av, code, key, prev, pct, 0, None, None, 0))
-    out.executemany("INSERT INTO items VALUES(" + ",".join("?" * 31) + ")", batch)
+                      mn, mx, n, pct, None, None, name, price, av, code, key, prev, pct, 0, None, None, 0, promo))
+    out.executemany("INSERT INTO items VALUES(" + ",".join("?" * 32) + ")", batch)
     out.execute("ATTACH DATABASE ? AS source_db", (src,))
     source_tables = {row[0] for row in out.execute(
         "SELECT name FROM source_db.sqlite_master WHERE type = 'table'"
@@ -1320,6 +1376,20 @@ def changes():
     )
 
 
+@app.route("/coupons")
+def coupons():
+    rows = store.read(lambda data: _coupon_rows(data, active_only=True))
+    return render_template("coupons.html", rows=rows, tab="coupons", **_basic())
+
+
+@app.route("/coupon-image/<coupon_id>")
+def coupon_image(coupon_id):
+    image = store.read(lambda data: data["coupons"].get(coupon_id, {}).get("image"))
+    if not image:
+        abort(404)
+    return Response(base64.b64decode(image, validate=True), mimetype="image/jpeg")
+
+
 # ----------------------------------------------------------------------------- zaproszenia (członkowie)
 def _invite_rows(data, who=None):
     rows = []
@@ -1422,6 +1492,92 @@ def admin_invites():
             flash(str(e) or "Niepoprawne dane.", "err")
         return redirect(url_for("admin_invites"))
     return render_template("admin_invites.html", rows=store.read(_invite_rows), tab="admin", sub="invites", **_basic())
+
+
+@app.route("/admin/coupons", methods=["GET", "POST"])
+@admin_required
+def admin_coupons():
+    if request.method == "POST":
+        try:
+            shop = request.form.get("shop", "").strip()
+            code = request.form.get("code", "").strip().upper()
+            discount = request.form.get("discount", "").strip()
+            terms = request.form.get("terms", "").strip()
+            valid_until = request.form.get("valid_until", "").strip()
+            source = request.form.get("source", "").strip()
+            image = _coupon_image(request.files.get("image"))
+            if not shop or not discount:
+                raise ValueError("Podaj sklep i opis rabatu.")
+            if len(shop) > 80 or len(discount) > 120 or len(terms) > 500:
+                raise ValueError("Przekroczono limit długości opisu, sklepu lub warunków.")
+            if not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{1,39}", code):
+                raise ValueError("Kod musi mieć 2-40 znaków: litery, cyfry, kropka, _ lub -.")
+            if valid_until:
+                try:
+                    valid_until = datetime.strptime(valid_until, "%Y-%m-%d").date().isoformat()
+                except ValueError as e:
+                    raise ValueError("Podaj poprawną datę ważności.") from e
+            if source:
+                parsed = urlparse(source)
+                if parsed.scheme not in ("http", "https") or not parsed.netloc or len(source) > 500:
+                    raise ValueError("Źródło musi być poprawnym adresem HTTP lub HTTPS (maks. 500 znaków).")
+            if not image and not source:
+                raise ValueError("Dodaj zdjęcie albo link do źródła kodu.")
+
+            coupon_id = secrets.token_urlsafe(12)
+            coupon = {
+                "shop": shop, "code": code, "discount": discount, "terms": terms,
+                "valid_until": valid_until, "source": source,
+                "excludes_promos": request.form.get("excludes_promos") == "1",
+                "image": base64.b64encode(image).decode()
+                if image else "", "created": now_iso(), "added_by": g.user["id"], "active": True,
+            }
+
+            def save(data):
+                data["coupons"][coupon_id] = coupon
+                audit(data, g.user["id"], "coupon_add", f"{shop}: {code}")
+
+            store.update(save, "app-state: kupon")
+            flash("Kupon dodany.", "ok")
+        except ValueError as e:
+            flash(str(e), "err")
+        return redirect(url_for("admin_coupons"))
+    rows = store.read(lambda data: _coupon_rows(data))
+    return render_template("admin_coupons.html", rows=rows, tab="admin", sub="coupons", **_basic())
+
+
+@app.route("/admin/coupons/ocr", methods=["POST"])
+@admin_required
+def admin_coupon_ocr():
+    try:
+        image = _coupon_image(request.files.get("image"))
+        if not image:
+            return jsonify(error="Wybierz zdjęcie do odczytu."), 400
+        text = pytesseract.image_to_string(Image.open(io.BytesIO(image)), lang="pol+eng",
+                                           config="--psm 11")
+        return jsonify(text=text[:4000], codes=_coupon_code_candidates(text))
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as e:
+        app.logger.error("OCR kuponu niedostępny: %s", e.__class__.__name__)
+        return jsonify(error="Odczyt OCR jest chwilowo niedostępny. Możesz wpisać kod ręcznie."), 503
+
+
+@app.route("/admin/coupons/<coupon_id>/deactivate", methods=["POST"])
+@admin_required
+def admin_coupon_deactivate(coupon_id):
+    def deactivate(data):
+        coupon = data["coupons"].get(coupon_id)
+        if not coupon:
+            return False
+        coupon["active"] = False
+        audit(data, g.user["id"], "coupon_deactivate", f'{coupon["shop"]}: {coupon["code"]}')
+        return True
+
+    if not store.update(deactivate, "app-state: wycofanie kuponu"):
+        abort(404)
+    flash("Kupon wycofany.", "ok")
+    return redirect(url_for("admin_coupons"))
 
 
 @app.route("/admin/settings", methods=["GET", "POST"])
@@ -1602,7 +1758,7 @@ TEMPLATES = {
 {% if user %}<div class="userbar"><span class="who"><img class="av" src="{{ user.avatar }}" alt="" width="24" height="24"><span class="un">{{ user.name }}</span></span>
 <a href="{{ url_for('invites') }}">Zaproszenia</a>{% if is_admin %}<a href="{{ url_for('admin_home') }}">Admin</a>{% endif %}
 <form method="post" action="{{ url_for('logout') }}" class="inl"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="lnk">Wyloguj</button></form></div>{% endif %}
-<header>{% if user %}<nav class="tabs"><a href="{{ url_for('index') }}" class="{{ 'on' if tab=='list' }}">Produkty</a><a href="{{ url_for('deals') }}" class="{{ 'on' if tab=='deals' }}">Okazje</a><a href="{{ url_for('basket') }}" class="{{ 'on' if tab=='basket' }}">Koszyk</a><a href="{{ url_for('changes') }}" class="{{ 'on' if tab=='changes' }}">Zmiany</a></nav>{% endif %}{% block head %}{% endblock %}</header>
+<header>{% if user %}<nav class="tabs"><a href="{{ url_for('index') }}" class="{{ 'on' if tab=='list' }}">Produkty</a><a href="{{ url_for('deals') }}" class="{{ 'on' if tab=='deals' }}">Okazje</a><a href="{{ url_for('basket') }}" class="{{ 'on' if tab=='basket' }}">Koszyk</a><a href="{{ url_for('coupons') }}" class="{{ 'on' if tab=='coupons' }}">Kody rabatowe</a><a href="{{ url_for('changes') }}" class="{{ 'on' if tab=='changes' }}">Zmiany</a></nav>{% endif %}{% block head %}{% endblock %}</header>
 {% for cat, msg in messages %}<div class="{{ 'err' if cat == 'err' else 'okm' }}">{{ msg }}</div>{% endfor %}
 {% if refresh_error %}<div class="err">Nie udało się odświeżyć danych ({{ refresh_error }}). Pokazuję poprzednią wersję.</div>{% endif %}
 {% block body %}{% endblock %}
@@ -2195,7 +2351,7 @@ TEMPLATES = {
 </script>
 </body></html>""",
 
-    "card.html": """{% macro card(it) %}<div class="card{{ ' dim' if it.hidden }}"><div class="top"><span class="shop">{{ it.site }}</span>{% if it.code %}<span class="code">{{ it.code }}</span>{% endif %}
+    "card.html": """{% macro card(it) %}<div class="card{{ ' dim' if it.hidden }}"><div class="top"><span class="shop">{{ it.site }}</span>{% if it.code %}<span class="code">{{ it.code }}</span>{% endif %}{% if it.promo %}<span class="badge r">promocja wykryta</span>{% endif %}
 {% if it.rank is not none %}<span class="code">przypięty</span>{% endif %}{% if it.hidden %}<span class="code">ukryty</span>{% endif %}{% if it.note %}<span class="best">{{ it.note }}</span>{% endif %}
 {% if is_admin and it.edited %}<span class="code">edytowany</span>{% endif %}<span class="dot {{ 'ok' if it.avail=='in_stock' }}" title="{{ 'dostępny' if it.avail=='in_stock' else 'niedostępny' }}"></span></div>
 <a class="name" href="{{ url_for('product', u=it.url) }}">{{ it.name }}</a><div class="row"><span class="price">{{ it.price|pln }}</span>
@@ -2281,6 +2437,7 @@ TEMPLATES = {
 {{ chart|safe }}{% if not chart %}<p class="note">Brak historii cen.</p>{% endif %}<p><a class="btn" href="{{ it.url }}" target="_blank" rel="noopener noreferrer">Otwórz w sklepie</a>
 {% if is_admin %} <a class="btn sec" href="{{ url_for('admin_product', u=it.url) }}">Edytuj</a>{% endif %}</p>
 {% if is_admin and it.edited %}<div class="note">Ten produkt ma ręczne zmiany (cena ze scrapera: {{ it.o_price|pln }}).</div>{% endif %}
+{% if it.promo %}<p class="note">Scraper wykrył oznaczenie promocji. Kod rabatowy może nie obejmować tego produktu — sprawdź warunki sklepu.</p>{% endif %}
 {% if others %}<h2>Ten sam kod w innych sklepach</h2>{% for o in others %}{{ card(o) }}{% endfor %}{% endif %}
 <h2>Historia zmian</h2><table><tr><th>kiedy</th><th>cena</th><th>stan</th></tr>{% for ts,p,av in hist %}<tr><td>{{ ts|dt('%d.%m.%Y %H:%M') }}</td><td>{{ p|pln }}</td><td>{{ 'dostępny' if av=='in_stock' else 'brak' }}</td></tr>{% endfor %}</table>{% endblock %}""",
 
@@ -2333,13 +2490,19 @@ TEMPLATES = {
   form.addEventListener('change', () => { clearTimeout(timer); updateBasket(); });
 })();
 </script>{% endblock %}""",
+    "coupons.html": """{% extends 'base.html' %}{% block body %}<h1>Kody rabatowe</h1><p class="note">Sprawdź warunki i ważność kodu przed zakupem. Sklepy mogą wykluczać produkty w promocji; scraper wykrywa tylko część takich oznaczeń, więc brak etykiety nie potwierdza, że kod zadziała.</p>
+{% for c in rows %}<div class="card"><div class="top"><span class="shop">{{ c.shop }}</span><span class="code">{{ c.code }}</span><span class="best">{{ c.discount }}</span></div>
+{% if c.image %}<img src="{{ url_for('coupon_image', coupon_id=c.id) }}" alt="Zdjęcie źródła kodu {{ c.code }}" loading="lazy" style="display:block;max-width:100%;max-height:360px;object-fit:contain;margin:10px 0">{% endif %}
+{% if c.terms %}<p>{{ c.terms }}</p>{% endif %}{% if c.excludes_promos %}<p class="note">Nie łączy się z innymi promocjami.</p>{% endif %}<div class="note">{% if c.valid_until %}ważny do {{ c.valid_until|dt('%d.%m.%Y') }}{% else %}brak podanej daty końca{% endif %}{% if c.source %} · <a href="{{ c.source }}" target="_blank" rel="noopener noreferrer" style="text-decoration:underline">źródło</a>{% endif %}</div></div>
+{% else %}<div class="card">Nie ma teraz aktywnych kodów rabatowych.</div>{% endfor %}{% endblock %}""",
+
     "basket_results.html": """<div id="basket-results">{% if plan %}<h2>Porównanie sum</h2><div class="stats"><div class="stat"><span class="note">Najtańszy miks sklepów</span><b>{{ plan.mix_total|pln }}</b><span class="note">{% if plan.mix_missing %}brak {{ plan.mix_missing }} pozycji{% else %}wszystkie pozycje{% endif %}</span></div>
 <div class="stat"><span class="note">Najtaniej w jednym sklepie</span><b>{{ plan.best_store.total|pln if plan.best_store else 'brak pełnej oferty' }}</b><span class="note">{{ plan.best_store.site if plan.best_store else 'żaden sklep nie ma wszystkich pozycji' }}{% if plan.best_store and plan.best_store.missing %} · brak {{ plan.best_store.missing }}{% endif %}</span></div></div>
 <p class="note">Tryb: {{ 'historyczne minimum' if plan.price_mode=='historical' else 'aktualne ceny' }}{% if plan.include_unavailable %}; uwzględniono także niedostępne{% else %}; tylko dostępne{% endif %}. Historyczna cena nie oznacza, że produkt można teraz kupić.</p>
 {% if selected_site %}<div class="card"><b>{{ selected_site }}:</b> {% if plan.selected_total and not plan.selected_total.missing %}{{ plan.selected_total.total|pln }}{% elif plan.selected_total %}brakuje {{ plan.selected_total.missing }} pozycji{% else %}brak danych{% endif %}</div>{% endif %}
 {% for line in plan.lines %}<div class="card"><div class="top"><span class="code">{{ line.query }}</span>{% if line.cheapest %}<span class="best">{{ line.cheapest.site }} · {{ line.cheapest.basket_price|pln }}</span>{% endif %}</div>
 {% if line.name %}<div>{{ line.name }}</div>{% endif %}{% if line.error %}<div class="err">{{ line.error }}</div>{% elif line.warning %}<div class="note">{{ line.warning }}</div>{% endif %}
-{% if line.cheapest %}<div class="note">{% if line.cheapest.historical_price %}najniższa cena historyczna{% elif line.cheapest.avail=='in_stock' %}dostępny{% else %}obecnie niedostępny{% endif %}</div><a class="btn sm" href="{{ line.cheapest.url }}" target="_blank" rel="noopener noreferrer">Otwórz ofertę</a>{% elif line.name %}<div class="note">Brak oferty pasującej do wybranych przełączników.</div>{% endif %}</div>{% endfor %}
+{% if line.cheapest %}<div class="note">{% if line.cheapest.historical_price %}najniższa cena historyczna{% elif line.cheapest.avail=='in_stock' %}dostępny{% else %}obecnie niedostępny{% endif %}{% if line.cheapest.promo %} · wykryto promocję — kupon może nie obowiązywać{% endif %}</div><a class="btn sm" href="{{ line.cheapest.url }}" target="_blank" rel="noopener noreferrer">Otwórz ofertę</a>{% elif line.name %}<div class="note">Brak oferty pasującej do wybranych przełączników.</div>{% endif %}</div>{% endfor %}
 <details><summary>Porównaj sumy we wszystkich sklepach</summary>{% for total in plan.shop_totals %}<div class="row"><span>{{ total.site }}</span><span>{% if total.missing %}brakuje {{ total.missing }} pozycji · suma częściowa {{ total.total|pln }}{% else %}{{ total.total|pln }}{% endif %}</span></div>{% endfor %}</details>{% endif %}</div>""",
 
     "deals.html": """{% extends 'base.html' %}
@@ -2376,7 +2539,7 @@ TEMPLATES = {
 {% if r.state=='ok' %}<form method="post" action="{{ url_for('invite_revoke') }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="code" value="{{ r.code }}"><button class="sec sm">Wycofaj</button></form>{% endif %}</div>
 {% else %}<div class="card">Nie masz jeszcze zaproszeń.</div>{% endfor %}{% endblock %}""",
 
-    "admin_base.html": """{% extends 'base.html' %}{% block head %}<nav class="tabs sub">{% for k,l,u in [('home','Przegląd','admin_home'),('users','Użytkownicy','admin_users'),('invites','Zaproszenia','admin_invites'),('settings','Ustawienia','admin_settings'),('audit','Dziennik','admin_audit')] %}<a class="{{ 'on' if sub==k }}" href="{{ url_for(u) }}">{{ l }}</a>{% endfor %}</nav>{% endblock %}""",
+    "admin_base.html": """{% extends 'base.html' %}{% block head %}<nav class="tabs sub">{% for k,l,u in [('home','Przegląd','admin_home'),('users','Użytkownicy','admin_users'),('invites','Zaproszenia','admin_invites'),('coupons','Kody rabatowe','admin_coupons'),('settings','Ustawienia','admin_settings'),('audit','Dziennik','admin_audit')] %}<a class="{{ 'on' if sub==k }}" href="{{ url_for(u) }}">{{ l }}</a>{% endfor %}</nav>{% endblock %}""",
 
     "admin_home.html": """{% extends 'admin_base.html' %}{% block body %}<h1>Panel administratora</h1>
 <div class="stats"><div class="stat"><span class="note">użytkownicy</span><b>{{ stats.users }}</b></div><div class="stat"><span class="note">administratorzy</span><b>{{ stats.admins }}</b></div><div class="stat"><span class="note">zablokowani</span><b>{{ stats.banned }}</b></div><div class="stat"><span class="note">aktywne zaproszenia</span><b>{{ stats.invites }}</b></div><div class="stat"><span class="note">ręcznie zmienione produkty</span><b>{{ stats.overrides }}</b></div></div>
@@ -2406,6 +2569,61 @@ TEMPLATES = {
 {% if r.users %}<div class="note">dołączyli: {{ r.users|join(', ') }}</div>{% endif %}
 {% if r.state=='ok' %}<form method="post" action="{{ url_for('invite_revoke') }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="code" value="{{ r.code }}"><input type="hidden" name="back" value="/admin/invites"><button class="sec sm">Wycofaj</button></form>{% endif %}</div>
 {% else %}<div class="card">Brak zaproszeń.</div>{% endfor %}{% endblock %}""",
+
+    "admin_coupons.html": """{% extends 'admin_base.html' %}{% block body %}<h1>Kody rabatowe</h1><p class="note">Dodaj kod ze zdjęcia lub linku. OCR tylko podpowiada tekst — sprawdź kod i warunki przed publikacją.</p>
+<form method="post" enctype="multipart/form-data" class="f"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Sklep<input name="shop" maxlength="80" required></label><label>Kod rabatowy<input name="code" maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,39}" required></label>
+<label style="grid-column:1/3">Rabat / promocja<input name="discount" maxlength="120" placeholder="np. 10% na całe zamówienie" required></label>
+<label style="grid-column:1/3">Warunki<input name="terms" maxlength="500" placeholder="np. od 200 zł, tylko produkty nieprzecenione"></label>
+<label class="chk" style="grid-column:1/3"><input type="checkbox" name="excludes_promos" value="1"> nie łączy się z innymi promocjami</label>
+<label>Ważny do<input type="date" name="valid_until"></label><label>Link do źródła<input type="url" name="source" maxlength="500" placeholder="https://..."></label>
+<label style="grid-column:1/3">Zdjęcie kodu (JPG, PNG, WebP; maks. 5 MB)<input type="file" name="image" accept="image/jpeg,image/png,image/webp"></label>
+<div style="grid-column:1/3"><button class="sec" type="button" data-coupon-ocr>Odczytaj tekst ze zdjęcia</button><span class="note" data-coupon-ocr-status aria-live="polite"></span><div data-coupon-code-suggestions class="qa"></div>
+<label style="display:block;margin-top:8px">Tekst odczytany ze zdjęcia<textarea rows="4" readonly data-coupon-ocr-text></textarea></label></div>
+<button style="grid-column:1/3">Dodaj kod</button></form>
+{% for c in rows %}<div class="card{{ ' dim' if not c.active or c.expired }}"><div class="top"><span class="shop">{{ c.shop }}</span><span class="code">{{ c.code }}</span><span class="best">{{ c.discount }}</span><span class="badge {{ 'a' if c.active and not c.expired else 'r' }}">{{ 'aktywny' if c.active and not c.expired else 'wycofany' if not c.active else 'wygasł' }}</span></div>
+{% if c.image %}<img src="{{ url_for('coupon_image', coupon_id=c.id) }}" alt="Zdjęcie kodu {{ c.code }}" loading="lazy" style="display:block;max-width:100%;max-height:240px;object-fit:contain;margin:10px 0">{% endif %}
+{% if c.terms %}<p>{{ c.terms }}</p>{% endif %}{% if c.excludes_promos %}<p class="note">Nie łączy się z innymi promocjami.</p>{% endif %}<div class="note">{% if c.valid_until %}ważny do {{ c.valid_until|dt('%d.%m.%Y') }}{% else %}bez daty końca{% endif %}{% if c.source %} · <a href="{{ c.source }}" target="_blank" rel="noopener noreferrer">źródło</a>{% endif %}</div>
+{% if c.active %}<form method="post" action="{{ url_for('admin_coupon_deactivate', coupon_id=c.id) }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="sec sm">Wycofaj kupon</button></form>{% endif %}</div>
+{% else %}<div class="card">Brak dodanych kuponów.</div>{% endfor %}
+<script>
+(() => {
+  const button = document.querySelector('[data-coupon-ocr]');
+  const form = button.closest('form');
+  const status = document.querySelector('[data-coupon-ocr-status]');
+  const text = document.querySelector('[data-coupon-ocr-text]');
+  const suggestions = document.querySelector('[data-coupon-code-suggestions]');
+  button.addEventListener('click', async () => {
+    const image = form.elements.image.files[0];
+    if (!image) { status.textContent = ' Wybierz zdjęcie.'; return; }
+    button.disabled = true;
+    status.textContent = ' Odczytuję…';
+    suggestions.replaceChildren();
+    try {
+      const body = new FormData();
+      body.append('csrf', form.elements.csrf.value);
+      body.append('image', image);
+      const response = await fetch('{{ url_for("admin_coupon_ocr") }}', { method: 'POST', body });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      text.value = result.text;
+      for (const code of result.codes) {
+        const choice = document.createElement('button');
+        choice.type = 'button';
+        choice.className = 'sec sm';
+        choice.textContent = code;
+        choice.addEventListener('click', () => { form.elements.code.value = code; });
+        suggestions.append(choice);
+      }
+      status.textContent = result.codes.length ? ' Wybierz podpowiedź lub sprawdź kod ręcznie:' : ' Sprawdź odczyt i wpisz kod ręcznie.';
+    } catch (error) {
+      status.textContent = ` ${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();
+</script>{% endblock %}""",
 
     "admin_settings.html": """{% extends 'admin_base.html' %}{% block body %}<h1>Ustawienia</h1>
 <form method="post" class="f"><input type="hidden" name="csrf" value="{{ csrf }}">

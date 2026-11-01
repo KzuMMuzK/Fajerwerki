@@ -1,5 +1,7 @@
 import io
+import os
 import sqlite3
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -42,6 +44,19 @@ class ProductDeduplicationTests(unittest.TestCase):
         self.assertEqual(representative[13:15], (4.0, 14.0))
         self.assertIn(different_price, rows)
         self.assertNotIn(older, rows)
+
+    def test_promotion_status_is_preserved_when_duplicate_rows_are_merged(self):
+        unknown = (
+            "https://shop.example/item", "shop", "Produkt", "SKU1", "SKU1",
+            "2026-10-01", "2026-10-11", 10.0, "in_stock", "2026-10-11", "PLN",
+            None, None, 10.0, 10.0, 1, None,
+        )
+        promoted = (*unknown[:6], "2026-10-10", *unknown[7:16], 1)
+
+        rows = price_app._deduplicate_product_rows([unknown, promoted])
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][16], 1)
 
 
 class ComparisonAndBasketTests(unittest.TestCase):
@@ -394,6 +409,7 @@ class CouponTests(unittest.TestCase):
             data={
                 "shop": "Sklep", "code": "RABAT20", "discount": "20% zniżki",
                 "terms": "Od 100 zł", "valid_until": "", "source": "",
+                "excludes_promos": "1",
                 "image": (image_stream, filename),
             },
             content_type="multipart/form-data",
@@ -407,6 +423,7 @@ class CouponTests(unittest.TestCase):
         self.assertEqual(coupon["code"], "RABAT20")
         self.assertTrue(coupon["image"])
         self.assertTrue(coupon["active"])
+        self.assertTrue(coupon["excludes_promos"])
         self.assertEqual(self.data["audit"][0]["action"], "coupon_add")
 
     def test_ocr_endpoint_returns_text_and_code_suggestions(self):
@@ -443,6 +460,7 @@ class CouponTests(unittest.TestCase):
         self.assertIn("NOWY20", result)
         self.assertNotIn("STARY20", result)
         self.assertNotIn("STOP20", result)
+        self.assertIn("brak etykiety nie potwierdza", result)
 
     def test_admin_coupon_page_renders_upload_and_ocr_controls(self):
         with price_app.app.test_request_context("/admin/coupons"):
@@ -453,6 +471,39 @@ class CouponTests(unittest.TestCase):
         self.assertIn('enctype="multipart/form-data"', result)
         self.assertIn("Odczytaj tekst ze zdjęcia", result)
         self.assertIn("/admin/coupons/ocr", result)
+
+    def test_derived_database_keeps_scraped_promotion_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src = os.path.join(temp_dir, "source.db")
+            dst = os.path.join(temp_dir, "derived.db")
+            connection = sqlite3.connect(src)
+            connection.executescript("""
+                CREATE TABLE products(
+                    url TEXT, site TEXT, name TEXT, code TEXT, code_key TEXT,
+                    first_seen TEXT, last_seen TEXT, promo INTEGER
+                );
+                CREATE TABLE prices(
+                    id INTEGER PRIMARY KEY, url TEXT, ts TEXT, price REAL,
+                    currency TEXT, availability TEXT, scan_id INTEGER
+                );
+                INSERT INTO products VALUES(
+                    'https://shop.example/item','shop','Produkt','SKU1','SKU1',
+                    '2026-10-01','2026-10-02',1
+                );
+                INSERT INTO prices VALUES
+                    (1,'https://shop.example/item','2026-10-01T10:00:00Z',20,'PLN','in_stock',1),
+                    (2,'https://shop.example/item','2026-10-02T10:00:00Z',10,'PLN','in_stock',2);
+            """)
+            connection.close()
+
+            with patch.object(price_app.store, "read", side_effect=RuntimeError("test")):
+                price_app._build_derived(src, dst)
+
+            connection = sqlite3.connect(dst)
+            try:
+                self.assertEqual(connection.execute("SELECT promo FROM items").fetchone()[0], 1)
+            finally:
+                connection.close()
 
 
 if __name__ == "__main__":

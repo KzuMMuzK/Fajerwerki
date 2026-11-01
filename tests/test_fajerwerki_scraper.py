@@ -39,7 +39,7 @@ class ListingParserTests(unittest.TestCase):
             ("""<article class="product"><a href="/sale">Produkt</a><span class="price">
                 <del><span class="woocommerce-Price-amount">199,00 zł</span></del>
                 <ins><span class="woocommerce-Price-amount">149,00 zł</span></ins></span></article>""",
-             ".price ins .woocommerce-Price-amount", 149.0),
+             ".woocommerce-Price-amount", 149.0),
             ("""<article class="product"><a href="/sale">Produkt</a>
                 <span class="badge onsale">Promocja</span><span class="price">149,00 zł</span></article>""",
              ".price", 149.0),
@@ -79,6 +79,17 @@ class ListingParserTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertIsNone(products[0]["promo"])
+
+    def test_product_page_price_selector_ignores_struck_price_and_unrelated_ins(self):
+        result = scraper.extract(
+            """<html><h1>Produkt</h1>
+              <span class="woocommerce-Price-amount"><del>199,00 zł</del></span>
+              <span class="woocommerce-Price-amount">149,00 zł</span>
+              <ins>0,01 zł</ins></html>""",
+            {"selectors": {"name": "h1", "price": ".woocommerce-Price-amount"}},
+        )
+
+        self.assertEqual(result["price"], 149.0)
 
 
 class AccessHandlingTests(unittest.TestCase):

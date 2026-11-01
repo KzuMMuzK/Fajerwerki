@@ -1,5 +1,8 @@
 flask>=3.0,<4
 gunicorn>=22.0
+beautifulsoup4>=4.12
+lxml>=5.0
+soupsieve>=2.5
 Pillow>=10.0
 pytesseract>=0.3.13
 requests>=2.31

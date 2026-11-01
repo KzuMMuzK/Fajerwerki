@@ -1430,6 +1430,29 @@ def parse_price(text):
         v = float(f"{whole}.{frac or '0'}")
     return round(v, 2) if 0 < v < 1_000_000 else None
 
+def promo_from_markup(root, current_price, selectors=None):
+    for selector in ([selectors] if isinstance(selectors, str) else (selectors or [])):
+        if has(root, selector):
+            return 1
+    for node in root.select("del, s, strike, [class*='old-price'], [class*='was-price']"):
+        old_price = parse_price(node.get("content") or node.get_text(" ", strip=True))
+        if current_price is not None and old_price is not None and old_price > current_price:
+            return 1
+    markers = {"sale", "onsale", "on-sale", "promo", "promocja", "promotion",
+               "discount", "przecena", "wyprzedaz"}
+    for node in [root, *root.select("*")]:
+        classes = node.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        if any(token.lower() in markers for token in classes):
+            return 1
+        if node.name in ("span", "div", "small", "strong") and any(
+                marker in node.get_text(" ", strip=True).lower()
+                for marker in ("promocja", "przecena", "wyprzedaż", "wyprzedaz")):
+            if any("badge" in token.lower() or "label" in token.lower() for token in classes):
+                return 1
+    return None
+
 
 def norm_availability(raw):
     if raw is None:
@@ -1540,6 +1563,7 @@ def extract(html, site):
         for k, v in s.items():
             if v is not None and (d.get(k) is None or site.get("prefer_selectors")):
                 d[k] = v
+    d["promo"] = promo_from_markup(soup, d.get("price"), site.get("promo"))
     if not d.get("name"):
         return None
     if d.get("price") is None and not d.get("_ld"):
@@ -1640,7 +1664,7 @@ def db():
     con.executescript("""
     CREATE TABLE IF NOT EXISTS products(
       url TEXT PRIMARY KEY, site TEXT, name TEXT, code TEXT, code_key TEXT,
-      first_seen TEXT, last_seen TEXT);
+      first_seen TEXT, last_seen TEXT, promo INTEGER);
     CREATE TABLE IF NOT EXISTS prices(
       id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT, ts TEXT,
       price REAL, currency TEXT, availability TEXT, scan_id INTEGER);
@@ -1651,6 +1675,8 @@ def db():
     CREATE TABLE IF NOT EXISTS nonproduct(url TEXT PRIMARY KEY, ts TEXT);
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(products)")}
+    if "promo" not in cols:
+        con.execute("ALTER TABLE products ADD COLUMN promo INTEGER")
     if "code" not in cols:
         con.execute("ALTER TABLE products ADD COLUMN code TEXT")
         con.execute("ALTER TABLE products ADD COLUMN code_key TEXT")
@@ -1694,11 +1720,11 @@ _active_scan_ids = {}
 def save(con, site_name, url, d):
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     code, key = extract_code(d["name"], url, d.get("hint"), d.get("code_raw"))
-    con.execute("""INSERT INTO products(url,site,name,code,code_key,first_seen,last_seen)
-                   VALUES(?,?,?,?,?,?,?)
+    con.execute("""INSERT INTO products(url,site,name,code,code_key,first_seen,last_seen,promo)
+                   VALUES(?,?,?,?,?,?,?,?)
                    ON CONFLICT(url) DO UPDATE SET name=excluded.name, code=excluded.code,
-                   code_key=excluded.code_key, last_seen=excluded.last_seen""",
-                (url, site_name, d["name"], code, key, now, now))
+                   code_key=excluded.code_key, last_seen=excluded.last_seen, promo=excluded.promo""",
+                (url, site_name, d["name"], code, key, now, now, d.get("promo")))
     scan_id = _active_scan_ids.get(site_name)
     if scan_id is not None:
         con.execute("UPDATE scrape_runs SET products_checked = products_checked + 1 WHERE id = ?",
@@ -1798,6 +1824,10 @@ def parse_listing(html, page_url, cfg):
         if raw_price:
             for pat in cfg.get("price_strip", []):
                 raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
+        price = parse_price(raw_price)
+        inserted_price = parse_price(_pick(tile, "ins"))
+        if inserted_price is not None and (price is None or inserted_price < price):
+            price = inserted_price
         raw_text = tile.get_text(" ", strip=True)
         text = raw_text.lower()
         out = False
@@ -1811,7 +1841,8 @@ def parse_listing(html, page_url, cfg):
             "name": name.strip(), "currency": cfg.get("currency", "PLN"),
             "hint": raw_text[:400], "code_raw": _pick(tile, cfg.get("code")),
             "availability": "out_of_stock" if out else "in_stock",
-            "price": parse_price(raw_price),
+            "price": price,
+            "promo": promo_from_markup(tile, price, cfg.get("promo")),
             "url": urljoin(page_url, href.strip()),
         })
     return len(tiles), products
@@ -2099,6 +2130,15 @@ def parse_store_api_product(raw):
                 price = None
         except (TypeError, ValueError, OverflowError):
             price = None
+    promo = None
+    try:
+        minor_unit = max(0, min(6, int(prices.get("currency_minor_unit", 2))))
+        sale_price = round(int(prices["sale_price"]) / (10 ** minor_unit), 2)
+        regular_price = round(int(prices["regular_price"]) / (10 ** minor_unit), 2)
+        if regular_price > 0 and sale_price > 0 and sale_price < regular_price:
+            promo = 1
+    except (KeyError, TypeError, ValueError, OverflowError):
+        pass
 
     in_stock = raw.get("is_in_stock")
     availability = "in_stock" if in_stock is True else (
@@ -2111,6 +2151,7 @@ def parse_store_api_product(raw):
         "code_raw": raw.get("sku"),
         "availability": availability,
         "price": price,
+        "promo": promo,
         "url": url,
     }
 

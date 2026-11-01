@@ -69,6 +69,37 @@ class ListingParserTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(products[0]["price"], 3819.0)
 
+    def test_listing_ignores_ins_price_when_shop_selector_does_not_match(self):
+        count, products = scraper.parse_listing(
+            """<article class="product-miniature">
+              <h3 class="product-title"><a href="/item">Produkt</a></h3>
+              <ins><span class="unrelated-price">459,69 zł</span></ins>
+            </article>""",
+            "https://fajerwerkibiegun.pl/pl/",
+            {
+                **scraper.SITES["biegun"]["listing"],
+                "price": "span.product-price",
+                "item": "article.product-miniature",
+            },
+        )
+
+        self.assertEqual(count, 1)
+        self.assertIsNone(products[0]["price"])
+
+    def test_biegun_listing_prefers_structured_product_price(self):
+        count, products = scraper.parse_listing(
+            """<article class="product-miniature">
+              <h3 class="product-title"><a href="/item">Produkt</a></h3>
+              <span class="product-price" content="1980">459,69 zł</span>
+              <ins><span class="unrelated-price">0,01 zł</span></ins>
+            </article>""",
+            "https://fajerwerkibiegun.pl/pl/",
+            scraper.SITES["biegun"]["listing"],
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(products[0]["price"], 1980.0)
+
     def test_listing_keeps_sale_status_unknown_without_a_promotion_marker(self):
         count, products = scraper.parse_listing(
             """<article class="product"><a href="/item">Produkt</a>

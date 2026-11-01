@@ -39,7 +39,7 @@ class ListingParserTests(unittest.TestCase):
             ("""<article class="product"><a href="/sale">Produkt</a><span class="price">
                 <del><span class="woocommerce-Price-amount">199,00 zł</span></del>
                 <ins><span class="woocommerce-Price-amount">149,00 zł</span></ins></span></article>""",
-             ".woocommerce-Price-amount", 149.0),
+             ".price ins .woocommerce-Price-amount", 149.0),
             ("""<article class="product"><a href="/sale">Produkt</a>
                 <span class="badge onsale">Promocja</span><span class="price">149,00 zł</span></article>""",
              ".price", 149.0),
@@ -55,6 +55,19 @@ class ListingParserTests(unittest.TestCase):
                 self.assertEqual(count, 1)
                 self.assertEqual(products[0]["price"], expected_price)
                 self.assertEqual(products[0]["promo"], 1)
+
+    def test_listing_uses_shop_price_selector_instead_of_unrelated_lower_ins_price(self):
+        count, products = scraper.parse_listing(
+            """<article class="product-miniature">
+              <h3 class="product-title"><a href="/item">Produkt</a></h3>
+              <span class="product-price">3 819,00 zł</span><ins>886,65 zł</ins>
+            </article>""",
+            "https://fajerwerkibiegun.pl/pl/",
+            scraper.SITES["biegun"]["listing"],
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(products[0]["price"], 3819.0)
 
     def test_listing_keeps_sale_status_unknown_without_a_promotion_marker(self):
         count, products = scraper.parse_listing(

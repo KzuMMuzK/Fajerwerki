@@ -430,11 +430,13 @@ SITES = {
     "biegun": {
         "base": "https://fajerwerkibiegun.pl",
         "delay": 1, "max_parallel": 2, "use_proxy": True, "browser_ua": True,
+        "code_from_detail": True,
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
             "name": "h3.product-title a", "link": "h3.product-title a@href",
             "price": ["span.product-price@content", "span.product-price"],
+            "code": '[itemprop="sku"]',
             "in_stock": "button.add-to-cart",
             "categories": [
                 "https://fajerwerkibiegun.pl/pl/3-wyrzutnie",
@@ -1545,9 +1547,28 @@ def from_selectors(soup, sel):
     }
 
 
+def product_page_code(soup):
+    sku = soup.find(attrs={"itemprop": "sku"})
+    sku_value = (sku.get("content") or sku.get_text(" ", strip=True)) if sku else None
+    if sku_value:
+        return sku_value
+    description = soup.find(attrs={"itemprop": "description"})
+    if description is None:
+        return None
+    match = re.search(
+        r"\b(?:index|indeks)\s+katalogowy\s*/\s*handlowy\s*[-:#]?\s*"
+        r"([A-Za-z0-9][A-Za-z0-9._/-]{2,20})",
+        description.get_text(" ", strip=True),
+        re.I,
+    )
+    return match.group(1) if match else None
+
+
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
     d = from_jsonld(soup) or {}
+    if not d.get("code_raw"):
+        d["code_raw"] = product_page_code(soup)
     if d.get("price") is None:
         d["price"] = parse_price(meta(soup, "product:price:amount", "og:price:amount", "price"))
         d.setdefault("currency", meta(soup, "product:price:currency", "og:price:currency") or "PLN")
@@ -1897,6 +1918,32 @@ def parse_listing(html, page_url, cfg):
     return len(tiles), products
 
 
+def enrich_listing_product_code(product, site, stats, existing_code=None, headers=None):
+    if product.get("code_raw"):
+        return
+    if existing_code:
+        product["code_raw"] = existing_code
+        return
+    if not site.get("code_from_detail"):
+        return
+    if extract_code(product["name"], product["url"], product.get("hint"))[0]:
+        return
+    response = get(
+        product["url"],
+        stats,
+        cookies=site.get("cookies"),
+        headers=headers,
+    )
+    if response is None:
+        return
+    details = extract(response.content, site)
+    code = details.get("code_raw") if details else None
+    if not code:
+        code = product_page_code(BeautifulSoup(response.content, "lxml"))
+    if code:
+        product["code_raw"] = code
+
+
 def site_headers(name, site):
     h = dict(site.get("headers") or {})
     wanted = {x.strip() for x in BROWSER_UA_SPEC.split(",") if x.strip()}
@@ -2094,6 +2141,7 @@ def run_listing(con, names, args):
             if per_shop[n]:
                 tasks.append((n, per_shop[n].pop(0)))
     stats = {n: Counter() for n in names}
+    detail_headers = {n: site_headers(n, SITES[n]) for n in names}
     problems = {n: [] for n in names}
     cats_total = {n: len(SITES[n]["listing"]["categories"]) for n in names}
     q = queue.Queue()
@@ -2123,6 +2171,17 @@ def run_listing(con, names, args):
                 st = stats[n]
                 st["strony"] += 1
                 for d in items:
+                    if SITES[n].get("code_from_detail"):
+                        existing = con.execute(
+                            "SELECT code FROM products WHERE url = ?", (d["url"],)
+                        ).fetchone()
+                        enrich_listing_product_code(
+                            d,
+                            SITES[n],
+                            st,
+                            existing_code=existing[0] if existing else None,
+                            headers=detail_headers[n],
+                        )
                     st["produkty"] += 1
                     if d["price"] is None:
                         st["bez_ceny"] += 1

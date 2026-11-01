@@ -122,6 +122,59 @@ class ListingParserTests(unittest.TestCase):
 
         self.assertEqual(result["price"], 149.0)
 
+    def test_biegun_product_page_uses_structured_sku(self):
+        result = scraper.extract(
+            """<html><h1>DRAGON FIRE</h1>
+              <span itemprop="sku">TW213</span>
+              <span itemprop="price" content="299.00"></span></html>""",
+            scraper.SITES["biegun"],
+        )
+
+        self.assertEqual(result["code_raw"], "TW213")
+
+    def test_biegun_product_page_falls_back_to_catalog_index(self):
+        result = scraper.extract(
+            """<html><h1>DRAGON FIRE</h1>
+              <div itemprop="description"><ul>
+                <li>Index katalogowy / handlowy - <b>TW213</b></li>
+              </ul></div>
+              <span itemprop="price" content="299.00"></span></html>""",
+            scraper.SITES["biegun"],
+        )
+
+        self.assertEqual(result["code_raw"], "TW213")
+
+    def test_listing_code_enrichment_fetches_detail_only_without_existing_code(self):
+        product = {
+            "name": "Produkt",
+            "url": "https://fajerwerkibiegun.pl/pl/produkt",
+            "hint": "Produkt",
+        }
+        response = SimpleNamespace(content="""<html><h1>Produkt</h1>
+          <span itemprop="sku">TW213</span>
+          <span itemprop="price" content="299.00"></span></html>""")
+        stats = Counter()
+        headers = {"User-Agent": "test"}
+
+        with patch.object(scraper, "get", return_value=response) as get:
+            scraper.enrich_listing_product_code(
+                product, scraper.SITES["biegun"], stats, headers=headers
+            )
+
+        self.assertEqual(product["code_raw"], "TW213")
+        get.assert_called_once_with(product["url"], stats, cookies=None, headers=headers)
+
+    def test_listing_code_enrichment_reuses_existing_code_without_fetching(self):
+        product = {"name": "Produkt", "url": "https://example.test/produkt"}
+
+        with patch.object(scraper, "get") as get:
+            scraper.enrich_listing_product_code(
+                product, scraper.SITES["biegun"], Counter(), existing_code="TW213"
+            )
+
+        self.assertEqual(product["code_raw"], "TW213")
+        get.assert_not_called()
+
 
 class AccessHandlingTests(unittest.TestCase):
     def test_direct_403_is_reported_as_failed_request(self):

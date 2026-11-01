@@ -311,9 +311,9 @@ class ChangesFilterTests(unittest.TestCase):
                 )
         connection.commit()
 
-    def test_shop_filter_applies_to_results_and_tab_counts(self):
+    def test_last_scan_filter_is_scoped_to_selected_shop(self):
         with price_app.app.test_request_context(
-            "/changes?site=alpha&t=drops&scan_mode=last"
+            "/changes?site=alpha&t=drops&scan_mode=last&scan=-2"
         ):
             price_app.g.user = None
             with (
@@ -327,7 +327,7 @@ class ChangesFilterTests(unittest.TestCase):
         self.assertEqual(context["site"], "alpha")
         self.assertEqual(context["counts"]["drops"], 1)
         self.assertEqual([row["site"] for row in context["rows"]], ["alpha"])
-        self.assertEqual(context["selected_scans"], ["-2", "-4"])
+        self.assertEqual(len(context["rows"]), 1)
 
     def test_change_events_are_paginated_after_filters(self):
         for index in range(205):
@@ -348,7 +348,7 @@ class ChangesFilterTests(unittest.TestCase):
         self.connection.commit()
 
         with price_app.app.test_request_context(
-            "/changes?site=alpha&t=drops&scan_mode=selected&scan=-2&page=2"
+            "/changes?site=alpha&t=drops&scan_mode=last&scan=-2&page=2"
         ):
             price_app.g.user = None
             with (
@@ -366,25 +366,47 @@ class ChangesFilterTests(unittest.TestCase):
         self.assertEqual(context["rows"][0]["name"], "Zmiana 154")
         self.assertEqual(context["rows"][-1]["name"], "Zmiana 105")
 
-    def test_selected_scans_and_date_range_filter_historical_events(self):
-        for url in (
-            "/changes?scan_mode=selected&scan=-1&scan=-3",
-            "/changes?scan_mode=range&date_from=2026-10-29&date_to=2026-10-29",
+    def test_date_range_filters_events_inclusive_of_both_dates(self):
+        with price_app.app.test_request_context(
+            "/changes?site=alpha&scan_mode=range&date_from=2026-10-29&date_to=2026-10-30"
         ):
-            with price_app.app.test_request_context(url):
-                price_app.g.user = None
-                with patch.object(price_app, "conn", return_value=self.connection), \
-                        patch.object(price_app, "render_template", return_value="rendered") as render:
-                    result = price_app.changes()
+            price_app.g.user = None
+            with (
+                patch.object(price_app, "conn", return_value=self.connection),
+                patch.object(price_app, "render_template", return_value="rendered") as render,
+            ):
+                result = price_app.changes()
 
-            self.assertEqual(result, "rendered")
-            context = render.call_args.kwargs
-            self.assertEqual(context["counts"]["drops"], 2)
-            self.assertTrue(all(row["changed_at"].startswith("2026-10-29") for row in context["rows"]))
+        self.assertEqual(result, "rendered")
+        context = render.call_args.kwargs
+        self.assertEqual(context["counts"]["drops"], 2)
+        self.assertEqual(len(context["rows"]), 2)
+        self.assertEqual(
+            {row["changed_at"][:10] for row in context["rows"]},
+            {"2026-10-29", "2026-10-30"},
+        )
+
+    def test_old_scan_number_parameter_does_not_limit_last_scan(self):
+        with price_app.app.test_request_context(
+            "/changes?site=alpha&scan_mode=last&scan=94"
+        ):
+            price_app.g.user = None
+            with (
+                patch.object(price_app, "conn", return_value=self.connection),
+                patch.object(price_app, "render_template", return_value="rendered") as render,
+            ):
+                result = price_app.changes()
+
+        self.assertEqual(result, "rendered")
+        context = render.call_args.kwargs
+        self.assertEqual(context["counts"]["drops"], 1)
+        self.assertEqual({row["changed_at"][:10] for row in context["rows"]}, {"2026-10-30"})
 
     def test_shop_selection_is_rendered_and_preserved_between_tabs(self):
         price_app.app.secret_key = "test-secret"
-        with price_app.app.test_request_context("/changes?site=alpha&t=drops&scan_mode=last"):
+        with price_app.app.test_request_context(
+            "/changes?site=alpha&t=drops&scan_mode=range&date_from=2026-10-29&date_to=2026-10-30"
+        ):
             price_app.g.user = None
             html = price_app.render_template(
                 "changes.html",
@@ -393,18 +415,13 @@ class ChangesFilterTests(unittest.TestCase):
                 site="alpha",
                 t="drops",
                 counts={"drops": 1, "rises": 0, "back": 0, "gone": 0},
-                scan_options=[
-                    {"scan_id": -2, "site": "alpha", "started_at": "2026-10-30T00:00:00+00:00",
-                     "completed_at": "2026-10-30T23:59:59+00:00", "status": "legacy"}
-                ],
-                scan_mode="last",
-                selected_scans=[],
-                date_from="",
-                date_to="",
                 page=1,
                 pages=2,
                 total=60,
                 per_page=50,
+                scan_mode="range",
+                date_from="2026-10-29",
+                date_to="2026-10-30",
                 tab="changes",
                 last_seen=None,
                 refresh_error=None,
@@ -412,7 +429,14 @@ class ChangesFilterTests(unittest.TestCase):
 
         self.assertIn('value="alpha" selected>alpha</option>', html)
         self.assertIn("site=alpha", html)
-        self.assertIn('href="/changes?site=alpha&amp;t=drops&amp;scan_mode=last&amp;page=2"', html)
+        self.assertIn(
+            'href="/changes?site=alpha&amp;t=drops&amp;scan_mode=range&amp;date_from=2026-10-29&amp;date_to=2026-10-30&amp;page=2"',
+            html,
+        )
+        self.assertIn("Ostatni skan", html)
+        self.assertIn("Od–do", html)
+        self.assertNotIn("Wybierz skany", html)
+        self.assertNotIn('name="scan"', html)
 
 
 class CouponTests(unittest.TestCase):

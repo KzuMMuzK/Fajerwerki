@@ -745,7 +745,14 @@ def setup_proxies(args):
         with open(args.proxy_file, encoding="utf-8") as f:
             items += [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
     items += [x.strip() for x in os.environ.get("SCRAPER_PROXIES", "").split(",") if x.strip()]
-    _proxies = list(dict.fromkeys(items))
+    normalized = []
+    for item in items:
+        item = item.strip()
+        if "://" not in item:
+            item = "http://" + item
+        if item not in normalized:
+            normalized.append(item)
+    _proxies = normalized
     if _proxies:
         log.info("proxy: %d szt., rotacja round-robin", len(_proxies))
     return _proxies
@@ -759,15 +766,26 @@ def _live_count():
 
 def _is_safe_proxy_for_https(px):
     """SOCKS tuneluje surowe bajty (bez MITM). HTTP/HTTPS proxy mogą robić SSL
-    interception - dla HTTPS ich unikamy (poza proxy z sekretów)."""
+    interception, więc dopuszczamy je tylko, gdy jawnie podano je w konfiguracji."""
     return px.startswith(("socks5", "socks4"))
 
 
 def _https_proxy_candidates():
     now = time.time()
     with _lock:
-        return [px for px in _proxies
-                if _is_safe_proxy_for_https(px) and _proxy_dead.get(px, 0) <= now]
+        trusted = [
+            px for px in _proxies
+            if px not in _free_proxies
+            and px.startswith(("http://", "https://", "socks4://", "socks4a://",
+                               "socks5://", "socks5h://"))
+            and _proxy_dead.get(px, 0) <= now
+        ]
+        free_socks = [
+            px for px in _proxies
+            if px in _free_proxies and _is_safe_proxy_for_https(px)
+            and _proxy_dead.get(px, 0) <= now
+        ]
+        return trusted + free_socks
 
 
 def pick_proxy(url_scheme="https"):
@@ -777,22 +795,12 @@ def pick_proxy(url_scheme="https"):
     with _lock:
         now = time.time()
         if url_scheme == "https":
-            safe = [px for px in _proxies
-                    if _is_safe_proxy_for_https(px) and _proxy_dead.get(px, 0) <= now]
+            safe = [px for px in _https_proxy_candidates()]
             if safe:
                 px = safe[_proxy_i % len(safe)]
                 _proxy_i += 1
                 return px
-            # Fallback: TYLKO user proxy z SOCKS (bez HTTP - robi MITM na HTTPS)
-            user_socks = [px for px in _proxies
-                         if px not in _free_proxies
-                         and _is_safe_proxy_for_https(px)
-                         and _proxy_dead.get(px, 0) <= now]
-            if user_socks:
-                px = user_socks[_proxy_i % len(user_socks)]
-                _proxy_i += 1
-                return px
-            return None  # direct lepiej niż HTTPS przez HTTP proxy (MITM)
+            return None
         for _ in range(len(_proxies)):
             px = _proxies[_proxy_i % len(_proxies)]
             _proxy_i += 1
@@ -897,7 +905,7 @@ def _proxifly_load_txt():
                          headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
         return [
-            {"proxy": line.strip()}
+            {"proxy": "socks5h://" + line.strip()[len("socks5://"):]}
             for line in r.text.splitlines()
             if line.strip().startswith("socks5://")
         ]
@@ -923,8 +931,10 @@ def _do_fetch_proxifly(tag=""):
     # 1) Preferuj proxy z krajów blisko Polski
     for item in data:
         proxy = item.get("proxy")
-        if not proxy or not proxy.startswith("socks5://"):
+        if not proxy or not proxy.startswith(("socks5://", "socks5h://")):
             continue
+        if proxy.startswith("socks5://"):
+            proxy = "socks5h://" + proxy[len("socks5://"):]
         country = (item.get("geolocation") or {}).get("country", "")
         if country and country not in PROXIFLY_QUALITY_COUNTRIES:
             continue
@@ -941,7 +951,9 @@ def _do_fetch_proxifly(tag=""):
         seen = set(added)
         for item in data:
             proxy = item.get("proxy")
-            if proxy and proxy.startswith("socks5://") and proxy not in seen:
+            if proxy and proxy.startswith(("socks5://", "socks5h://")) and proxy not in seen:
+                if proxy.startswith("socks5://"):
+                    proxy = "socks5h://" + proxy[len("socks5://"):]
                 added.append(proxy)
                 seen.add(proxy)
                 if len(added) >= PROXIFLY_MAX_QUALITY:
@@ -1036,10 +1048,12 @@ def geonode_candidates(countries=()):
 
 def _check_proxy(px, targets):
     t0 = time.time()
+    sess = requests.Session()
+    sess.trust_env = False
     for url, hdrs in targets:
         try:
-            r = requests.get(url, proxies={"http": px, "https": px}, timeout=(5, 9),
-                             headers={"User-Agent": USER_AGENT, **(hdrs or {})})
+            r = sess.get(url, proxies={"http": px, "https": px}, timeout=(5, 9),
+                         headers={"User-Agent": USER_AGENT, **(hdrs or {})})
         except requests.RequestException:
             return None
         if r.status_code != 200 or len(r.content) < 1500 or b"<html" not in r.content[:50000].lower():
@@ -1050,18 +1064,20 @@ def _check_proxy(px, targets):
 def verify_site_proxy(name):
     site = SITES[name]
     target = (site["base"].rstrip("/") + "/", site_headers(name, site))
-    ensure_fallback_proxies()
     candidates = _https_proxy_candidates()
+    if not candidates:
+        ensure_fallback_proxies()
+        candidates = _https_proxy_candidates()
     if not candidates:
         raise RuntimeError(
             f"{name} wymaga proxy HTTPS (SOCKS4/5), ale nie ma dostępnego proxy; "
             "skan przerwany bez połączenia bezpośredniego"
         )
 
-    pool = ThreadPoolExecutor(max_workers=min(16, len(candidates)))
+    pool = ThreadPoolExecutor(max_workers=min(40, len(candidates)))
     futures = {pool.submit(_check_proxy, px, [target]): px for px in candidates}
     try:
-        for future in as_completed(futures, timeout=15):
+        for future in as_completed(futures, timeout=60):
             px = futures[future]
             if future.result() is not None:
                 report_proxy(px, True)

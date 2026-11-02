@@ -41,84 +41,69 @@ jobs:
           scraper._min_delay[host] = float(site.get("delay", 1.0))
           scraper._host_sem[host] = threading.Semaphore(int(site.get("max_parallel", 2)))
 
-          url = "https://fajerwerkibiegun.pl/pl/wyrzutnie/2691-the-apocalypse-12-riakeo-abcd-5907317500955.html"
+          stats = Counter()
           hdrs = scraper.site_headers("biegun", site)
 
+          # ==========================================
+          # TEST 1: Strona produktu i funkcja extract()
+          # ==========================================
+          url_prod = "https://fajerwerkibiegun.pl/pl/wyrzutnie/2691-the-apocalypse-12-riakeo-abcd-5907317500955.html"
+          print("\n" + "=" * 60)
+          print("TEST 1: Pobieranie strony produktu (extract)")
           print("=" * 60)
-          print("Pobieranie przez scraper.get() (przez proxy)")
+          r_prod = scraper.get(url_prod, stats=stats, headers=hdrs)
+          
+          if r_prod:
+              d = scraper.extract(r_prod.content, site)
+              print(f"  extract() zwraca cenę: {d.get('price') if d else 'None'}")
+          else:
+              print("  Błąd pobierania strony produktu!")
+
+          # ==========================================
+          # TEST 2: Strona kategorii i funkcja parse_listing()
+          # ==========================================
+          url_kat = "https://fajerwerkibiegun.pl/pl/3-wyrzutnie"
+          print("\n" + "=" * 60)
+          print("TEST 2: Pobieranie strony kategorii (listing)")
           print("=" * 60)
-          stats = Counter()
-          r = scraper.get(url, stats=stats, headers=hdrs)
-          if r is None:
-              print(f"BŁĄD POBIERANIA: {scraper._tls.last_fail}")
-              sys.exit(1)
+          r_kat = scraper.get(url_kat, stats=stats, headers=hdrs)
+          
+          if r_kat:
+              n_tiles, items = scraper.parse_listing(r_kat.content, url_kat, site["listing"])
+              print(f"  Znaleziono {n_tiles} kafelków, sparsowano {len(items)} produktów.")
               
-          print(f"HTTP {r.status_code}, {len(r.content)} B, URL: {r.url}")
-          print(f"stats: {dict(stats)}")
-
-          soup = BeautifulSoup(r.content, "lxml")
-
-          print("\n" + "=" * 60)
-          print("Wszystkie tagi itemprop='price' na stronie:")
-          print("=" * 60)
-          els = soup.find_all(attrs={"itemprop": "price"})
-          print(f"Znaleziono: {len(els)}")
-          for i, el in enumerate(els):
-              parent_chain = []
-              p = el.parent
-              for _ in range(3):
-                  if p is None: break
-                  parent_chain.append(f"<{p.name}>")
-                  p = p.parent
-              print(f"  [{i}] content={el.get('content')!r}")
-              print(f"       text={el.get_text(strip=True)!r}")
-              print(f"       class={el.get('class', [])}")
-              print(f"       rodzice: {' > '.join(parent_chain)}")
-
-          print("\n" + "=" * 60)
-          print("Meta tagi cenowe:")
-          print("=" * 60)
-          for meta_name in ["product:price:amount", "og:price:amount", "product:price:currency", "product:pretax_price:amount", "product:price"]:
-              v = scraper.meta(soup, meta_name)
-              print(f"  {meta_name} = {v!r}")
-
-          print("\n" + "=" * 60)
-          print("JSON-LD (co wyciągnął from_jsonld):")
-          print("=" * 60)
-          ld = scraper.from_jsonld(soup)
-          print(f"  {ld}")
-
-          print("\n" + "=" * 60)
-          print("Co zwraca funkcja extract():")
-          print("=" * 60)
-          d = scraper.extract(r.content, site)
-          if d:
-              print(f"  name = {d.get('name')!r}")
-              print(f"  price = {d.get('price')}")
-              print(f"  currency = {d.get('currency')}")
-              print(f"  availability = {d.get('availability')}")
+              found = False
+              for it in items:
+                  if "APOCALYPSE" in it["name"].upper():
+                      print(f"  ✅ ZNALEZIONO PRODUKT W LISTINGU:")
+                      print(f"     Nazwa: {it['name']}")
+                      print(f"     Cena zapisana: {it['price']}")
+                      print(f"     URL: {it['url']}")
+                      found = True
+              if not found:
+                  print("  ❌ Nie znaleziono produktu APOCALYPSE na tej stronie kategorii (może jest na innej stronie).")
+                  
+              # ==========================================
+              # TEST 3: Surowy HTML kafelka z kategorii
+              # ==========================================
+              print("\n" + "=" * 60)
+              print("TEST 3: Surowy HTML kafelka produktu z kategorii")
+              print("=" * 60)
+              soup_kat = BeautifulSoup(r_kat.content, "lxml")
+              # Szukamy kafelka (article), który zawiera słowo APOCALYPSE
+              for tile in soup_kat.select("article.product-miniature"):
+                  if "APOCALYPSE" in tile.get_text().upper():
+                      print("Kod HTML kafelka (fragment z ceną):")
+                      price_span = tile.select_one(".product-price")
+                      if price_span:
+                          print(f"  Rodzic ceny: {price_span.parent}")
+                          print(f"  Atrybuty ceny: {price_span.attrs}")
+                          print(f"  Tekst ceny: {price_span.get_text(strip=True)!r}")
+                          print(f"  Cały tag HTML: {price_span}")
+                      else:
+                          print("  Nie znaleziono .product-price w kafelku.")
+                      break
           else:
-              print("  extract() zwrócił None")
-
-          print("\n" + "=" * 60)
-          print("Wystąpienia kluczowych wartości w HTML:")
-          print("=" * 60)
-          text = r.text
-          print(f"  '3104.88'  = {text.count('3104.88')}")
-          print(f"  '3104,88'  = {text.count('3104,88')}")
-          print(f"  '3819'     = {text.count('3819')}")
-          print(f"  '3819,00'  = {text.count('3819,00')}")
-          print(f"  '3819.00'  = {text.count('3819.00')}")
-          print(f"  'Brutto'   = {text.count('Brutto')}")
-          print(f"  'Netto'    = {text.count('Netto')}")
-
-          print("\n" + "=" * 60)
-          print("Kontekst HTML wokół pierwszego 'itemprop=\"price\"':")
-          print("=" * 60)
-          idx = r.content.find(b'itemprop="price"')
-          if idx > 0:
-              print(r.content[max(0, idx-400):idx+400].decode("utf-8", "replace"))
-          else:
-              print("BRAK")
+              print("  Błąd pobierania strony kategorii!")
           EOF
           python diag.py

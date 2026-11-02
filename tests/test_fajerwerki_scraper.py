@@ -311,6 +311,35 @@ class ListingPageFailureTests(unittest.TestCase):
 
 
 class AccessHandlingTests(unittest.TestCase):
+    def test_setup_proxies_adds_http_scheme_to_secret_host_port_entries(self):
+        args = SimpleNamespace(proxy=None, proxy_file=None)
+        with (
+            patch.dict(scraper.os.environ, {"SCRAPER_PROXIES": "proxy1.example:8080,https://proxy2.example:443"}),
+            patch.object(scraper, "_proxies", []),
+        ):
+            proxies = list(scraper.setup_proxies(args))
+
+        self.assertEqual(
+            proxies,
+            ["http://proxy1.example:8080", "https://proxy2.example:443"],
+        )
+
+    def test_https_proxy_rotation_includes_trusted_secret_proxies_but_not_free_http(self):
+        trusted = "http://secret-proxy.example:8080"
+        free_socks = "socks5h://free-proxy.example:1080"
+        free_http = "http://free-proxy.example:8080"
+        with (
+            patch.object(scraper, "_proxies", [trusted, free_socks, free_http]),
+            patch.object(scraper, "_free_proxies", {free_socks, free_http}),
+            patch.object(scraper, "_proxy_dead", {}),
+            patch.object(scraper, "_proxy_i", 0),
+        ):
+            candidates = scraper._https_proxy_candidates()
+            selected = scraper.pick_proxy("https")
+
+        self.assertEqual(candidates, [trusted, free_socks])
+        self.assertEqual(selected, trusted)
+
     def test_proxy_required_request_never_falls_back_to_direct(self):
         host = "fajerwerkibiegun.pl"
         session = Mock()
@@ -357,6 +386,18 @@ class AccessHandlingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "bez połączenia bezpośredniego"):
                 scraper.verify_site_proxy("biegun")
 
+    def test_proxy_preflight_uses_trusted_proxies_before_fetching_public_fallbacks(self):
+        proxy = "http://secret-proxy.example:8080"
+        with (
+            patch.object(scraper, "_https_proxy_candidates", return_value=[proxy]),
+            patch.object(scraper, "ensure_fallback_proxies") as fetch_fallback,
+            patch.object(scraper, "_check_proxy", return_value=0.1),
+            patch.object(scraper, "report_proxy"),
+        ):
+            scraper.verify_site_proxy("biegun")
+
+        fetch_fallback.assert_not_called()
+
     def test_scrape_aborts_before_creating_run_when_proxy_preflight_fails(self):
         connection = Mock()
         args = SimpleNamespace(
@@ -396,6 +437,26 @@ class AccessHandlingTests(unittest.TestCase):
             )],
         )
         report_proxy.assert_called_once_with(proxy, True)
+
+    def test_proxy_check_disables_environment_proxy_fallback(self):
+        proxy = "http://secret-proxy.example:8080"
+        response = SimpleNamespace(status_code=200, content=b"<html>" + b"x" * 1500)
+        proxy_session = Mock()
+        proxy_session.get.return_value = response
+        with patch.object(scraper.requests, "Session", return_value=proxy_session):
+            elapsed = scraper._check_proxy(
+                proxy,
+                [("https://fajerwerkibiegun.pl/", {"User-Agent": "test"})],
+            )
+
+        self.assertIsNotNone(elapsed)
+        self.assertFalse(proxy_session.trust_env)
+        proxy_session.get.assert_called_once_with(
+            "https://fajerwerkibiegun.pl/",
+            proxies={"http": proxy, "https": proxy},
+            timeout=(5, 9),
+            headers={"User-Agent": "test"},
+        )
 
     def test_direct_403_is_reported_as_failed_request(self):
         response = Mock(status_code=403, headers={"server": "Cloudflare"})

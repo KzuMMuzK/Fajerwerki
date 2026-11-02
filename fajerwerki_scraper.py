@@ -1274,24 +1274,13 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             if code == 200:
                 report_proxy(px, True)
                 currency = _biegun_response_currency(r, url)
-                if currency not in ("PLN", "not-applicable"):
+                if currency not in ("PLN", None, "not-applicable"):
                     _tls.last_fail = (
-                        f"waluta Bieguna niepotwierdzona jako PLN "
-                        f"({currency or 'brak oznaczenia'})"
+                        f"waluta Bieguna nie jest PLN ({currency})"
                     )
                     log.error("%s: %s; pomijam odpowiedź: %s", host, _tls.last_fail, url)
                     bump("nieudane")
                     bump("waluta_niepotwierdzona")
-                    return None
-                tax_display = _biegun_response_tax_display(r, url)
-                if tax_display not in ("tax-included", "not-applicable"):
-                    _tls.last_fail = (
-                        f"ceny Bieguna niepotwierdzone jako brutto "
-                        f"({tax_display or 'brak oznaczenia'})"
-                    )
-                    log.error("%s: %s; pomijam odpowiedź: %s", host, _tls.last_fail, url)
-                    bump("nieudane")
-                    bump("cena_brutto_niepotwierdzona")
                     return None
                 proxy_fails = 0
                 with _lock:
@@ -1643,9 +1632,12 @@ def extract(html, site):
     d = from_jsonld(soup) or {}
     if site.get("prefer_gross_price_metadata"):
         gross_price = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
+        body_classes = {
+            str(name).lower() for name in (soup.body.get("class") or [])
+        } if soup.body else set()
         if gross_price is None:
             price_elements = soup.find_all(attrs={"itemprop": "price"})
-            if len(price_elements) == 1:
+            if len(price_elements) == 1 and "tax-display-disabled" not in body_classes:
                 gross_price = parse_price(
                     price_elements[0].get("content") or price_elements[0].get_text(" ", strip=True)
                 )
@@ -1841,6 +1833,8 @@ def save(con, site_name, url, d):
     if scan_id is not None:
         con.execute("UPDATE scrape_runs SET products_checked = products_checked + 1 WHERE id = ?",
                     (scan_id,))
+    if d.get("_skip_price_save"):
+        return False
     last = con.execute("SELECT price, availability FROM prices WHERE url=? "
                        "ORDER BY id DESC LIMIT 1", (url,)).fetchone()
     cur = (d["price"], d.get("availability"))
@@ -2036,7 +2030,10 @@ def enrich_listing_price(name, site, product, stats, headers):
         reason = _tls.last_fail if not response else "brak potwierdzonej ceny brutto w HTML produktu"
         log.warning("[%s] pomijam zapis ceny; nie udało się potwierdzić ceny brutto: %s (%s)",
                     name, product["url"], reason)
-        return False
+        product["price"] = None
+        product["currency"] = None
+        product["_skip_price_save"] = True
+        return True
     product["price"] = detail["price"]
     product["currency"] = detail["currency"]
     product["availability"] = detail.get("availability") or product.get("availability")

@@ -203,6 +203,74 @@ class ListingParserTests(unittest.TestCase):
         self.assertEqual(result["price"], 3819.0)
         self.assertEqual(result["currency"], "PLN")
 
+    def test_biegun_listing_price_is_replaced_by_verified_gross_detail_price(self):
+        product = {
+            "name": "THE APOCALYPSE",
+            "url": "https://fajerwerkibiegun.pl/pl/item",
+            "price": 3104.88,
+            "currency": "PLN",
+            "availability": "in_stock",
+        }
+        response = SimpleNamespace(content="""<html><head>
+          <script type="application/ld+json">
+            {"@type":"Product","name":"THE APOCALYPSE",
+             "offers":{"@type":"Offer","price":"3104.88","priceCurrency":"PLN"}}
+          </script>
+          <meta property="product:pretax_price:amount" content="3104.88">
+          <meta property="product:price:amount" content="3819">
+          <meta itemprop="priceCurrency" content="PLN">
+          </head><body>
+            <span itemprop="price" content="3819">3 819,00 zł</span>
+          </body></html>""")
+        stats = Counter()
+
+        with patch.object(scraper, "get", return_value=response):
+            verified = scraper.enrich_listing_product_price(
+                product, scraper.SITES["biegun"], stats
+            )
+
+        self.assertTrue(verified)
+        self.assertEqual(product["price"], 3819.0)
+        self.assertEqual(product["currency"], "PLN")
+        self.assertTrue(product["_gross_price_verified"])
+
+    def test_biegun_listing_price_is_rejected_without_gross_price_metadata(self):
+        product = {
+            "name": "Produkt",
+            "url": "https://fajerwerkibiegun.pl/pl/item",
+            "price": 16.53,
+            "currency": "PLN",
+        }
+        response = SimpleNamespace(content="""<html><head>
+          <script type="application/ld+json">
+            {"@type":"Product","name":"Produkt",
+             "offers":{"@type":"Offer","price":"16.53","priceCurrency":"PLN"}}
+          </script>
+          </head><body><h1>Produkt</h1></body></html>""")
+        stats = Counter()
+
+        with patch.object(scraper, "get", return_value=response):
+            verified = scraper.enrich_listing_product_price(
+                product, scraper.SITES["biegun"], stats
+            )
+
+        self.assertFalse(verified)
+        self.assertEqual(product["price"], 16.53)
+        self.assertEqual(stats["price_detail_failures"], 1)
+
+    def test_save_refuses_unverified_biegun_price(self):
+        connection = Mock()
+
+        saved = scraper.save(
+            connection,
+            "biegun",
+            "https://fajerwerkibiegun.pl/pl/item",
+            {"name": "Produkt", "price": 16.53, "currency": "PLN"},
+        )
+
+        self.assertFalse(saved)
+        connection.execute.assert_not_called()
+
     def test_new_biegun_product_fetches_catalog_code_when_listing_has_none(self):
         product = {
             "name": "Nowy produkt",

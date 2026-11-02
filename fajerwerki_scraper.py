@@ -430,6 +430,8 @@ SITES = {
     "biegun": {
         "base": "https://fajerwerkibiegun.pl",
         "delay": 1, "max_parallel": 2, "use_proxy": True, "browser_ua": True,
+        "detail_price_for_listing": True,
+        "prefer_gross_price_metadata": True,
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
@@ -760,6 +762,14 @@ def _is_safe_proxy_for_https(px):
     interception - dla HTTPS ich unikamy (poza proxy z sekretów)."""
     return px.startswith(("socks5", "socks4"))
 
+
+def _https_proxy_candidates():
+    now = time.time()
+    with _lock:
+        return [px for px in _proxies
+                if _is_safe_proxy_for_https(px) and _proxy_dead.get(px, 0) <= now]
+
+
 def pick_proxy(url_scheme="https"):
     global _proxy_i
     if not _proxies:
@@ -1037,6 +1047,38 @@ def _check_proxy(px, targets):
     return time.time() - t0
 
 
+def verify_site_proxy(name):
+    site = SITES[name]
+    target = (site["base"].rstrip("/") + "/", site_headers(name, site))
+    ensure_fallback_proxies()
+    candidates = _https_proxy_candidates()
+    if not candidates:
+        raise RuntimeError(
+            f"{name} wymaga proxy HTTPS (SOCKS4/5), ale nie ma dostępnego proxy; "
+            "skan przerwany bez połączenia bezpośredniego"
+        )
+
+    pool = ThreadPoolExecutor(max_workers=min(16, len(candidates)))
+    futures = {pool.submit(_check_proxy, px, [target]): px for px in candidates}
+    try:
+        for future in as_completed(futures, timeout=15):
+            px = futures[future]
+            if future.result() is not None:
+                report_proxy(px, True)
+                log.info("[%s] proxy HTTPS sprawdzone; połączenie bezpośrednie zablokowane", name)
+                return
+            report_proxy(px, False, dead=True)
+    except FuturesTimeout:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    raise RuntimeError(
+        f"{name} wymaga proxy HTTPS (SOCKS4/5), ale żadne proxy nie przeszło testu; "
+        "skan przerwany bez połączenia bezpośredniego"
+    )
+
+
 def acquire_free_proxies(targets, want=None, budget=None, countries=()):
     want = want or int(env("SCRAPER_FREE_PROXY_COUNT", 12))
     budget = budget or int(env("SCRAPER_FREE_PROXY_SECONDS", 90))
@@ -1112,13 +1154,18 @@ def proxy_kw(px):
 def allowed(url):
     host = "{0.scheme}://{0.netloc}".format(urlparse(url))
     nl = urlparse(url).netloc
+    via_proxy = PROXY_ALL or nl in _proxy_hosts
+    if via_proxy and not _https_proxy_candidates():
+        ensure_fallback_proxies()
     with _lock:
         if host not in _robots:
             rp, reason, net_fail = None, "brak odpowiedzi", False
-            via_proxy = bool(_proxies) and (PROXY_ALL or nl in _proxy_hosts)
             attempts = min(10, max(3, _live_count() + 1)) if via_proxy else 3
             for _ in range(attempts):
                 px = proxy_for(nl, "https")
+                if via_proxy and px is None:
+                    reason, net_fail = "brak dostępnego proxy HTTPS", True
+                    break
                 try:
                     r = session().get(host + "/robots.txt", timeout=15, **proxy_kw(px))
                 except requests.RequestException as e:
@@ -1249,8 +1296,17 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     url = _biegun_request_url(url)
     host = urlparse(url).netloc
     url_scheme = urlparse(url).scheme
+    via_proxy = PROXY_ALL or host in _proxy_hosts
     last_err = "?"
-    if _proxies and (PROXY_ALL or host in _proxy_hosts):
+    if via_proxy and not _https_proxy_candidates():
+        ensure_fallback_proxies()
+    if via_proxy and not _https_proxy_candidates():
+        _tls.last_fail = "brak dostępnego proxy HTTPS; połączenie bezpośrednie zablokowane"
+        bump("nieudane")
+        bump("proxy_wymagane")
+        log.error("%s: %s; pomijam żądanie: %s", host, _tls.last_fail, url)
+        return None
+    if via_proxy:
         retries = max(retries, _live_count() + 1)
     gate = _gate(host)
     proxy_fails = 0
@@ -1260,6 +1316,12 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         px = None
         try:
             px = proxy_for(host, url_scheme)
+            if via_proxy and px is None:
+                _tls.last_fail = "brak dostępnego proxy HTTPS; połączenie bezpośrednie zablokowane"
+                bump("nieudane")
+                bump("proxy_wymagane")
+                log.error("%s: %s; pomijam żądanie: %s", host, _tls.last_fail, url)
+                return None
             if px in _free_proxies and url_scheme != "https":
                 _tls.last_fail = "adres HTTP nie przez darmowe proxy"
                 bump("nieudane")
@@ -1639,6 +1701,17 @@ def from_selectors(soup, sel):
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
     d = from_jsonld(soup) or {}
+    if site.get("prefer_gross_price_metadata"):
+        gross_price = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
+        if gross_price is None:
+            price_elements = soup.find_all(attrs={"itemprop": "price"})
+            if len(price_elements) == 1:
+                gross_price = parse_price(
+                    price_elements[0].get("content") or price_elements[0].get_text(" ", strip=True)
+                )
+        if gross_price is not None:
+            d["price"] = gross_price
+            d["currency"] = meta(soup, "product:price:currency", "og:price:currency") or d.get("currency") or "PLN"
     if d.get("price") is None:
         d["price"] = parse_price(meta(soup, "product:price:amount", "og:price:amount", "price"))
         d.setdefault("currency", meta(soup, "product:price:currency", "og:price:currency") or "PLN")
@@ -2000,6 +2073,28 @@ def parse_listing(html, page_url, cfg):
     return len(tiles), products
 
 
+def enrich_listing_price(name, site, product, stats, headers):
+    if not site.get("detail_price_for_listing"):
+        return True
+    response = get(
+        product["url"],
+        stats,
+        cookies=site.get("cookies"),
+        headers=headers,
+    )
+    detail = extract(response.content, site) if response else None
+    if not detail or detail.get("price") is None or detail.get("currency") != "PLN":
+        stats["cena_szczegoly_blad"] += 1
+        reason = _tls.last_fail if not response else "brak potwierdzonej ceny brutto w HTML produktu"
+        log.warning("[%s] pomijam zapis ceny; nie udało się potwierdzić ceny brutto: %s (%s)",
+                    name, product["url"], reason)
+        return False
+    product["price"] = detail["price"]
+    product["currency"] = detail["currency"]
+    product["availability"] = detail.get("availability") or product.get("availability")
+    return True
+
+
 def site_headers(name, site):
     h = dict(site.get("headers") or {})
     wanted = {x.strip() for x in BROWSER_UA_SPEC.split(",") if x.strip()}
@@ -2134,6 +2229,9 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                 if page == start:
                     reason = _tls.last_fail
                     log.warning("[%s] kategoria niedostępna (%s): %s", name, reason, url)
+                else:
+                    reason = f"przerwano paginację na stronie {page} ({_tls.last_fail})"
+                    log.warning("[%s] %s: %s", name, reason, url)
                 break
             last_r = r
             n_tiles, items = parse_listing(r.content, url, cfg)
@@ -2153,7 +2251,8 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                 break
             seen.update(it["url"] for it in new)
             total += len(new)
-            q.put(("items", name, cat_url, page, new))
+            verified = [it for it in new if enrich_listing_price(name, site, it, stats, hdrs)]
+            q.put(("items", name, cat_url, page, verified))
             page += 1
         if total and page - start == 1 and last_r is not None:
             visited, cur, ordinal, extra = {last_r.url}, last_r, 1, 0
@@ -2164,6 +2263,8 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                 visited.add(nxt_url)
                 r = get(nxt_url, stats, cookies=site.get("cookies"), headers=hdrs)
                 if not r:
+                    reason = f"przerwano paginację przez link na stronie {ordinal + 1} ({_tls.last_fail})"
+                    log.warning("[%s] %s: %s", name, reason, nxt_url)
                     break
                 n_tiles, items = parse_listing(r.content, nxt_url, cfg)
                 new = [it for it in dict((it["url"], it) for it in items).values() if it["url"] not in seen]
@@ -2171,7 +2272,8 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                     break
                 seen.update(it["url"] for it in new)
                 total += len(new)
-                q.put(("items", name, cat_url, start + ordinal, new))
+                verified = [it for it in new if enrich_listing_price(name, site, it, stats, hdrs)]
+                q.put(("items", name, cat_url, start + ordinal, verified))
                 ordinal, extra, cur = ordinal + 1, extra + 1, r
             if extra:
                 page = start + ordinal
@@ -2636,15 +2738,6 @@ def cmd_scrape(args):
     scan_completed = False
     try:
         names = resolve_sites(args)
-        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        for name in names:
-            cursor = con.execute(
-                "INSERT INTO scrape_runs(site,started_at,status) VALUES(?,?,'running')",
-                (name, started_at),
-            )
-            scan_ids[name] = cursor.lastrowid
-        _active_scan_ids.update(scan_ids)
-        con.commit()
         for n in names:
             site = SITES[n]
             hosts = {urlparse(site["base"]).netloc}
@@ -2665,6 +2758,18 @@ def cmd_scrape(args):
                 countries = tuple(c.strip().upper() for c in (env("SCRAPER_PROXY_COUNTRY", "") or "").split(",") if c.strip())
                 acquire_free_proxies(targets, countries=countries)
                 start_free_refresher(targets, countries)
+        for n in names:
+            if SITES[n].get("use_proxy") or PROXY_ALL:
+                verify_site_proxy(n)
+        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for name in names:
+            cursor = con.execute(
+                "INSERT INTO scrape_runs(site,started_at,status) VALUES(?,?,'running')",
+                (name, started_at),
+            )
+            scan_ids[name] = cursor.lastrowid
+        _active_scan_ids.update(scan_ids)
+        con.commit()
         if _proxies and not PROXY_ALL and not _proxy_hosts:
             log.warning("podano proxy, ale żaden wybrany sklep nie ma use_proxy (ustaw SCRAPER_PROXY_ALL=1)")
         in_actions = bool(os.environ.get("GITHUB_ACTIONS"))

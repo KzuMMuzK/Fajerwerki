@@ -62,6 +62,11 @@ class ProductDeduplicationTests(unittest.TestCase):
 class ComparisonAndBasketTests(unittest.TestCase):
     def setUp(self):
         price_app.app.secret_key = "test-secret"
+        store_read = patch.object(
+            price_app.store, "read", side_effect=lambda callback: callback({"coupons": {}})
+        )
+        store_read.start()
+        self.addCleanup(store_read.stop)
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("""
@@ -71,7 +76,8 @@ class ComparisonAndBasketTests(unittest.TestCase):
                 currency TEXT, prev_price REAL, prev_avail TEXT, min_price REAL, max_price REAL,
                 n_changes INTEGER, drop_pct REAL, key_shops INTEGER, key_min REAL,
                 o_name TEXT, o_price REAL, o_avail TEXT, o_code TEXT, o_key TEXT, o_prev REAL,
-                o_drop REAL, hidden INTEGER, rank INTEGER, note TEXT, edited INTEGER
+                o_drop REAL, hidden INTEGER, rank INTEGER, note TEXT, edited INTEGER,
+                promo INTEGER
             )
         """)
         self.connection.execute("CREATE TABLE meta(k TEXT, v TEXT)")
@@ -171,6 +177,28 @@ class ComparisonAndBasketTests(unittest.TestCase):
         self.assertIn("Produkt X", result)
         self.assertNotIn("<!doctype html>", result.lower())
 
+    def test_product_detail_renders_coupon_controls_near_main_price(self):
+        coupon_data = {"coupons": {
+            "coupon-1": {
+                "shop": "alpha", "code": "RABAT10", "discount": "10%",
+                "active": True, "excludes_promos": False,
+            }
+        }}
+        with price_app.app.test_request_context("/p?u=https://alpha.example/a-x"):
+            price_app.g.user = None
+            with (
+                patch.object(price_app, "conn", return_value=self.connection),
+                patch.object(price_app, "history", return_value=[]),
+                patch.object(price_app.store, "read",
+                             side_effect=lambda callback: callback(coupon_data)),
+            ):
+                result = price_app.product()
+
+        self.assertIn('data-coupon-shop-group="alpha"', result)
+        self.assertIn('data-store-coupon', result)
+        self.assertIn('data-discount-value="10.0"', result)
+        self.assertIn("Cena jest szacunkowa dla jednej sztuki", result)
+
     def test_content_security_policy_allows_same_origin_dynamic_requests(self):
         response = price_app.app.test_client().get("/health")
 
@@ -251,6 +279,11 @@ class ComparisonAndBasketTests(unittest.TestCase):
 
 class ChangesFilterTests(unittest.TestCase):
     def setUp(self):
+        store_read = patch.object(
+            price_app.store, "read", side_effect=lambda callback: callback({"coupons": {}})
+        )
+        store_read.start()
+        self.addCleanup(store_read.stop)
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         connection.executescript("""
@@ -456,6 +489,66 @@ class CouponTests(unittest.TestCase):
             price_app._coupon_code_candidates("Kod: RABAT20. PROMO_2026 RABAT20 OOOO 10%"),
             ["RABAT20", "PROMO_2026"],
         )
+
+    def test_coupon_percent_and_shop_name_are_normalized_for_price_cards(self):
+        self.assertEqual(price_app._coupon_percent("10% zniżki"), 10)
+        self.assertEqual(price_app._coupon_percent("rabat 10%"), 10)
+        self.assertIsNone(price_app._coupon_percent("10% albo 20%"))
+        self.assertIsNone(price_app._coupon_percent("20 zł rabatu"))
+        self.assertEqual(price_app._coupon_amount("20 zł rabatu"), 20)
+        self.assertIsNone(price_app._coupon_amount("10% do 20 zł"))
+        self.assertEqual(price_app._coupon_shop_key("Fajerwerki Biegun"), "biegun")
+        self.assertEqual(price_app._coupon_shop_key("Biegun"), "biegun")
+
+    def test_product_card_renders_store_coupon_checkbox_and_estimate(self):
+        item = {
+            "site": "biegun", "hidden": False, "code": None, "promo": None,
+            "rank": None, "note": None, "edited": False, "url": "https://shop.test/item",
+            "name": "Produkt", "price": 100.0, "prev_price": None, "key_shops": 1,
+            "changed_at": "2026-11-02T10:00:00+00:00", "avail": "in_stock",
+        }
+        coupons = {
+            "biegun": [{
+                "id": "coupon-1", "code": "RABAT10", "discount": "10%",
+                "percent": 10, "amount": None, "discount_kind": "percent",
+                "discount_value": 10, "excludes_promos": False,
+            }]
+        }
+
+        with price_app.app.test_request_context("/"):
+            template = price_app.app.jinja_env.from_string(
+                "{% from 'card.html' import card with context %}{{ card(it) }}"
+            )
+            result = template.render(
+                it=item,
+                coupons_by_shop=coupons,
+                coupon_shop_key=price_app._coupon_shop_key,
+                is_admin=False,
+            )
+
+        self.assertIn('data-store-coupon', result)
+        self.assertIn('data-coupon-id="coupon-1"', result)
+        self.assertIn('data-discount-kind="percent"', result)
+        self.assertIn('data-discount-value="10"', result)
+        self.assertIn("Uwzględnij RABAT10", result)
+        self.assertIn("data-coupon-discounted", result)
+        self.assertIn("data-copy-coupon", result)
+
+    def test_coupon_rows_include_only_unambiguous_discount_values(self):
+        rows = price_app._coupon_rows({
+            "coupons": {
+                "percent": {"shop": "Biegun", "code": "RABAT10", "discount": "10%"},
+                "amount": {"shop": "Biegun", "code": "RABAT20", "discount": "20 zł"},
+                "ambiguous": {"shop": "Biegun", "code": "RABAT", "discount": "10% lub 20%"},
+            }
+        }, active_only=True)
+
+        supported = {row["id"]: row for row in rows if row["discount_value"] is not None}
+        self.assertEqual(supported["percent"]["discount_kind"], "percent")
+        self.assertEqual(supported["percent"]["discount_value"], 10)
+        self.assertEqual(supported["amount"]["discount_kind"], "amount")
+        self.assertEqual(supported["amount"]["discount_value"], 20)
+        self.assertIsNone(next(row for row in rows if row["id"] == "ambiguous")["discount_value"])
 
     def test_coupon_image_is_normalized_and_rejects_non_images(self):
         image = Image.new("RGB", (80, 40), "white")

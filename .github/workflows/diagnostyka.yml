@@ -47,7 +47,7 @@ jobs:
           # ==========================================
           # TEST 1: Strona produktu i funkcja extract()
           # ==========================================
-          url_prod = "https://fajerwerkibiegun.pl/pl/wyrzutnie/2691-the-apocalypse-12-riakeo-abcd-5907317500955.html"
+          url_prod = "https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=16"
           print("\n" + "=" * 60)
           print("TEST 1: Pobieranie strony produktu (extract)")
           print("=" * 60)

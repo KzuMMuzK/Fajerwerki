@@ -1936,6 +1936,7 @@ def listing_soup(content):
     return BeautifulSoup(content, "lxml")
 
 
+
 def parse_listing(html, page_url, cfg):
     soup = listing_soup(html)
     sel = cfg["item"]
@@ -1984,7 +1985,6 @@ def parse_listing(html, page_url, cfg):
             "url": urljoin(page_url, href.strip()),
         })
     return len(tiles), products
-
 
 def site_headers(name, site):
     h = dict(site.get("headers") or {})

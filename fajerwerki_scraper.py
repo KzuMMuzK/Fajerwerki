@@ -745,14 +745,7 @@ def setup_proxies(args):
         with open(args.proxy_file, encoding="utf-8") as f:
             items += [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
     items += [x.strip() for x in os.environ.get("SCRAPER_PROXIES", "").split(",") if x.strip()]
-    normalized = []
-    for item in items:
-        item = item.strip()
-        if "://" not in item:
-            item = "http://" + item
-        if item not in normalized:
-            normalized.append(item)
-    _proxies = normalized
+    _proxies = list(dict.fromkeys(items))
     if _proxies:
         log.info("proxy: %d szt., rotacja round-robin", len(_proxies))
     return _proxies
@@ -766,27 +759,8 @@ def _live_count():
 
 def _is_safe_proxy_for_https(px):
     """SOCKS tuneluje surowe bajty (bez MITM). HTTP/HTTPS proxy mogą robić SSL
-    interception, więc dopuszczamy je tylko, gdy jawnie podano je w konfiguracji."""
+    interception - dla HTTPS ich unikamy (poza proxy z sekretów)."""
     return px.startswith(("socks5", "socks4"))
-
-
-def _https_proxy_candidates():
-    now = time.time()
-    with _lock:
-        trusted = [
-            px for px in _proxies
-            if px not in _free_proxies
-            and px.startswith(("http://", "https://", "socks4://", "socks4a://",
-                               "socks5://", "socks5h://"))
-            and _proxy_dead.get(px, 0) <= now
-        ]
-        free_socks = [
-            px for px in _proxies
-            if px in _free_proxies and _is_safe_proxy_for_https(px)
-            and _proxy_dead.get(px, 0) <= now
-        ]
-        return trusted + free_socks
-
 
 def pick_proxy(url_scheme="https"):
     global _proxy_i
@@ -795,12 +769,22 @@ def pick_proxy(url_scheme="https"):
     with _lock:
         now = time.time()
         if url_scheme == "https":
-            safe = [px for px in _https_proxy_candidates()]
+            safe = [px for px in _proxies
+                    if _is_safe_proxy_for_https(px) and _proxy_dead.get(px, 0) <= now]
             if safe:
                 px = safe[_proxy_i % len(safe)]
                 _proxy_i += 1
                 return px
-            return None
+            # Fallback: TYLKO user proxy z SOCKS (bez HTTP - robi MITM na HTTPS)
+            user_socks = [px for px in _proxies
+                         if px not in _free_proxies
+                         and _is_safe_proxy_for_https(px)
+                         and _proxy_dead.get(px, 0) <= now]
+            if user_socks:
+                px = user_socks[_proxy_i % len(user_socks)]
+                _proxy_i += 1
+                return px
+            return None  # direct lepiej niż HTTPS przez HTTP proxy (MITM)
         for _ in range(len(_proxies)):
             px = _proxies[_proxy_i % len(_proxies)]
             _proxy_i += 1
@@ -905,7 +889,7 @@ def _proxifly_load_txt():
                          headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
         return [
-            {"proxy": "socks5h://" + line.strip()[len("socks5://"):]}
+            {"proxy": line.strip()}
             for line in r.text.splitlines()
             if line.strip().startswith("socks5://")
         ]
@@ -931,10 +915,8 @@ def _do_fetch_proxifly(tag=""):
     # 1) Preferuj proxy z krajów blisko Polski
     for item in data:
         proxy = item.get("proxy")
-        if not proxy or not proxy.startswith(("socks5://", "socks5h://")):
+        if not proxy or not proxy.startswith("socks5://"):
             continue
-        if proxy.startswith("socks5://"):
-            proxy = "socks5h://" + proxy[len("socks5://"):]
         country = (item.get("geolocation") or {}).get("country", "")
         if country and country not in PROXIFLY_QUALITY_COUNTRIES:
             continue
@@ -951,9 +933,7 @@ def _do_fetch_proxifly(tag=""):
         seen = set(added)
         for item in data:
             proxy = item.get("proxy")
-            if proxy and proxy.startswith(("socks5://", "socks5h://")) and proxy not in seen:
-                if proxy.startswith("socks5://"):
-                    proxy = "socks5h://" + proxy[len("socks5://"):]
+            if proxy and proxy.startswith("socks5://") and proxy not in seen:
                 added.append(proxy)
                 seen.add(proxy)
                 if len(added) >= PROXIFLY_MAX_QUALITY:
@@ -1048,51 +1028,15 @@ def geonode_candidates(countries=()):
 
 def _check_proxy(px, targets):
     t0 = time.time()
-    sess = requests.Session()
-    sess.trust_env = False
     for url, hdrs in targets:
         try:
-            r = sess.get(url, proxies={"http": px, "https": px}, timeout=(5, 9),
-                         headers={"User-Agent": USER_AGENT, **(hdrs or {})})
+            r = requests.get(url, proxies={"http": px, "https": px}, timeout=(5, 9),
+                             headers={"User-Agent": USER_AGENT, **(hdrs or {})})
         except requests.RequestException:
             return None
         if r.status_code != 200 or len(r.content) < 1500 or b"<html" not in r.content[:50000].lower():
             return None
     return time.time() - t0
-
-
-def verify_site_proxy(name):
-    site = SITES[name]
-    target = (site["base"].rstrip("/") + "/", site_headers(name, site))
-    candidates = _https_proxy_candidates()
-    if not candidates:
-        ensure_fallback_proxies()
-        candidates = _https_proxy_candidates()
-    if not candidates:
-        raise RuntimeError(
-            f"{name} wymaga proxy HTTPS (SOCKS4/5), ale nie ma dostępnego proxy; "
-            "skan przerwany bez połączenia bezpośredniego"
-        )
-
-    pool = ThreadPoolExecutor(max_workers=min(40, len(candidates)))
-    futures = {pool.submit(_check_proxy, px, [target]): px for px in candidates}
-    try:
-        for future in as_completed(futures, timeout=60):
-            px = futures[future]
-            if future.result() is not None:
-                report_proxy(px, True)
-                log.info("[%s] proxy HTTPS sprawdzone; połączenie bezpośrednie zablokowane", name)
-                return
-            report_proxy(px, False, dead=True)
-    except FuturesTimeout:
-        pass
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
-
-    raise RuntimeError(
-        f"{name} wymaga proxy HTTPS (SOCKS4/5), ale żadne proxy nie przeszło testu; "
-        "skan przerwany bez połączenia bezpośredniego"
-    )
 
 
 def acquire_free_proxies(targets, want=None, budget=None, countries=()):
@@ -1170,18 +1114,13 @@ def proxy_kw(px):
 def allowed(url):
     host = "{0.scheme}://{0.netloc}".format(urlparse(url))
     nl = urlparse(url).netloc
-    via_proxy = PROXY_ALL or nl in _proxy_hosts
-    if via_proxy and not _https_proxy_candidates():
-        ensure_fallback_proxies()
     with _lock:
         if host not in _robots:
             rp, reason, net_fail = None, "brak odpowiedzi", False
+            via_proxy = bool(_proxies) and (PROXY_ALL or nl in _proxy_hosts)
             attempts = min(10, max(3, _live_count() + 1)) if via_proxy else 3
             for _ in range(attempts):
                 px = proxy_for(nl, "https")
-                if via_proxy and px is None:
-                    reason, net_fail = "brak dostępnego proxy HTTPS", True
-                    break
                 try:
                     r = session().get(host + "/robots.txt", timeout=15, **proxy_kw(px))
                 except requests.RequestException as e:
@@ -1312,17 +1251,8 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     url = _biegun_request_url(url)
     host = urlparse(url).netloc
     url_scheme = urlparse(url).scheme
-    via_proxy = PROXY_ALL or host in _proxy_hosts
     last_err = "?"
-    if via_proxy and not _https_proxy_candidates():
-        ensure_fallback_proxies()
-    if via_proxy and not _https_proxy_candidates():
-        _tls.last_fail = "brak dostępnego proxy HTTPS; połączenie bezpośrednie zablokowane"
-        bump("nieudane")
-        bump("proxy_wymagane")
-        log.error("%s: %s; pomijam żądanie: %s", host, _tls.last_fail, url)
-        return None
-    if via_proxy:
+    if _proxies and (PROXY_ALL or host in _proxy_hosts):
         retries = max(retries, _live_count() + 1)
     gate = _gate(host)
     proxy_fails = 0
@@ -1332,12 +1262,6 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         px = None
         try:
             px = proxy_for(host, url_scheme)
-            if via_proxy and px is None:
-                _tls.last_fail = "brak dostępnego proxy HTTPS; połączenie bezpośrednie zablokowane"
-                bump("nieudane")
-                bump("proxy_wymagane")
-                log.error("%s: %s; pomijam żądanie: %s", host, _tls.last_fail, url)
-                return None
             if px in _free_proxies and url_scheme != "https":
                 _tls.last_fail = "adres HTTP nie przez darmowe proxy"
                 bump("nieudane")
@@ -1348,6 +1272,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                     r = session().get(url, timeout=to, cookies=cookies, headers=headers, **proxy_kw(px))
             code = r.status_code
             if code == 200:
+                report_proxy(px, True)
                 currency = _biegun_response_currency(r, url)
                 if currency not in ("PLN", "not-applicable"):
                     _tls.last_fail = (
@@ -1368,7 +1293,6 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                     bump("nieudane")
                     bump("cena_brutto_niepotwierdzona")
                     return None
-                report_proxy(px, True)
                 proxy_fails = 0
                 with _lock:
                     _host_proxy_fails[host] = 0
@@ -1728,6 +1652,7 @@ def extract(html, site):
         if gross_price is not None:
             d["price"] = gross_price
             d["currency"] = meta(soup, "product:price:currency", "og:price:currency") or d.get("currency") or "PLN"
+            d["_gross_price_confirmed"] = True
     if d.get("price") is None:
         d["price"] = parse_price(meta(soup, "product:price:amount", "og:price:amount", "price"))
         d.setdefault("currency", meta(soup, "product:price:currency", "og:price:currency") or "PLN")
@@ -1748,6 +1673,8 @@ def extract(html, site):
         for k, v in s.items():
             if v is not None and (d.get(k) is None or site.get("prefer_selectors")):
                 d[k] = v
+    if site.get("prefer_gross_price_metadata") and not d.get("_gross_price_confirmed"):
+        d["price"] = None
     d["promo"] = promo_from_markup(soup, d.get("price"), site.get("promo"))
     if not d.get("name"):
         return None
@@ -2099,7 +2026,12 @@ def enrich_listing_price(name, site, product, stats, headers):
         headers=headers,
     )
     detail = extract(response.content, site) if response else None
-    if not detail or detail.get("price") is None or detail.get("currency") != "PLN":
+    if (
+        not detail
+        or detail.get("price") is None
+        or detail.get("currency") != "PLN"
+        or not detail.get("_gross_price_confirmed")
+    ):
         stats["cena_szczegoly_blad"] += 1
         reason = _tls.last_fail if not response else "brak potwierdzonej ceny brutto w HTML produktu"
         log.warning("[%s] pomijam zapis ceny; nie udało się potwierdzić ceny brutto: %s (%s)",
@@ -2754,6 +2686,15 @@ def cmd_scrape(args):
     scan_completed = False
     try:
         names = resolve_sites(args)
+        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for name in names:
+            cursor = con.execute(
+                "INSERT INTO scrape_runs(site,started_at,status) VALUES(?,?,'running')",
+                (name, started_at),
+            )
+            scan_ids[name] = cursor.lastrowid
+        _active_scan_ids.update(scan_ids)
+        con.commit()
         for n in names:
             site = SITES[n]
             hosts = {urlparse(site["base"]).netloc}
@@ -2774,18 +2715,6 @@ def cmd_scrape(args):
                 countries = tuple(c.strip().upper() for c in (env("SCRAPER_PROXY_COUNTRY", "") or "").split(",") if c.strip())
                 acquire_free_proxies(targets, countries=countries)
                 start_free_refresher(targets, countries)
-        for n in names:
-            if SITES[n].get("use_proxy") or PROXY_ALL:
-                verify_site_proxy(n)
-        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        for name in names:
-            cursor = con.execute(
-                "INSERT INTO scrape_runs(site,started_at,status) VALUES(?,?,'running')",
-                (name, started_at),
-            )
-            scan_ids[name] = cursor.lastrowid
-        _active_scan_ids.update(scan_ids)
-        con.commit()
         if _proxies and not PROXY_ALL and not _proxy_hosts:
             log.warning("podano proxy, ale żaden wybrany sklep nie ma use_proxy (ustaw SCRAPER_PROXY_ALL=1)")
         in_actions = bool(os.environ.get("GITHUB_ACTIONS"))

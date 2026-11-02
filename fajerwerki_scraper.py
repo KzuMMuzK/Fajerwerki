@@ -1608,19 +1608,16 @@ def from_selectors(soup, sel):
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
 
-    # Tylko i wyłącznie widoczna cena brutto z mikrodata
     price_brutto = None
     el = soup.find(attrs={"itemprop": "price"})
     if el is not None:
         price_brutto = parse_price(el.get("content") or el.get_text(" ", strip=True))
 
-    # Fallback jeśli nie ma mikrodata
     if price_brutto is None:
         price_brutto = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
 
     d = from_jsonld(soup) or {}
-    
-    # Nadpisujemy cenę z JSON-LD (która często jest netto) naszą pewną brutto
+
     if price_brutto is not None:
         d["price"] = price_brutto
     elif d.get("price") is None:
@@ -1632,13 +1629,13 @@ def extract(html, site):
         d["availability"] = norm_availability(meta(soup, "product:availability", "og:availability", "availability"))
     if not d.get("name"):
         d["name"] = meta(soup, "og:title") or (soup.h1.get_text(strip=True) if soup.h1 else None)
-    
+
     if site.get("selectors"):
         s = from_selectors(soup, site["selectors"])
         for k, v in s.items():
             if v is not None and (d.get(k) is None or site.get("prefer_selectors")):
                 d[k] = v
-                
+
     d["promo"] = promo_from_markup(soup, d.get("price"), site.get("promo"))
     if not d.get("name"):
         return None
@@ -1902,23 +1899,42 @@ def _pick_price(el, spec):
         match = re.match(r"^(.*)@([\w-]+)$", one)
         if match:
             css, attr = match.group(1), match.group(2)
-        node = el.select_one(css) if css else el
-        if node is None:
-            continue
-        
-        # Jeśli szukamy atrybutu (np. @content), bierzemy go bezpośrednio - to daje "3819"
-        if attr:
-            val = node.get(attr)
-            if val:
-                return val
-        else:
-            # Jeśli bierzemy tekst, usuwamy przekreślone ceny (del, s, itp.)
-            clean = copy.deepcopy(node)
-            for old_price in clean.select("del, s, strike, .old-price, .price-old"):
-                old_price.decompose()
-            val = clean.get_text(" ", strip=True)
-            if val:
-                return val
+
+        nodes = el.select(css) if css else [el]
+        for node in nodes:
+            # pomiń węzły, które są (lub leżą w) przekreślonej cenie
+            is_old = False
+            cur = node
+            while cur is not None and cur is not el:
+                if cur.name in ("del", "s", "strike"):
+                    is_old = True
+                    break
+                classes = cur.get("class", [])
+                if isinstance(classes, str):
+                    classes = classes.split()
+                markers = ("old-price", "price-old", "was-price", "price-was",
+                           "old_price", "price_old", "was_price", "price_was")
+                if any(any(m in c.lower() for m in markers) for c in classes):
+                    is_old = True
+                    break
+                cur = cur.parent
+            if is_old:
+                continue
+
+            if attr:
+                val = node.get(attr)
+                if val:
+                    return val
+            else:
+                # usuń del/s/strike z kopii, żeby wyciągnąć tylko aktualną cenę
+                clean = copy.deepcopy(node)
+                for old in clean.select("del, s, strike"):
+                    old.decompose()
+                if clean.name in ("del", "s", "strike"):
+                    continue
+                val = clean.get_text(" ", strip=True)
+                if val:
+                    return val
     return None
 
 

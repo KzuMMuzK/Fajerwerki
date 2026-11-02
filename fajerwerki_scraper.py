@@ -432,6 +432,7 @@ SITES = {
         "delay": 1, "max_parallel": 2, "use_proxy": True, "browser_ua": True,
         "detail_code_for_new_products": True,
         "prefer_gross_price_metadata": True,
+        "detail_price_for_listing": True,
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
@@ -1616,6 +1617,47 @@ def enrich_listing_product_code(product, site, stats, is_new, headers=None):
         product["code_raw"] = product_page_code(BeautifulSoup(response.content, "lxml"))
 
 
+def enrich_listing_product_price(product, site, stats, headers=None):
+    if not site.get("detail_price_for_listing"):
+        return True
+    response = get(
+        product["url"],
+        stats,
+        cookies=site.get("cookies"),
+        headers=headers,
+    )
+    if response is None:
+        stats["price_detail_failures"] += 1
+        log.warning("nie można potwierdzić ceny brutto, pomijam produkt: %s", product["url"])
+        return False
+    soup = BeautifulSoup(response.content, "lxml")
+    raw_price = meta(soup, "product:price:amount", "og:price:amount")
+    if raw_price is None:
+        price_elements = soup.find_all(attrs={"itemprop": "price"})
+        if len(price_elements) == 1:
+            raw_price = price_elements[0].get("content") or price_elements[0].get_text(" ", strip=True)
+    currency = meta(soup, "product:price:currency", "og:price:currency", "priceCurrency")
+    price = parse_price(raw_price)
+    if price is None or currency != "PLN":
+        stats["price_detail_failures"] += 1
+        log.warning(
+            "brak potwierdzonej ceny brutto PLN, pomijam produkt (%s, waluta %s): %s",
+            price if price is not None else "brak ceny",
+            currency or "nieznana",
+            product["url"],
+        )
+        return False
+    details = extract(response.content, site) or {}
+    product["price"] = price
+    product["currency"] = currency
+    product["_gross_price_verified"] = True
+    if details.get("availability"):
+        product["availability"] = details["availability"]
+    if not product.get("code_raw"):
+        product["code_raw"] = details.get("code_raw") or product_page_code(soup)
+    return True
+
+
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
     d = from_jsonld(soup) or {}
@@ -1807,6 +1849,11 @@ _active_scan_ids = {}
 
 
 def save(con, site_name, url, d):
+    if site_name == "biegun" and (
+        not d.get("_gross_price_verified") or d.get("currency") != "PLN"
+    ):
+        log.error("pomijam zapis niezweryfikowanej ceny Bieguna: %s", url)
+        return False
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     code, key = extract_code(d["name"], url, d.get("hint"), d.get("code_raw"))
     con.execute("""INSERT INTO products(url,site,name,code,code_key,first_seen,last_seen,promo)
@@ -2220,6 +2267,11 @@ def run_listing(con, names, args):
                 st = stats[n]
                 st["strony"] += 1
                 for d in items:
+                    if not enrich_listing_product_price(
+                        d, SITES[n], st, headers=detail_headers[n]
+                    ):
+                        st["bez_potwierdzonej_ceny"] += 1
+                        continue
                     if SITES[n].get("detail_code_for_new_products"):
                         existing = con.execute(
                             "SELECT 1 FROM products WHERE url = ?", (d["url"],)

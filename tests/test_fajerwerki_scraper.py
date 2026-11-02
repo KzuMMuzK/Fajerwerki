@@ -305,12 +305,12 @@ class AccessHandlingTests(unittest.TestCase):
 class BiegunCurrencyTests(unittest.TestCase):
     def test_requests_force_pln_and_preserve_pagination(self):
         url = scraper._biegun_request_url(
-            "https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=2&id_currency=3"
+            "https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=2&id_currency=3&id_country=21"
         )
 
         self.assertEqual(
             parse_qs(urlparse(url).query),
-            {"page": ["2"], "id_currency": ["1"]},
+            {"page": ["2"], "id_currency": ["1"], "id_country": ["14"]},
         )
         self.assertEqual(
             scraper._biegun_request_url("https://example.test/items?page=2"),
@@ -374,7 +374,7 @@ class BiegunCurrencyTests(unittest.TestCase):
                 requested_url = session.return_value.get.call_args.args[0]
                 self.assertEqual(
                     parse_qs(urlparse(requested_url).query),
-                    {"page": ["2"], "id_currency": ["1"]},
+                    {"page": ["2"], "id_currency": ["1"], "id_country": ["14"]},
                 )
 
 

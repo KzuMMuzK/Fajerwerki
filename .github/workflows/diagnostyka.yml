@@ -1,7 +1,7 @@
 name: Diagnostyka Bieguna
 
 on:
-  workflow_dispatch:  # Uruchamiasz ręcznie z zakładki Actions
+  workflow_dispatch:
 
 jobs:
   diag:
@@ -23,12 +23,12 @@ jobs:
           SCRAPER_PROXIES: ${{ secrets.SCRAPER_PROXIES }}
         run: |
           cat > diag.py << 'EOF'
-          import sys, os, threading
+          import sys, threading
+          from collections import Counter
           sys.path.insert(0, '.')
           from bs4 import BeautifulSoup
           import fajerwerki_scraper as scraper
 
-          # --- Setup identyczny jak w cmd_scrape dla Bieguna ---
           class Args:
               proxy = None
               proxy_file = None
@@ -47,12 +47,14 @@ jobs:
           print("=" * 60)
           print("Pobieranie przez scraper.get() (przez proxy)")
           print("=" * 60)
-          r = scraper.get(url, stats={}, headers=hdrs)
+          stats = Counter()
+          r = scraper.get(url, stats=stats, headers=hdrs)
           if r is None:
               print(f"BŁĄD POBIERANIA: {scraper._tls.last_fail}")
               sys.exit(1)
               
           print(f"HTTP {r.status_code}, {len(r.content)} B, URL: {r.url}")
+          print(f"stats: {dict(stats)}")
 
           soup = BeautifulSoup(r.content, "lxml")
 
@@ -62,14 +64,29 @@ jobs:
           els = soup.find_all(attrs={"itemprop": "price"})
           print(f"Znaleziono: {len(els)}")
           for i, el in enumerate(els):
-              print(f"  [{i}] content={el.get('content')!r} text={el.get_text(strip=True)!r} parent=<{el.parent.name}> class={el.get('class', [])}")
+              parent_chain = []
+              p = el.parent
+              for _ in range(3):
+                  if p is None: break
+                  parent_chain.append(f"<{p.name}>")
+                  p = p.parent
+              print(f"  [{i}] content={el.get('content')!r}")
+              print(f"       text={el.get_text(strip=True)!r}")
+              print(f"       class={el.get('class', [])}")
+              print(f"       rodzice: {' > '.join(parent_chain)}")
 
           print("\n" + "=" * 60)
           print("Meta tagi cenowe:")
           print("=" * 60)
-          for meta_name in ["product:price:amount", "og:price:amount", "product:price:currency", "product:pretax_price:amount"]:
+          for meta_name in ["product:price:amount", "og:price:amount", "product:price:currency", "product:pretax_price:amount", "product:price"]:
               v = scraper.meta(soup, meta_name)
               print(f"  {meta_name} = {v!r}")
+
+          print("\n" + "=" * 60)
+          print("JSON-LD (co wyciągnął from_jsonld):")
+          print("=" * 60)
+          ld = scraper.from_jsonld(soup)
+          print(f"  {ld}")
 
           print("\n" + "=" * 60)
           print("Co zwraca funkcja extract():")
@@ -84,7 +101,7 @@ jobs:
               print("  extract() zwrócił None")
 
           print("\n" + "=" * 60)
-          print("Czy w HTML występuje 3104.88 / 3819?")
+          print("Wystąpienia kluczowych wartości w HTML:")
           print("=" * 60)
           text = r.text
           print(f"  '3104.88'  = {text.count('3104.88')}")
@@ -92,5 +109,16 @@ jobs:
           print(f"  '3819'     = {text.count('3819')}")
           print(f"  '3819,00'  = {text.count('3819,00')}")
           print(f"  '3819.00'  = {text.count('3819.00')}")
+          print(f"  'Brutto'   = {text.count('Brutto')}")
+          print(f"  'Netto'    = {text.count('Netto')}")
+
+          print("\n" + "=" * 60)
+          print("Kontekst HTML wokół pierwszego 'itemprop=\"price\"':")
+          print("=" * 60)
+          idx = r.content.find(b'itemprop="price"')
+          if idx > 0:
+              print(r.content[max(0, idx-400):idx+400].decode("utf-8", "replace"))
+          else:
+              print("BRAK")
           EOF
           python diag.py

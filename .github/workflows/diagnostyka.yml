@@ -1,0 +1,111 @@
+name: Diagnostyka Bieguna
+
+on:
+  workflow_dispatch:  # ręczne uruchamianie z zakładki Actions
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalacja zależności
+        run: pip install requests beautifulsoup4 lxml PySocks
+
+      - name: Uruchom diagnostykę
+        run: |
+          cat > diag.py << 'EOF'
+          import sys
+          sys.path.insert(0, '.')
+          import requests
+          from bs4 import BeautifulSoup
+          import fajerwerki_scraper as scraper
+
+          url = "https://fajerwerkibiegun.pl/pl/wyrzutnie/2691-the-apocalypse-12-riakeo-abcd-5907317500955.html"
+
+          print("=" * 60)
+          print("TEST 1: Zwykłe zapytanie (bez id_currency)")
+          print("=" * 60)
+          r = requests.get(url, headers={"User-Agent": scraper.BROWSER_UA})
+          print(f"HTTP {r.status_code}, {len(r.content)} B")
+          soup = BeautifulSoup(r.content, "lxml")
+          el = soup.find(attrs={"itemprop": "price"})
+          print(f"Cena w itemprop='price': {el.get('content') if el else 'BRAK TAGU'}")
+          print(f"Meta product:price:amount: {scraper.meta(soup, 'product:price:amount')}")
+
+          print()
+          print("=" * 60)
+          print("TEST 2: Zapytanie ze zmodyfikowanym URL (jak robi scraper)")
+          print("=" * 60)
+          url_zm = scraper._biegun_request_url(url)
+          print(f"URL: {url_zm}")
+          r2 = requests.get(url_zm, headers={"User-Agent": scraper.BROWSER_UA})
+          soup2 = BeautifulSoup(r2.content, "lxml")
+          el2 = soup2.find(attrs={"itemprop": "price"})
+          print(f"Cena w itemprop='price': {el2.get('content') if el2 else 'BRAK TAGU'}")
+          print(f"Meta product:price:amount: {scraper.meta(soup2, 'product:price:amount')}")
+
+          print()
+          print("=" * 60)
+          print("TEST 3: Co zwraca extract()?")
+          print("=" * 60)
+          d = scraper.extract(r.content, scraper.SITES["biegun"])
+          print(f"extract() zwykły: price={d.get('price') if d else None}")
+          d2 = scraper.extract(r2.content, scraper.SITES["biegun"])
+          print(f"extract() zmodyfikowany: price={d2.get('price') if d2 else None}")
+
+          print()
+          print("=" * 60)
+          print("TEST 4: Wszystkie itemprop='price' na stronie")
+          print("=" * 60)
+          for i, el in enumerate(soup.find_all(attrs={"itemprop": "price"})):
+              parent = el.parent.name if el.parent else "?"
+              cls = el.get("class", [])
+              print(f"  [{i}] content={el.get('content')!r} text={el.get_text(strip=True)!r} parent=<{parent}> class={cls}")
+
+          print()
+          print("=" * 60)
+          print("TEST 5: Fragment body (pierwsze 500 znaków okolic ceny)")
+          print("=" * 60)
+          idx = r.content.find(b'itemprop="price"')
+          if idx > 0:
+              print(r.content[max(0, idx-200):idx+300].decode("utf-8", "replace"))
+          else:
+              print("Brak itemprop='price' w body")
+          EOF
+          python diag.py
+
+      - name: Pokaż kluczowe fragmenty HTML
+        run: |
+          echo "Szukam wszystkich wystąpień 3104.88 i 3819:"
+          cat > diag2.py << 'EOF'
+          import sys
+          sys.path.insert(0, '.')
+          import requests
+          import fajerwerki_scraper as scraper
+
+          url = "https://fajerwerkibiegun.pl/pl/wyrzutnie/2691-the-apocalypse-12-riakeo-abcd-5907317500955.html"
+          r = requests.get(url, headers={"User-Agent": scraper.BROWSER_UA})
+          text = r.text
+
+          import re
+          print("3104.88 wystąpień:", text.count("3104.88"))
+          print("3104.88 wystąpień (z kropką):", text.count("3104,88"))
+          print("3819 wystąpień:", text.count("3819"))
+          print("3819 wystąpień (z kropką):", text.count("3819.00"))
+          print("3819 wystąpień (z przecinkiem):", text.count("3819,00"))
+          print()
+
+          # Kontekst dla każdego wystąpienia
+          for m in re.finditer(r'3104[.,]88', text):
+              start = max(0, m.start() - 150)
+              end = min(len(text), m.end() + 150)
+              print(f"--- kontekst 3104.88 ---")
+              print(text[start:end])
+              print()
+          EOF
+          python diag2.py

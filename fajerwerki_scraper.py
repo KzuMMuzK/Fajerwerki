@@ -1173,8 +1173,8 @@ def _biegun_request_url(url):
     if parsed.path.lower().endswith((".xml", ".xml.gz")):
         return url
     query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-             if key.lower() != "id_currency"]
-    query.append(("id_currency", "1"))
+             if key.lower() not in ("id_currency", "id_country")]
+    query.extend((("id_currency", "1"), ("id_country", "14")))
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 

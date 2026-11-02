@@ -1608,18 +1608,19 @@ def from_selectors(soup, sel):
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
 
-    # 1) NAJWAŻNIEJSZE: cena z mikrodata (itemprop="price") – to co widzi klient
+    # Tylko i wyłącznie widoczna cena brutto z mikrodata
     price_brutto = None
     el = soup.find(attrs={"itemprop": "price"})
     if el is not None:
         price_brutto = parse_price(el.get("content") or el.get_text(" ", strip=True))
 
-    # 2) Fallback: meta brutto (PrestaShop zawsze generuje to w <head>)
+    # Fallback jeśli nie ma mikrodata
     if price_brutto is None:
         price_brutto = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
 
-    # 3) JSON-LD (może mieć netto – używamy TYLKO gdy nie ma brutto wyżej)
     d = from_jsonld(soup) or {}
+    
+    # Nadpisujemy cenę z JSON-LD (która często jest netto) naszą pewną brutto
     if price_brutto is not None:
         d["price"] = price_brutto
     elif d.get("price") is None:
@@ -1901,22 +1902,23 @@ def _pick_price(el, spec):
         match = re.match(r"^(.*)@([\w-]+)$", one)
         if match:
             css, attr = match.group(1), match.group(2)
-        for node in el.select(css) if css else [el]:
-            ancestor = node
-            while ancestor is not None and ancestor is not el:
-                if _is_old_price(ancestor):
-                    break
-                ancestor = ancestor.parent
-            else:
-                if attr:
-                    value = node.get(attr)
-                else:
-                    clean = copy.deepcopy(node)
-                    for old_price in clean.select(_OLD_PRICE_SELECTOR):
-                        old_price.decompose()
-                    value = clean.get_text(" ", strip=True)
-                if value:
-                    return value
+        node = el.select_one(css) if css else el
+        if node is None:
+            continue
+        
+        # Jeśli szukamy atrybutu (np. @content), bierzemy go bezpośrednio - to daje "3819"
+        if attr:
+            val = node.get(attr)
+            if val:
+                return val
+        else:
+            # Jeśli bierzemy tekst, usuwamy przekreślone ceny (del, s, itp.)
+            clean = copy.deepcopy(node)
+            for old_price in clean.select("del, s, strike, .old-price, .price-old"):
+                old_price.decompose()
+            val = clean.get_text(" ", strip=True)
+            if val:
+                return val
     return None
 
 

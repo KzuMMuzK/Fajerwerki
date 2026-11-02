@@ -434,7 +434,7 @@ SITES = {
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
             "name": "h3.product-title a", "link": "h3.product-title a@href",
-            "price": ["span.product-price@content", "span.product-price"],
+            "price": "span.product-price",
             "code": ".product-reference a",
             "in_stock": "button.add-to-cart",
             "categories": [
@@ -1214,6 +1214,27 @@ def _biegun_response_currency(response, request_url):
     return next(iter(currencies)) if len(currencies) == 1 else None
 
 
+def _biegun_response_tax_display(response, request_url):
+    requested = urlsplit(request_url)
+    if (requested.hostname or "").lower() != "fajerwerkibiegun.pl":
+        return "not-applicable"
+    parsed = urlsplit(getattr(response, "url", request_url))
+    if parsed.path.lower() == "/robots.txt" or parsed.path.lower().endswith((".xml", ".xml.gz")):
+        return "not-applicable"
+    body = re.search(rb"<body\b[^>]*>", response.content[:200000], re.I | re.S)
+    if not body:
+        return None
+    classes = re.search(rb"""\bclass=["']([^"']*)["']""", body.group(0), re.I | re.S)
+    if not classes:
+        return None
+    class_names = set(classes.group(1).lower().split())
+    if b"tax-display-enabled" in class_names:
+        return "tax-included"
+    if b"tax-display-disabled" in class_names:
+        return "tax-excluded"
+    return None
+
+
 def get(url, stats=None, retries=3, cookies=None, headers=None):
     def bump(key):
         if stats is not None:
@@ -1258,6 +1279,16 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                     log.error("%s: %s; pomijam odpowiedź: %s", host, _tls.last_fail, url)
                     bump("nieudane")
                     bump("waluta_niepotwierdzona")
+                    return None
+                tax_display = _biegun_response_tax_display(r, url)
+                if tax_display not in ("tax-included", "not-applicable"):
+                    _tls.last_fail = (
+                        f"ceny Bieguna niepotwierdzone jako brutto "
+                        f"({tax_display or 'brak oznaczenia'})"
+                    )
+                    log.error("%s: %s; pomijam odpowiedź: %s", host, _tls.last_fail, url)
+                    bump("nieudane")
+                    bump("cena_brutto_niepotwierdzona")
                     return None
                 report_proxy(px, True)
                 proxy_fails = 0
@@ -1607,41 +1638,34 @@ def from_selectors(soup, sel):
 
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
-
-    price_brutto = None
-    el = soup.find(attrs={"itemprop": "price"})
-    if el is not None:
-        price_brutto = parse_price(el.get("content") or el.get_text(" ", strip=True))
-
-    if price_brutto is None:
-        price_brutto = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
-
     d = from_jsonld(soup) or {}
-
-    if price_brutto is not None:
-        d["price"] = price_brutto
-    elif d.get("price") is None:
+    if d.get("price") is None:
         d["price"] = parse_price(meta(soup, "product:price:amount", "og:price:amount", "price"))
-
-    if not d.get("currency"):
-        d["currency"] = meta(soup, "product:price:currency", "og:price:currency") or "PLN"
+        d.setdefault("currency", meta(soup, "product:price:currency", "og:price:currency") or "PLN")
     if not d.get("availability"):
         d["availability"] = norm_availability(meta(soup, "product:availability", "og:availability", "availability"))
+    if d.get("price") is None:
+        els = soup.find_all(attrs={"itemprop": "price"})
+        if len(els) == 1:
+            d["price"] = parse_price(els[0].get("content") or els[0].get_text(" ", strip=True))
+    if not d.get("availability"):
+        el = soup.find(attrs={"itemprop": "availability"})
+        if el is not None:
+            d["availability"] = norm_availability(el.get("href") or el.get("content") or el.get_text(" ", strip=True))
     if not d.get("name"):
         d["name"] = meta(soup, "og:title") or (soup.h1.get_text(strip=True) if soup.h1 else None)
-
     if site.get("selectors"):
         s = from_selectors(soup, site["selectors"])
         for k, v in s.items():
             if v is not None and (d.get(k) is None or site.get("prefer_selectors")):
                 d[k] = v
-
     d["promo"] = promo_from_markup(soup, d.get("price"), site.get("promo"))
     if not d.get("name"):
         return None
     if d.get("price") is None and not d.get("_ld"):
         return None
     return d
+
 
 # ----------------------------- kody produktów -------------------------------
 _UNITS = (r"MM|CM|M|G|KG|ML|L|SZT|S|SEK|SEC|MIN|H|X|V|W|HZ|PCS|SHOT|SHOTS|STRZ\w*|STRZAL\w*|ST|K|CAL|CALI|CALA|CALE|"
@@ -1880,14 +1904,17 @@ _OLD_PRICE_SELECTOR = (
     "[class*='price_old'], [class*='was_price'], [class*='price_was']"
 )
 
+
 def _is_old_price(node):
     if node.name in ("del", "s", "strike"):
         return True
     classes = node.get("class", [])
     if isinstance(classes, str):
         classes = classes.split()
-    markers = ("old-price", "price-old", "was-price", "price-was", "old_price", "price_old", "was_price", "price_was")
+    markers = ("old-price", "price-old", "was-price", "price-was",
+               "old_price", "price_old", "was_price", "price_was")
     return any(any(marker in token.lower() for marker in markers) for token in classes)
+
 
 def _pick_price(el, spec):
     if not spec:
@@ -1899,42 +1926,22 @@ def _pick_price(el, spec):
         match = re.match(r"^(.*)@([\w-]+)$", one)
         if match:
             css, attr = match.group(1), match.group(2)
-
-        nodes = el.select(css) if css else [el]
-        for node in nodes:
-            # pomiń węzły, które są (lub leżą w) przekreślonej cenie
-            is_old = False
-            cur = node
-            while cur is not None and cur is not el:
-                if cur.name in ("del", "s", "strike"):
-                    is_old = True
+        for node in el.select(css) if css else [el]:
+            ancestor = node
+            while ancestor is not None and ancestor is not el:
+                if _is_old_price(ancestor):
                     break
-                classes = cur.get("class", [])
-                if isinstance(classes, str):
-                    classes = classes.split()
-                markers = ("old-price", "price-old", "was-price", "price-was",
-                           "old_price", "price_old", "was_price", "price_was")
-                if any(any(m in c.lower() for m in markers) for c in classes):
-                    is_old = True
-                    break
-                cur = cur.parent
-            if is_old:
-                continue
-
-            if attr:
-                val = node.get(attr)
-                if val:
-                    return val
+                ancestor = ancestor.parent
             else:
-                # usuń del/s/strike z kopii, żeby wyciągnąć tylko aktualną cenę
-                clean = copy.deepcopy(node)
-                for old in clean.select("del, s, strike"):
-                    old.decompose()
-                if clean.name in ("del", "s", "strike"):
-                    continue
-                val = clean.get_text(" ", strip=True)
-                if val:
-                    return val
+                if attr:
+                    value = node.get(attr)
+                else:
+                    clean = copy.deepcopy(node)
+                    for old_price in clean.select(_OLD_PRICE_SELECTOR):
+                        old_price.decompose()
+                    value = clean.get_text(" ", strip=True)
+                if value:
+                    return value
     return None
 
 
@@ -1954,7 +1961,6 @@ def listing_soup(content):
     return BeautifulSoup(content, "lxml")
 
 
-
 def parse_listing(html, page_url, cfg):
     soup = listing_soup(html)
     sel = cfg["item"]
@@ -1969,23 +1975,11 @@ def parse_listing(html, page_url, cfg):
         href = _pick(tile, cfg["link"]) or _pick(tile, cfg.get("link_fallback"))
         if not name or not href:
             continue
-            
-        # NOWOŚĆ: Wymuś cenę brutto z itemprop="price", jeśli jest w kafelku
-        price_brutto = None
-        el_micro = tile.find(attrs={"itemprop": "price"})
-        if el_micro is not None:
-            price_brutto = parse_price(el_micro.get("content") or el_micro.get_text(" ", strip=True))
-
-        if price_brutto is not None:
-            price = price_brutto
-            raw_price = str(price_brutto) # tylko do logów/bezpieczeństwa
-        else:
-            raw_price = _pick_price(tile, cfg.get("price"))
-            if raw_price:
-                for pat in cfg.get("price_strip", []):
-                    raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
-            price = parse_price(raw_price)
-
+        raw_price = _pick_price(tile, cfg.get("price"))
+        if raw_price:
+            for pat in cfg.get("price_strip", []):
+                raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
+        price = parse_price(raw_price)
         raw_text = tile.get_text(" ", strip=True)
         text = raw_text.lower()
         out = False
@@ -1999,10 +1993,12 @@ def parse_listing(html, page_url, cfg):
             "name": name.strip(), "currency": cfg.get("currency", "PLN"),
             "hint": raw_text[:400], "code_raw": _pick(tile, cfg.get("code")),
             "availability": "out_of_stock" if out else "in_stock",
-            "price": price, "promo": promo_from_markup(tile, price, cfg.get("promo")),
+            "price": price,
+            "promo": promo_from_markup(tile, price, cfg.get("promo")),
             "url": urljoin(page_url, href.strip()),
         })
     return len(tiles), products
+
 
 def site_headers(name, site):
     h = dict(site.get("headers") or {})

@@ -100,6 +100,33 @@ class ListingParserTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(products[0]["price"], 3819.0)
 
+    def test_biegun_listing_parses_prestashop_json_rendered_products(self):
+        response = {
+            "rendered_products_top": "<div class='products-selection'>",
+            "rendered_products": """<div id="products">
+              <div class="js-product-miniature-wrapper">
+                <article class="product-miniature">
+                  <h3 class="product-title"><a href="https://fajerwerkibiegun.pl/pl/item">Produkt</a></h3>
+                  <span class="product-price" content="3104.88">3 819,00 zł</span>
+                  <span itemprop="sku">TW213</span>
+                </article>
+              </div>
+            </div>""",
+            "rendered_products_bottom": "",
+            "products": [{"id_product": 2736}],
+        }
+
+        count, products = scraper.parse_listing(
+            scraper.json.dumps(response).encode("utf-8"),
+            "https://fajerwerkibiegun.pl/pl/3-wyrzutnie",
+            scraper.SITES["biegun"]["listing"],
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(products[0]["name"], "Produkt")
+        self.assertEqual(products[0]["price"], 3819.0)
+        self.assertEqual(products[0]["code_raw"], "TW213")
+
     def test_listing_keeps_sale_status_unknown_without_a_promotion_marker(self):
         count, products = scraper.parse_listing(
             """<article class="product"><a href="/item">Produkt</a>
@@ -288,6 +315,65 @@ class AccessHandlingTests(unittest.TestCase):
             "sklepzpetardami.pl",
             "fajerwerkibiegun.pl",
         })
+
+
+class BiegunCurrencyTests(unittest.TestCase):
+    def test_request_forces_pln_and_preserves_pagination(self):
+        response_url = (
+            "https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=2&id_currency=1"
+        )
+        response = Mock(
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            content=b'<html><body class="country-pl currency-pln"></body></html>',
+            url=response_url,
+        )
+        session = Mock()
+        session.return_value.get.return_value = response
+
+        with (
+            patch.object(scraper, "allowed", return_value=True),
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "throttle"),
+            patch.object(scraper, "session", session),
+            patch.object(scraper, "_proxies", []),
+            patch.object(scraper, "proxy_for", return_value=None),
+        ):
+            result = scraper.get(
+                "https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=2&id_currency=3",
+                retries=1,
+            )
+
+        self.assertIs(result, response)
+        requested_url = session.return_value.get.call_args.args[0]
+        self.assertEqual(parse_qs(urlparse(requested_url).query),
+                         {"page": ["2"], "id_currency": ["1"]})
+
+    def test_non_pln_biegun_response_is_not_returned_for_scraping(self):
+        response = Mock(
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            content=b'<html><body class="country-fr currency-eur"></body></html>',
+            url="https://fajerwerkibiegun.pl/pl/item?id_currency=1",
+        )
+        session = Mock()
+        session.return_value.get.return_value = response
+        stats = Counter()
+
+        with (
+            patch.object(scraper, "allowed", return_value=True),
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "throttle"),
+            patch.object(scraper, "session", session),
+            patch.object(scraper, "_proxies", []),
+            patch.object(scraper, "proxy_for", return_value=None),
+        ):
+            result = scraper.get(
+                "https://fajerwerkibiegun.pl/pl/item", stats=stats, retries=1
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(stats["nieudane"], 1)
 
 
 class StoreApiTests(unittest.TestCase):

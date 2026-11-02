@@ -1617,9 +1617,22 @@ def enrich_listing_product_code(product, site, stats, is_new, headers=None):
         product["code_raw"] = product_page_code(BeautifulSoup(response.content, "lxml"))
 
 
-def enrich_listing_product_price(product, site, stats, headers=None):
+def enrich_listing_product_price(product, site, stats, headers=None, con=None):
     if not site.get("detail_price_for_listing"):
         return True
+    listing_price = product.get("price")
+    if con is not None and listing_price is not None:
+        cached = con.execute(
+            "SELECT listing_price, gross_price, currency FROM biegun_price_cache WHERE url = ?",
+            (product["url"],),
+        ).fetchone()
+        if cached and cached[2] == "PLN" and abs(cached[0] - listing_price) <= 0.005:
+            product["price"] = cached[1]
+            product["currency"] = cached[2]
+            product["_gross_price_verified"] = True
+            stats["price_cache_hits"] += 1
+            return True
+    stats["price_detail_checks"] += 1
     response = get(
         product["url"],
         stats,
@@ -1651,6 +1664,12 @@ def enrich_listing_product_price(product, site, stats, headers=None):
     product["price"] = price
     product["currency"] = currency
     product["_gross_price_verified"] = True
+    if con is not None:
+        con.execute(
+            """INSERT OR REPLACE INTO biegun_price_cache
+               (url, listing_price, gross_price, currency) VALUES (?, ?, ?, ?)""",
+            (product["url"], listing_price, price, currency),
+        )
     if details.get("availability"):
         product["availability"] = details["availability"]
     if not product.get("code_raw"):
@@ -1804,6 +1823,8 @@ def db():
       id INTEGER PRIMARY KEY AUTOINCREMENT, site TEXT, started_at TEXT,
       completed_at TEXT, status TEXT, products_checked INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nonproduct(url TEXT PRIMARY KEY, ts TEXT);
+    CREATE TABLE IF NOT EXISTS biegun_price_cache(
+      url TEXT PRIMARY KEY, listing_price REAL, gross_price REAL NOT NULL, currency TEXT NOT NULL);
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(products)")}
     if "promo" not in cols:
@@ -1846,6 +1867,55 @@ def db():
 
 _suspicious = []
 _active_scan_ids = {}
+
+
+def prime_biegun_price_cache(con):
+    rows = con.execute("""
+        SELECT current.id, current.url, current.price, previous.price
+        FROM prices current
+        JOIN products product ON product.url = current.url
+        JOIN prices previous ON previous.id = (
+            SELECT MAX(old.id) FROM prices old
+            WHERE old.url = current.url AND old.id < current.id
+        )
+        WHERE product.site = 'biegun'
+          AND current.scan_id = (
+              SELECT MAX(latest.scan_id)
+              FROM prices latest JOIN products p ON p.url = latest.url
+              WHERE p.site = 'biegun' AND latest.scan_id IS NOT NULL
+          )
+          AND current.price > 0 AND previous.price > current.price
+    """).fetchall()
+    tax_like = [
+        row for row in rows
+        if 1.22 <= row[3] / row[2] <= 1.24
+    ]
+    repaired = 0
+    if len(tax_like) >= 100 and len(tax_like) >= len(rows) * 0.9:
+        con.executemany(
+            """INSERT OR REPLACE INTO biegun_price_cache(url,listing_price,gross_price,currency)
+               SELECT ?, ?, ?, 'PLN'""",
+            ((url, listing_price, gross_price) for _, url, listing_price, gross_price in tax_like),
+        )
+        con.executemany("DELETE FROM prices WHERE id = ?", ((row_id,) for row_id, *_ in tax_like))
+        repaired = len(tax_like)
+        log.warning(
+            "[biegun] wykryto skan z cenami netto (%d produktów); przywrócono poprzednie ceny brutto",
+            repaired,
+        )
+
+    con.execute("""
+        INSERT OR IGNORE INTO biegun_price_cache(url, listing_price, gross_price, currency)
+        SELECT product.url, latest.price, latest.price, COALESCE(latest.currency, 'PLN')
+        FROM products product
+        JOIN prices latest ON latest.id = (
+            SELECT MAX(price.id) FROM prices price WHERE price.url = product.url
+        )
+        WHERE product.site = 'biegun' AND latest.price IS NOT NULL
+    """)
+    count = con.execute("SELECT COUNT(*) FROM biegun_price_cache").fetchone()[0]
+    con.commit()
+    log.info("[biegun] cache cen brutto: %d produktów, naprawiono wpisów: %d", count, repaired)
 
 
 def save(con, site_name, url, d):
@@ -2268,7 +2338,7 @@ def run_listing(con, names, args):
                 st["strony"] += 1
                 for d in items:
                     if not enrich_listing_product_price(
-                        d, SITES[n], st, headers=detail_headers[n]
+                        d, SITES[n], st, headers=detail_headers[n], con=con
                     ):
                         st["bez_potwierdzonej_ceny"] += 1
                         continue
@@ -2304,9 +2374,11 @@ def run_listing(con, names, args):
                 last_beat = time.time()
                 for n in names:
                     st = stats[n]
-                    log.info("[%s] kategorie %d/%d | strony: %d | produkty: %d | zmiany: %d | błędy: %d | %s",
+                    log.info("[%s] kategorie %d/%d | strony: %d | produkty: %d | zmiany: %d | "
+                             "ceny z cache: %d | karty cen: %d | pominięte ceny: %d | błędy: %d | %s",
                              n, st["kategorie_gotowe"], cats_total[n], st["strony"], st["produkty"],
-                             st["zmiany_w_historii"], st["nieudane"], fmt_dur(time.time() - t0))
+                             st["zmiany_w_historii"], st["price_cache_hits"], st["price_detail_checks"],
+                             st["bez_potwierdzonej_ceny"], st["nieudane"], fmt_dur(time.time() - t0))
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
         con.commit()
@@ -2692,6 +2764,8 @@ def cmd_scrape(args):
     scan_completed = False
     try:
         names = resolve_sites(args)
+        if "biegun" in names:
+            prime_biegun_price_cache(con)
         started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for name in names:
             cursor = con.execute(

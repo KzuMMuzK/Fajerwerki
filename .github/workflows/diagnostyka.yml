@@ -1,111 +1,96 @@
 name: Diagnostyka Bieguna
 
 on:
-  workflow_dispatch:  # ręczne uruchamianie z zakładki Actions
+  workflow_dispatch:  # Uruchamiasz ręcznie z zakładki Actions
 
 jobs:
   diag:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Pobierz kod
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Zainstaluj Pythona
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Instalacja zależności
+      - name: Zainstaluj zależności
         run: pip install requests beautifulsoup4 lxml PySocks
 
-      - name: Uruchom diagnostykę
+      - name: Uruchom diagnostykę Bieguna
+        env:
+          SCRAPER_PROXIES: ${{ secrets.SCRAPER_PROXIES }}
         run: |
           cat > diag.py << 'EOF'
-          import sys
+          import sys, os, threading
           sys.path.insert(0, '.')
-          import requests
           from bs4 import BeautifulSoup
           import fajerwerki_scraper as scraper
 
+          # --- Setup identyczny jak w cmd_scrape dla Bieguna ---
+          class Args:
+              proxy = None
+              proxy_file = None
+          scraper.setup_proxies(Args())
+          print(f"Proxy w puli: {len(scraper._proxies)}")
+
+          site = scraper.SITES["biegun"]
+          host = "fajerwerkibiegun.pl"
+          scraper._proxy_hosts.add(host)
+          scraper._min_delay[host] = float(site.get("delay", 1.0))
+          scraper._host_sem[host] = threading.Semaphore(int(site.get("max_parallel", 2)))
+
           url = "https://fajerwerkibiegun.pl/pl/wyrzutnie/2691-the-apocalypse-12-riakeo-abcd-5907317500955.html"
+          hdrs = scraper.site_headers("biegun", site)
 
           print("=" * 60)
-          print("TEST 1: Zwykłe zapytanie (bez id_currency)")
+          print("Pobieranie przez scraper.get() (przez proxy)")
           print("=" * 60)
-          r = requests.get(url, headers={"User-Agent": scraper.BROWSER_UA})
-          print(f"HTTP {r.status_code}, {len(r.content)} B")
+          r = scraper.get(url, stats={}, headers=hdrs)
+          if r is None:
+              print(f"BŁĄD POBIERANIA: {scraper._tls.last_fail}")
+              sys.exit(1)
+              
+          print(f"HTTP {r.status_code}, {len(r.content)} B, URL: {r.url}")
+
           soup = BeautifulSoup(r.content, "lxml")
-          el = soup.find(attrs={"itemprop": "price"})
-          print(f"Cena w itemprop='price': {el.get('content') if el else 'BRAK TAGU'}")
-          print(f"Meta product:price:amount: {scraper.meta(soup, 'product:price:amount')}")
 
-          print()
+          print("\n" + "=" * 60)
+          print("Wszystkie tagi itemprop='price' na stronie:")
           print("=" * 60)
-          print("TEST 2: Zapytanie ze zmodyfikowanym URL (jak robi scraper)")
-          print("=" * 60)
-          url_zm = scraper._biegun_request_url(url)
-          print(f"URL: {url_zm}")
-          r2 = requests.get(url_zm, headers={"User-Agent": scraper.BROWSER_UA})
-          soup2 = BeautifulSoup(r2.content, "lxml")
-          el2 = soup2.find(attrs={"itemprop": "price"})
-          print(f"Cena w itemprop='price': {el2.get('content') if el2 else 'BRAK TAGU'}")
-          print(f"Meta product:price:amount: {scraper.meta(soup2, 'product:price:amount')}")
+          els = soup.find_all(attrs={"itemprop": "price"})
+          print(f"Znaleziono: {len(els)}")
+          for i, el in enumerate(els):
+              print(f"  [{i}] content={el.get('content')!r} text={el.get_text(strip=True)!r} parent=<{el.parent.name}> class={el.get('class', [])}")
 
-          print()
+          print("\n" + "=" * 60)
+          print("Meta tagi cenowe:")
           print("=" * 60)
-          print("TEST 3: Co zwraca extract()?")
-          print("=" * 60)
-          d = scraper.extract(r.content, scraper.SITES["biegun"])
-          print(f"extract() zwykły: price={d.get('price') if d else None}")
-          d2 = scraper.extract(r2.content, scraper.SITES["biegun"])
-          print(f"extract() zmodyfikowany: price={d2.get('price') if d2 else None}")
+          for meta_name in ["product:price:amount", "og:price:amount", "product:price:currency", "product:pretax_price:amount"]:
+              v = scraper.meta(soup, meta_name)
+              print(f"  {meta_name} = {v!r}")
 
-          print()
+          print("\n" + "=" * 60)
+          print("Co zwraca funkcja extract():")
           print("=" * 60)
-          print("TEST 4: Wszystkie itemprop='price' na stronie")
-          print("=" * 60)
-          for i, el in enumerate(soup.find_all(attrs={"itemprop": "price"})):
-              parent = el.parent.name if el.parent else "?"
-              cls = el.get("class", [])
-              print(f"  [{i}] content={el.get('content')!r} text={el.get_text(strip=True)!r} parent=<{parent}> class={cls}")
-
-          print()
-          print("=" * 60)
-          print("TEST 5: Fragment body (pierwsze 500 znaków okolic ceny)")
-          print("=" * 60)
-          idx = r.content.find(b'itemprop="price"')
-          if idx > 0:
-              print(r.content[max(0, idx-200):idx+300].decode("utf-8", "replace"))
+          d = scraper.extract(r.content, site)
+          if d:
+              print(f"  name = {d.get('name')!r}")
+              print(f"  price = {d.get('price')}")
+              print(f"  currency = {d.get('currency')}")
+              print(f"  availability = {d.get('availability')}")
           else:
-              print("Brak itemprop='price' w body")
+              print("  extract() zwrócił None")
+
+          print("\n" + "=" * 60)
+          print("Czy w HTML występuje 3104.88 / 3819?")
+          print("=" * 60)
+          text = r.text
+          print(f"  '3104.88'  = {text.count('3104.88')}")
+          print(f"  '3104,88'  = {text.count('3104,88')}")
+          print(f"  '3819'     = {text.count('3819')}")
+          print(f"  '3819,00'  = {text.count('3819,00')}")
+          print(f"  '3819.00'  = {text.count('3819.00')}")
           EOF
           python diag.py
-
-      - name: Pokaż kluczowe fragmenty HTML
-        run: |
-          echo "Szukam wszystkich wystąpień 3104.88 i 3819:"
-          cat > diag2.py << 'EOF'
-          import sys
-          sys.path.insert(0, '.')
-          import requests
-          import fajerwerki_scraper as scraper
-
-          url = "https://fajerwerkibiegun.pl/pl/wyrzutnie/2691-the-apocalypse-12-riakeo-abcd-5907317500955.html"
-          r = requests.get(url, headers={"User-Agent": scraper.BROWSER_UA})
-          text = r.text
-
-          import re
-          print("3104.88 wystąpień:", text.count("3104.88"))
-          print("3104.88 wystąpień (z kropką):", text.count("3104,88"))
-          print("3819 wystąpień:", text.count("3819"))
-          print("3819 wystąpień (z kropką):", text.count("3819.00"))
-          print("3819 wystąpień (z przecinkiem):", text.count("3819,00"))
-          print()
-
-          # Kontekst dla każdego wystąpienia
-          for m in re.finditer(r'3104[.,]88', text):
-              start = max(0, m.start() - 150)
-              end = min(len(text), m.end() + 150)
-              print(f"--- kontekst 3104.88 ---")
-              print(text[start:end])
-              print()
-          EOF
-          python diag2.py

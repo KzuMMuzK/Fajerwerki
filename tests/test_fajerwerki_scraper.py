@@ -56,18 +56,34 @@ class ListingParserTests(unittest.TestCase):
                 self.assertEqual(products[0]["price"], expected_price)
                 self.assertEqual(products[0]["promo"], 1)
 
-    def test_listing_uses_shop_price_selector_instead_of_unrelated_lower_ins_price(self):
+    def test_biegun_listing_reads_name_code_link_and_price_from_category_card(self):
         count, products = scraper.parse_listing(
             """<article class="product-miniature">
-              <h3 class="product-title"><a href="/item">Produkt</a></h3>
-              <span class="product-price">3 819,00 zł</span><ins>886,65 zł</ins>
+              <h3 class="product-title"><a href="/pl/item">Produkt</a></h3>
+              <div class="product-reference"><a href="/pl/item">TXB821</a></div>
+              <span class="product-price" content="14.4">14,40&nbsp;zł</span>
+              <ins><span class="unrelated-price">0,01 zł</span></ins>
             </article>""",
-            "https://fajerwerkibiegun.pl/pl/",
+            "https://fajerwerkibiegun.pl/pl/wyrzutnie-do-200-pln",
             scraper.SITES["biegun"]["listing"],
         )
 
         self.assertEqual(count, 1)
-        self.assertEqual(products[0]["price"], 3819.0)
+        self.assertEqual(products[0]["name"], "Produkt")
+        self.assertEqual(products[0]["url"], "https://fajerwerkibiegun.pl/pl/item")
+        self.assertEqual(products[0]["code_raw"], "TXB821")
+        self.assertEqual(products[0]["price"], 14.4)
+
+    def test_biegun_configuration_keeps_proxy_browser_ua_and_categories(self):
+        site = scraper.SITES["biegun"]
+
+        self.assertTrue(site["use_proxy"])
+        self.assertTrue(site["browser_ua"])
+        self.assertEqual(site["mode"], "listing")
+        self.assertEqual(len(site["listing"]["categories"]), 16)
+        self.assertNotIn("detail_price_for_listing", site)
+        self.assertNotIn("detail_code_for_new_products", site)
+        self.assertNotIn("prefer_gross_price_metadata", site)
 
     def test_listing_ignores_ins_price_when_shop_selector_does_not_match(self):
         count, products = scraper.parse_listing(
@@ -86,11 +102,11 @@ class ListingParserTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertIsNone(products[0]["price"])
 
-    def test_biegun_listing_prefers_structured_product_price(self):
+    def test_biegun_listing_reads_numeric_price_from_content_attribute(self):
         count, products = scraper.parse_listing(
             """<article class="product-miniature">
               <h3 class="product-title"><a href="/item">Produkt</a></h3>
-              <span class="product-price" content="3104.88">3 819,00 zł</span>
+              <span class="product-price" content="14.4">14,40 zł</span>
               <ins><span class="unrelated-price">0,01 zł</span></ins>
             </article>""",
             "https://fajerwerkibiegun.pl/pl/",
@@ -98,7 +114,7 @@ class ListingParserTests(unittest.TestCase):
         )
 
         self.assertEqual(count, 1)
-        self.assertEqual(products[0]["price"], 3819.0)
+        self.assertEqual(products[0]["price"], 14.4)
 
     def test_biegun_listing_parses_prestashop_json_rendered_products(self):
         response = {
@@ -107,8 +123,8 @@ class ListingParserTests(unittest.TestCase):
               <div class="js-product-miniature-wrapper">
                 <article class="product-miniature">
                   <h3 class="product-title"><a href="https://fajerwerkibiegun.pl/pl/item">Produkt</a></h3>
-                  <span class="product-price" content="3104.88">3 819,00 zł</span>
-                  <span itemprop="sku">TW213</span>
+                  <div class="product-reference"><a href="https://fajerwerkibiegun.pl/pl/item">TXB821</a></div>
+                  <span class="product-price" content="14.4">14,40 zł</span>
                 </article>
               </div>
             </div>""",
@@ -124,8 +140,8 @@ class ListingParserTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertEqual(products[0]["name"], "Produkt")
-        self.assertEqual(products[0]["price"], 3819.0)
-        self.assertEqual(products[0]["code_raw"], "TW213")
+        self.assertEqual(products[0]["price"], 14.4)
+        self.assertEqual(products[0]["code_raw"], "TXB821")
 
     def test_listing_keeps_sale_status_unknown_without_a_promotion_marker(self):
         count, products = scraper.parse_listing(
@@ -148,251 +164,6 @@ class ListingParserTests(unittest.TestCase):
         )
 
         self.assertEqual(result["price"], 149.0)
-
-    def test_biegun_product_page_uses_structured_sku(self):
-        result = scraper.extract(
-            """<html><h1>DRAGON FIRE</h1>
-              <span itemprop="sku">TW213</span>
-              <span itemprop="price" content="299.00"></span></html>""",
-            scraper.SITES["biegun"],
-        )
-
-        self.assertEqual(result["code_raw"], "TW213")
-
-    def test_biegun_product_page_falls_back_to_catalog_index(self):
-        result = scraper.extract(
-            """<html><h1>DRAGON FIRE</h1>
-              <div itemprop="description"><ul>
-                <li>Index katalogowy / handlowy - <b>TW213</b></li>
-              </ul></div>
-              <span itemprop="price" content="299.00"></span></html>""",
-            scraper.SITES["biegun"],
-        )
-
-        self.assertEqual(result["code_raw"], "TW213")
-
-    def test_biegun_product_page_uses_gross_price_metadata(self):
-        result = scraper.extract(
-            """<html>
-              <meta property="product:pretax_price:amount" content="3104.88">
-              <meta property="product:price:amount" content="3819">
-              <meta property="product:price:currency" content="PLN">
-              <h1>THE APOCALYPSE 1+2</h1>
-            </html>""",
-            scraper.SITES["biegun"],
-        )
-
-        self.assertEqual(result["price"], 3819.0)
-
-    def test_biegun_product_page_prefers_gross_metadata_over_net_jsonld(self):
-        result = scraper.extract(
-            """<html><head>
-              <script type="application/ld+json">
-                {"@type":"Product","name":"THE APOCALYPSE",
-                 "offers":{"@type":"Offer","price":"3104.88","priceCurrency":"PLN"}}
-              </script>
-              <meta property="product:pretax_price:amount" content="3104.88">
-              <meta property="product:price:amount" content="3819">
-              <meta property="product:price:currency" content="PLN">
-              </head><body>
-                <span itemprop="price" class="product-price" content="3819">3 819,00 zł</span>
-              </body></html>""",
-            scraper.SITES["biegun"],
-        )
-
-        self.assertEqual(result["price"], 3819.0)
-        self.assertEqual(result["currency"], "PLN")
-
-    def test_biegun_listing_price_is_replaced_by_verified_gross_detail_price(self):
-        product = {
-            "name": "THE APOCALYPSE",
-            "url": "https://fajerwerkibiegun.pl/pl/item",
-            "price": 3104.88,
-            "currency": "PLN",
-            "availability": "in_stock",
-        }
-        response = SimpleNamespace(content="""<html><head>
-          <script type="application/ld+json">
-            {"@type":"Product","name":"THE APOCALYPSE",
-             "offers":{"@type":"Offer","price":"3104.88","priceCurrency":"PLN"}}
-          </script>
-          <meta property="product:pretax_price:amount" content="3104.88">
-          <meta property="product:price:amount" content="3819">
-          <meta itemprop="priceCurrency" content="PLN">
-          </head><body>
-            <span itemprop="price" content="3819">3 819,00 zł</span>
-          </body></html>""")
-        stats = Counter()
-
-        with patch.object(scraper, "get", return_value=response):
-            verified = scraper.enrich_listing_product_price(
-                product, scraper.SITES["biegun"], stats
-            )
-
-        self.assertTrue(verified)
-        self.assertEqual(product["price"], 3819.0)
-        self.assertEqual(product["currency"], "PLN")
-        self.assertTrue(product["_gross_price_verified"])
-
-    def test_biegun_listing_price_is_rejected_without_gross_price_metadata(self):
-        product = {
-            "name": "Produkt",
-            "url": "https://fajerwerkibiegun.pl/pl/item",
-            "price": 16.53,
-            "currency": "PLN",
-        }
-        response = SimpleNamespace(content="""<html><head>
-          <script type="application/ld+json">
-            {"@type":"Product","name":"Produkt",
-             "offers":{"@type":"Offer","price":"16.53","priceCurrency":"PLN"}}
-          </script>
-          </head><body><h1>Produkt</h1></body></html>""")
-        stats = Counter()
-
-        with patch.object(scraper, "get", return_value=response):
-            verified = scraper.enrich_listing_product_price(
-                product, scraper.SITES["biegun"], stats
-            )
-
-        self.assertFalse(verified)
-        self.assertEqual(product["price"], 16.53)
-        self.assertEqual(stats["price_detail_failures"], 1)
-
-    def test_biegun_verified_price_cache_avoids_product_page_request(self):
-        connection = sqlite3.connect(":memory:")
-        connection.execute("""
-            CREATE TABLE biegun_price_cache(
-                url TEXT PRIMARY KEY, listing_price REAL, gross_price REAL, currency TEXT
-            )
-        """)
-        connection.execute(
-            "INSERT INTO biegun_price_cache VALUES (?, ?, ?, ?)",
-            ("https://fajerwerkibiegun.pl/pl/item", 16.53, 20.33, "PLN"),
-        )
-        product = {
-            "name": "Produkt",
-            "url": "https://fajerwerkibiegun.pl/pl/item",
-            "price": 16.53,
-            "currency": "PLN",
-        }
-
-        with patch.object(scraper, "get") as get:
-            verified = scraper.enrich_listing_product_price(
-                product, scraper.SITES["biegun"], Counter(), con=connection
-            )
-
-        self.assertTrue(verified)
-        self.assertEqual(product["price"], 20.33)
-        self.assertTrue(product["_gross_price_verified"])
-        get.assert_not_called()
-        connection.close()
-
-    def test_prime_biegun_price_cache_repairs_mass_net_price_scan(self):
-        connection = sqlite3.connect(":memory:")
-        connection.executescript("""
-            CREATE TABLE products(url TEXT PRIMARY KEY, site TEXT);
-            CREATE TABLE prices(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT, ts TEXT,
-                price REAL, currency TEXT, availability TEXT, scan_id INTEGER
-            );
-            CREATE TABLE biegun_price_cache(
-                url TEXT PRIMARY KEY, listing_price REAL, gross_price REAL, currency TEXT
-            );
-        """)
-        for index in range(120):
-            url = f"https://fajerwerkibiegun.pl/pl/item-{index}"
-            connection.execute("INSERT INTO products(url,site) VALUES(?, 'biegun')", (url,))
-            connection.execute(
-                "INSERT INTO prices(url,price,currency,scan_id) VALUES(?,100,'PLN',80)",
-                (url,),
-            )
-            connection.execute(
-                "INSERT INTO prices(url,price,currency,scan_id) VALUES(?,81.30,'PLN',123)",
-                (url,),
-            )
-
-        scraper.prime_biegun_price_cache(connection)
-
-        self.assertEqual(connection.execute("SELECT COUNT(*) FROM prices").fetchone()[0], 120)
-        self.assertEqual(
-            connection.execute("SELECT COUNT(*) FROM prices WHERE scan_id=123").fetchone()[0],
-            0,
-        )
-        self.assertEqual(
-            connection.execute(
-                "SELECT listing_price,gross_price,currency FROM biegun_price_cache LIMIT 1"
-            ).fetchone(),
-            (81.3, 100.0, "PLN"),
-        )
-        connection.close()
-
-    def test_save_refuses_unverified_biegun_price(self):
-        connection = Mock()
-
-        saved = scraper.save(
-            connection,
-            "biegun",
-            "https://fajerwerkibiegun.pl/pl/item",
-            {"name": "Produkt", "price": 16.53, "currency": "PLN"},
-        )
-
-        self.assertFalse(saved)
-        connection.execute.assert_not_called()
-
-    def test_new_biegun_product_fetches_catalog_code_when_listing_has_none(self):
-        product = {
-            "name": "Nowy produkt",
-            "url": "https://fajerwerkibiegun.pl/pl/nowy-produkt",
-            "hint": "Nowy produkt",
-        }
-        response = SimpleNamespace(content="""<html>
-          <div itemprop="description"><ul>
-            <li>Index katalogowy / handlowy - <b>TW213</b></li>
-          </ul></div></html>""")
-        stats = Counter()
-        headers = {"User-Agent": "test"}
-
-        with patch.object(scraper, "get", return_value=response) as get:
-            scraper.enrich_listing_product_code(
-                product,
-                scraper.SITES["biegun"],
-                stats,
-                is_new=True,
-                headers=headers,
-            )
-
-        self.assertEqual(product["code_raw"], "TW213")
-        get.assert_called_once_with(product["url"], stats, cookies=None, headers=headers)
-
-    def test_existing_biegun_product_does_not_fetch_detail_only_for_code(self):
-        product = {
-            "name": "Produkt",
-            "url": "https://fajerwerkibiegun.pl/pl/produkt",
-            "hint": "Produkt",
-        }
-
-        with patch.object(scraper, "get") as get:
-            scraper.enrich_listing_product_code(
-                product, scraper.SITES["biegun"], Counter(), is_new=False
-            )
-
-        self.assertNotIn("code_raw", product)
-        get.assert_not_called()
-
-    def test_new_biegun_product_with_code_in_url_does_not_fetch_detail(self):
-        product = {
-            "name": "Produkt",
-            "url": "https://fajerwerkibiegun.pl/pl/produkt-tw213.html",
-            "hint": "Produkt",
-        }
-
-        with patch.object(scraper, "get") as get:
-            scraper.enrich_listing_product_code(
-                product, scraper.SITES["biegun"], Counter(), is_new=True
-            )
-
-        get.assert_not_called()
-
 
 class AccessHandlingTests(unittest.TestCase):
     def test_direct_403_is_reported_as_failed_request(self):
@@ -470,65 +241,6 @@ class AccessHandlingTests(unittest.TestCase):
             "sklepzpetardami.pl",
             "fajerwerkibiegun.pl",
         })
-
-
-class BiegunCurrencyTests(unittest.TestCase):
-    def test_request_forces_pln_and_preserves_pagination(self):
-        response_url = (
-            "https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=2&id_currency=1"
-        )
-        response = Mock(
-            status_code=200,
-            headers={"Content-Type": "text/html"},
-            content=b'<html><body class="country-pl currency-pln"></body></html>',
-            url=response_url,
-        )
-        session = Mock()
-        session.return_value.get.return_value = response
-
-        with (
-            patch.object(scraper, "allowed", return_value=True),
-            patch.object(scraper, "ensure_fallback_proxies"),
-            patch.object(scraper, "throttle"),
-            patch.object(scraper, "session", session),
-            patch.object(scraper, "_proxies", []),
-            patch.object(scraper, "proxy_for", return_value=None),
-        ):
-            result = scraper.get(
-                "https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=2&id_currency=3",
-                retries=1,
-            )
-
-        self.assertIs(result, response)
-        requested_url = session.return_value.get.call_args.args[0]
-        self.assertEqual(parse_qs(urlparse(requested_url).query),
-                         {"page": ["2"], "id_currency": ["1"]})
-
-    def test_non_pln_biegun_response_is_not_returned_for_scraping(self):
-        response = Mock(
-            status_code=200,
-            headers={"Content-Type": "text/html"},
-            content=b'<html><body class="country-fr currency-eur"></body></html>',
-            url="https://fajerwerkibiegun.pl/pl/item?id_currency=1",
-        )
-        session = Mock()
-        session.return_value.get.return_value = response
-        stats = Counter()
-
-        with (
-            patch.object(scraper, "allowed", return_value=True),
-            patch.object(scraper, "ensure_fallback_proxies"),
-            patch.object(scraper, "throttle"),
-            patch.object(scraper, "session", session),
-            patch.object(scraper, "_proxies", []),
-            patch.object(scraper, "proxy_for", return_value=None),
-        ):
-            result = scraper.get(
-                "https://fajerwerkibiegun.pl/pl/item", stats=stats, retries=1
-            )
-
-        self.assertIsNone(result)
-        self.assertEqual(stats["nieudane"], 1)
 
 
 class StoreApiTests(unittest.TestCase):

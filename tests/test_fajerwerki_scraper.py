@@ -81,9 +81,9 @@ class ListingParserTests(unittest.TestCase):
         self.assertTrue(site["browser_ua"])
         self.assertEqual(site["mode"], "listing")
         self.assertEqual(len(site["listing"]["categories"]), 16)
-        self.assertNotIn("detail_price_for_listing", site)
+        self.assertTrue(site["detail_price_for_listing"])
+        self.assertTrue(site["prefer_gross_price_metadata"])
         self.assertNotIn("detail_code_for_new_products", site)
-        self.assertNotIn("prefer_gross_price_metadata", site)
 
     def test_listing_ignores_ins_price_when_shop_selector_does_not_match(self):
         count, products = scraper.parse_listing(
@@ -214,17 +214,189 @@ class ListingParserTests(unittest.TestCase):
     def test_product_page_prefers_gross_price_metadata_over_pretax_metadata(self):
         result = scraper.extract(
             """<html><head>
+              <script type="application/ld+json">
+                {"@context":"https://schema.org","@type":"Product","offers":
+                  {"@type":"Offer","price":"927.796748","priceCurrency":"PLN"}}
+              </script>
               <meta property="product:pretax_price:amount" content="927.796748">
               <meta property="product:price:amount" content="1141.19">
               <meta property="product:price:currency" content="PLN">
               </head><body><h1>POWER HUNTER</h1></body></html>""",
-            {},
+            scraper.SITES["biegun"],
         )
 
         self.assertEqual(result["price"], 1141.19)
         self.assertEqual(result["currency"], "PLN")
 
+
+class BiegunDetailPriceTests(unittest.TestCase):
+    def test_listing_price_is_replaced_with_gross_detail_price(self):
+        response = SimpleNamespace(content="""<html><head>
+          <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Product","offers":
+              {"@type":"Offer","price":"927.796748","priceCurrency":"PLN"}}
+          </script>
+          <meta property="product:pretax_price:amount" content="927.796748">
+          <meta property="product:price:amount" content="1141.19">
+          <meta property="product:price:currency" content="PLN">
+          </head><body class="currency-pln tax-display-enabled">
+            <h1>POWER HUNTER</h1><span itemprop="price" content="1141.19">1 141,19 zł</span>
+          </body></html>""".encode("utf-8"))
+        product = {
+            "url": "https://fajerwerkibiegun.pl/pl/item",
+            "price": 927.8,
+            "currency": "PLN",
+        }
+
+        with patch.object(scraper, "get", return_value=response):
+            valid = scraper.enrich_listing_price(
+                "biegun", scraper.SITES["biegun"], product, Counter(), None
+            )
+
+        self.assertTrue(valid)
+        self.assertEqual(product["price"], 1141.19)
+        self.assertEqual(product["currency"], "PLN")
+
+    def test_listing_price_is_not_saved_when_detail_price_cannot_be_verified(self):
+        product = {
+            "url": "https://fajerwerkibiegun.pl/pl/item",
+            "price": 927.8,
+            "currency": "PLN",
+        }
+        stats = Counter()
+        scraper._tls.last_fail = "HTTP 503"
+        with patch.object(scraper, "get", return_value=None):
+            valid = scraper.enrich_listing_price(
+                "biegun", scraper.SITES["biegun"], product, stats, None
+            )
+
+        self.assertFalse(valid)
+        self.assertEqual(product["price"], 927.8)
+        self.assertEqual(stats["cena_szczegoly_blad"], 1)
+
+
+class ListingPageFailureTests(unittest.TestCase):
+    def test_mid_category_page_failure_is_reported_with_page_number_and_reason(self):
+        html = """<article class="product-miniature">
+          <h3 class="product-title"><a href="/item">Produkt</a></h3>
+          <span class="product-price">14,40 zł</span>
+        </article>"""
+        first_page = SimpleNamespace(
+            content=html.encode(),
+            url="https://fajerwerkibiegun.pl/pl/3-wyrzutnie?id_currency=1&id_country=14",
+        )
+
+        def get_page(url, *_args, **_kwargs):
+            if "page=2" in url:
+                scraper._tls.last_fail = "HTTP 503"
+                return None
+            return first_page
+
+        events = queue.Queue()
+        with patch.object(scraper, "get", side_effect=get_page):
+            scraper.listing_category(
+                "biegun",
+                scraper.SITES["biegun"],
+                scraper.SITES["biegun"]["listing"],
+                "https://fajerwerkibiegun.pl/pl/3-wyrzutnie",
+                events,
+                Counter(),
+            )
+
+        messages = [events.get_nowait(), events.get_nowait()]
+        self.assertEqual(messages[0][0], "items")
+        self.assertEqual(messages[1][0], "done")
+        self.assertIn("stronie 2", messages[1][5])
+        self.assertIn("HTTP 503", messages[1][5])
+
+
 class AccessHandlingTests(unittest.TestCase):
+    def test_proxy_required_request_never_falls_back_to_direct(self):
+        host = "fajerwerkibiegun.pl"
+        session = Mock()
+        stats = Counter()
+        with (
+            patch.object(scraper, "allowed", return_value=True),
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "session", session),
+            patch.object(scraper, "_proxies", []),
+            patch.object(scraper, "_proxy_hosts", {host}),
+        ):
+            result = scraper.get(
+                f"https://{host}/pl/items",
+                stats=stats,
+                retries=1,
+            )
+
+        self.assertIsNone(result)
+        session.return_value.get.assert_not_called()
+        self.assertEqual(stats["proxy_wymagane"], 1)
+
+    def test_proxy_required_robots_check_never_falls_back_to_direct(self):
+        host = "fajerwerkibiegun.pl"
+        session = Mock()
+        with (
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "session", session),
+            patch.object(scraper, "proxy_for", return_value=None),
+            patch.object(scraper, "_proxies", []),
+            patch.object(scraper, "_proxy_hosts", {host}),
+            patch.object(scraper, "_robots", {}),
+            patch.object(scraper, "_robots_note", {}),
+        ):
+            allowed = scraper.allowed(f"https://{host}/pl/items")
+
+        self.assertFalse(allowed)
+        session.return_value.get.assert_not_called()
+
+    def test_proxy_preflight_fails_when_no_https_proxy_is_available(self):
+        with (
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "_https_proxy_candidates", return_value=[]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "bez połączenia bezpośredniego"):
+                scraper.verify_site_proxy("biegun")
+
+    def test_scrape_aborts_before_creating_run_when_proxy_preflight_fails(self):
+        connection = Mock()
+        args = SimpleNamespace(
+            delay=0.5,
+            proxy=None,
+            proxy_file=None,
+            site="biegun",
+        )
+        with (
+            patch.object(scraper, "db", return_value=connection),
+            patch.object(scraper, "resolve_sites", return_value=["biegun"]),
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "_https_proxy_candidates", return_value=[]),
+            patch.object(scraper, "_proxy_hosts", set()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "bez połączenia bezpośredniego"):
+                scraper.cmd_scrape(args)
+
+        connection.execute.assert_not_called()
+        connection.close.assert_called_once()
+
+    def test_proxy_preflight_accepts_a_verified_socks_route(self):
+        proxy = "socks5://proxy.example:1080"
+        with (
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "_https_proxy_candidates", return_value=[proxy]),
+            patch.object(scraper, "_check_proxy", return_value=0.1) as check_proxy,
+            patch.object(scraper, "report_proxy") as report_proxy,
+        ):
+            scraper.verify_site_proxy("biegun")
+
+        check_proxy.assert_called_once_with(
+            proxy,
+            [(
+                scraper.SITES["biegun"]["base"].rstrip("/") + "/",
+                scraper.site_headers("biegun", scraper.SITES["biegun"]),
+            )],
+        )
+        report_proxy.assert_called_once_with(proxy, True)
+
     def test_direct_403_is_reported_as_failed_request(self):
         response = Mock(status_code=403, headers={"server": "Cloudflare"})
         session = Mock()

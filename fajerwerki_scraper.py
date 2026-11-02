@@ -58,7 +58,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -430,15 +430,12 @@ SITES = {
     "biegun": {
         "base": "https://fajerwerkibiegun.pl",
         "delay": 1, "max_parallel": 2, "use_proxy": True, "browser_ua": True,
-        "detail_code_for_new_products": True,
-        "prefer_gross_price_metadata": True,
-        "detail_price_for_listing": True,
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
             "name": "h3.product-title a", "link": "h3.product-title a@href",
-            "price": "span.product-price",
-            "code": '[itemprop="sku"]',
+            "price": ["span.product-price@content", "span.product-price"],
+            "code": ".product-reference a",
             "in_stock": "button.add-to-cart",
             "categories": [
                 "https://fajerwerkibiegun.pl/pl/3-wyrzutnie",
@@ -1169,32 +1166,6 @@ def throttle(host):
         time.sleep(slot - now)
 
 
-def _biegun_request_url(url):
-    parsed = urlsplit(url)
-    if (parsed.hostname or "").lower() != "fajerwerkibiegun.pl" or parsed.path.lower() == "/robots.txt":
-        return url
-    query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-             if key.lower() != "id_currency"]
-    query.append(("id_currency", "1"))
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
-
-
-def _biegun_response_currency(response, request_url):
-    requested = urlsplit(request_url)
-    if (requested.hostname or "").lower() != "fajerwerkibiegun.pl":
-        return "not-applicable"
-    parsed = urlsplit(getattr(response, "url", request_url))
-    if parsed.path.lower() == "/robots.txt":
-        return "not-applicable"
-    if parsed.path.lower().endswith((".xml", ".xml.gz")):
-        return "not-applicable"
-    body = re.search(rb"<body\b[^>]*>", response.content[:20000], re.I | re.S)
-    if not body:
-        return None
-    currency = re.search(rb"\bcurrency-([a-z]{3})\b", body.group(0), re.I)
-    return currency.group(1).decode("ascii").upper() if currency else None
-
-
 def get(url, stats=None, retries=3, cookies=None, headers=None):
     def bump(key):
         if stats is not None:
@@ -1206,7 +1177,6 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         log.debug("robots.txt zabrania: %s", url)
         _tls.last_fail = _robots_note.get(urlparse(url).netloc, "robots.txt zabrania tej ścieżki")
         return None
-    url = _biegun_request_url(url)
     host = urlparse(url).netloc
     url_scheme = urlparse(url).scheme
     last_err = "?"
@@ -1231,15 +1201,6 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             code = r.status_code
             if code == 200:
                 report_proxy(px, True)
-                currency = _biegun_response_currency(r, url)
-                if currency not in ("PLN", "not-applicable"):
-                    _tls.last_fail = (
-                        f"waluta Bieguna niepotwierdzona jako PLN "
-                        f"({currency or 'brak oznaczenia'})"
-                    )
-                    log.error("%s: %s; pomijam odpowiedź: %s", host, _tls.last_fail, url)
-                    bump("nieudane")
-                    return None
                 proxy_fails = 0
                 with _lock:
                     _host_proxy_fails[host] = 0
@@ -1585,114 +1546,9 @@ def from_selectors(soup, sel):
     }
 
 
-def product_page_code(soup):
-    sku = soup.find(attrs={"itemprop": "sku"})
-    sku_value = (sku.get("content") or sku.get_text(" ", strip=True)) if sku else None
-    if sku_value:
-        return sku_value
-    description = soup.find(attrs={"itemprop": "description"})
-    if description is None:
-        return None
-    match = re.search(
-        r"\b(?:index|indeks)\s+katalogowy\s*/\s*handlowy\s*[-:#]?\s*"
-        r"([A-Za-z0-9][A-Za-z0-9._/-]{2,20})",
-        description.get_text(" ", strip=True),
-        re.I,
-    )
-    return match.group(1) if match else None
-
-
-def enrich_listing_product_code(product, site, stats, is_new, headers=None):
-    if not is_new or product.get("code_raw") or not site.get("detail_code_for_new_products"):
-        return
-    if extract_code(product["name"], product["url"], product.get("hint"))[0]:
-        return
-    response = get(
-        product["url"],
-        stats,
-        cookies=site.get("cookies"),
-        headers=headers,
-    )
-    if response is not None:
-        product["code_raw"] = product_page_code(BeautifulSoup(response.content, "lxml"))
-
-
-def enrich_listing_product_price(product, site, stats, headers=None, con=None):
-    if not site.get("detail_price_for_listing"):
-        return True
-    listing_price = product.get("price")
-    if con is not None and listing_price is not None:
-        cached = con.execute(
-            "SELECT listing_price, gross_price, currency FROM biegun_price_cache WHERE url = ?",
-            (product["url"],),
-        ).fetchone()
-        if cached and cached[2] == "PLN" and abs(cached[0] - listing_price) <= 0.005:
-            product["price"] = cached[1]
-            product["currency"] = cached[2]
-            product["_gross_price_verified"] = True
-            stats["price_cache_hits"] += 1
-            return True
-    stats["price_detail_checks"] += 1
-    response = get(
-        product["url"],
-        stats,
-        cookies=site.get("cookies"),
-        headers=headers,
-    )
-    if response is None:
-        stats["price_detail_failures"] += 1
-        log.warning("nie można potwierdzić ceny brutto, pomijam produkt: %s", product["url"])
-        return False
-    soup = BeautifulSoup(response.content, "lxml")
-    raw_price = meta(soup, "product:price:amount", "og:price:amount")
-    if raw_price is None:
-        price_elements = soup.find_all(attrs={"itemprop": "price"})
-        if len(price_elements) == 1:
-            raw_price = price_elements[0].get("content") or price_elements[0].get_text(" ", strip=True)
-    currency = meta(soup, "product:price:currency", "og:price:currency", "priceCurrency")
-    price = parse_price(raw_price)
-    if price is None or currency != "PLN":
-        stats["price_detail_failures"] += 1
-        log.warning(
-            "brak potwierdzonej ceny brutto PLN, pomijam produkt (%s, waluta %s): %s",
-            price if price is not None else "brak ceny",
-            currency or "nieznana",
-            product["url"],
-        )
-        return False
-    details = extract(response.content, site) or {}
-    product["price"] = price
-    product["currency"] = currency
-    product["_gross_price_verified"] = True
-    if con is not None:
-        con.execute(
-            """INSERT OR REPLACE INTO biegun_price_cache
-               (url, listing_price, gross_price, currency) VALUES (?, ?, ?, ?)""",
-            (product["url"], listing_price, price, currency),
-        )
-    if details.get("availability"):
-        product["availability"] = details["availability"]
-    if not product.get("code_raw"):
-        product["code_raw"] = details.get("code_raw") or product_page_code(soup)
-    return True
-
-
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
     d = from_jsonld(soup) or {}
-    if site.get("prefer_gross_price_metadata"):
-        gross_price = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
-        if gross_price is None:
-            price_elements = soup.find_all(attrs={"itemprop": "price"})
-            if len(price_elements) == 1:
-                gross_price = parse_price(
-                    price_elements[0].get("content") or price_elements[0].get_text(" ", strip=True)
-                )
-        if gross_price is not None:
-            d["price"] = gross_price
-            d["currency"] = meta(soup, "product:price:currency", "og:price:currency") or d.get("currency") or "PLN"
-    if not d.get("code_raw"):
-        d["code_raw"] = product_page_code(soup)
     if d.get("price") is None:
         d["price"] = parse_price(meta(soup, "product:price:amount", "og:price:amount", "price"))
         d.setdefault("currency", meta(soup, "product:price:currency", "og:price:currency") or "PLN")
@@ -1823,8 +1679,6 @@ def db():
       id INTEGER PRIMARY KEY AUTOINCREMENT, site TEXT, started_at TEXT,
       completed_at TEXT, status TEXT, products_checked INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nonproduct(url TEXT PRIMARY KEY, ts TEXT);
-    CREATE TABLE IF NOT EXISTS biegun_price_cache(
-      url TEXT PRIMARY KEY, listing_price REAL, gross_price REAL NOT NULL, currency TEXT NOT NULL);
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(products)")}
     if "promo" not in cols:
@@ -1869,61 +1723,7 @@ _suspicious = []
 _active_scan_ids = {}
 
 
-def prime_biegun_price_cache(con):
-    rows = con.execute("""
-        SELECT current.id, current.url, current.price, previous.price
-        FROM prices current
-        JOIN products product ON product.url = current.url
-        JOIN prices previous ON previous.id = (
-            SELECT MAX(old.id) FROM prices old
-            WHERE old.url = current.url AND old.id < current.id
-        )
-        WHERE product.site = 'biegun'
-          AND current.scan_id = (
-              SELECT MAX(latest.scan_id)
-              FROM prices latest JOIN products p ON p.url = latest.url
-              WHERE p.site = 'biegun' AND latest.scan_id IS NOT NULL
-          )
-          AND current.price > 0 AND previous.price > current.price
-    """).fetchall()
-    tax_like = [
-        row for row in rows
-        if 1.22 <= row[3] / row[2] <= 1.24
-    ]
-    repaired = 0
-    if len(tax_like) >= 100 and len(tax_like) >= len(rows) * 0.9:
-        con.executemany(
-            """INSERT OR REPLACE INTO biegun_price_cache(url,listing_price,gross_price,currency)
-               SELECT ?, ?, ?, 'PLN'""",
-            ((url, listing_price, gross_price) for _, url, listing_price, gross_price in tax_like),
-        )
-        con.executemany("DELETE FROM prices WHERE id = ?", ((row_id,) for row_id, *_ in tax_like))
-        repaired = len(tax_like)
-        log.warning(
-            "[biegun] wykryto skan z cenami netto (%d produktów); przywrócono poprzednie ceny brutto",
-            repaired,
-        )
-
-    con.execute("""
-        INSERT OR IGNORE INTO biegun_price_cache(url, listing_price, gross_price, currency)
-        SELECT product.url, latest.price, latest.price, COALESCE(latest.currency, 'PLN')
-        FROM products product
-        JOIN prices latest ON latest.id = (
-            SELECT MAX(price.id) FROM prices price WHERE price.url = product.url
-        )
-        WHERE product.site = 'biegun' AND latest.price IS NOT NULL
-    """)
-    count = con.execute("SELECT COUNT(*) FROM biegun_price_cache").fetchone()[0]
-    con.commit()
-    log.info("[biegun] cache cen brutto: %d produktów, naprawiono wpisów: %d", count, repaired)
-
-
 def save(con, site_name, url, d):
-    if site_name == "biegun" and (
-        not d.get("_gross_price_verified") or d.get("currency") != "PLN"
-    ):
-        log.error("pomijam zapis niezweryfikowanej ceny Bieguna: %s", url)
-        return False
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     code, key = extract_code(d["name"], url, d.get("hint"), d.get("code_raw"))
     con.execute("""INSERT INTO products(url,site,name,code,code_key,first_seen,last_seen,promo)
@@ -2307,7 +2107,6 @@ def run_listing(con, names, args):
             if per_shop[n]:
                 tasks.append((n, per_shop[n].pop(0)))
     stats = {n: Counter() for n in names}
-    detail_headers = {n: site_headers(n, SITES[n]) for n in names}
     problems = {n: [] for n in names}
     cats_total = {n: len(SITES[n]["listing"]["categories"]) for n in names}
     q = queue.Queue()
@@ -2337,22 +2136,6 @@ def run_listing(con, names, args):
                 st = stats[n]
                 st["strony"] += 1
                 for d in items:
-                    if not enrich_listing_product_price(
-                        d, SITES[n], st, headers=detail_headers[n], con=con
-                    ):
-                        st["bez_potwierdzonej_ceny"] += 1
-                        continue
-                    if SITES[n].get("detail_code_for_new_products"):
-                        existing = con.execute(
-                            "SELECT 1 FROM products WHERE url = ?", (d["url"],)
-                        ).fetchone()
-                        enrich_listing_product_code(
-                            d,
-                            SITES[n],
-                            st,
-                            is_new=existing is None,
-                            headers=detail_headers[n],
-                        )
                     st["produkty"] += 1
                     if d["price"] is None:
                         st["bez_ceny"] += 1
@@ -2360,7 +2143,8 @@ def run_listing(con, names, args):
                         st["niedostepne"] += 1
                     if save(con, n, d["url"], d):
                         st["zmiany_w_historii"] += 1
-                        log.debug("zapisano: %s | %s | %s", d["name"], d["price"], d["availability"])
+                        log.debug("zapisano: %s | %s | %s",
+                                  d["name"], d["price"], d["availability"])
             elif msg:
                 _, n, cat, pages, total, reason = msg
                 if reason:
@@ -2374,11 +2158,9 @@ def run_listing(con, names, args):
                 last_beat = time.time()
                 for n in names:
                     st = stats[n]
-                    log.info("[%s] kategorie %d/%d | strony: %d | produkty: %d | zmiany: %d | "
-                             "ceny z cache: %d | karty cen: %d | pominięte ceny: %d | błędy: %d | %s",
+                    log.info("[%s] kategorie %d/%d | strony: %d | produkty: %d | zmiany: %d | błędy: %d | %s",
                              n, st["kategorie_gotowe"], cats_total[n], st["strony"], st["produkty"],
-                             st["zmiany_w_historii"], st["price_cache_hits"], st["price_detail_checks"],
-                             st["bez_potwierdzonej_ceny"], st["nieudane"], fmt_dur(time.time() - t0))
+                             st["zmiany_w_historii"], st["nieudane"], fmt_dur(time.time() - t0))
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
         con.commit()
@@ -2764,8 +2546,6 @@ def cmd_scrape(args):
     scan_completed = False
     try:
         names = resolve_sites(args)
-        if "biegun" in names:
-            prime_biegun_price_cache(con)
         started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for name in names:
             cursor = con.execute(

@@ -102,11 +102,11 @@ class ListingParserTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertIsNone(products[0]["price"])
 
-    def test_biegun_listing_reads_numeric_price_from_content_attribute(self):
+    def test_biegun_listing_prefers_visible_gross_price_over_net_content_attribute(self):
         count, products = scraper.parse_listing(
             """<article class="product-miniature">
               <h3 class="product-title"><a href="/item">Produkt</a></h3>
-              <span class="product-price" content="14.4">14,40 zł</span>
+              <span class="product-price" content="11.707317">14,40 zł</span>
               <ins><span class="unrelated-price">0,01 zł</span></ins>
             </article>""",
             "https://fajerwerkibiegun.pl/pl/",
@@ -115,6 +115,52 @@ class ListingParserTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertEqual(products[0]["price"], 14.4)
+
+    def test_response_tax_display_requires_explicit_tax_included_marker(self):
+        examples = (
+            (b'<body class="lang-pl tax-display-enabled">', "tax-included"),
+            (b'<body class="lang-pl tax-display-disabled">', "tax-excluded"),
+            (b"<body class=\"lang-pl\">", None),
+        )
+        for body, expected in examples:
+            with self.subTest(body=body):
+                response = SimpleNamespace(
+                    content=b"<html>" + body + b"</body></html>",
+                    url="https://fajerwerkibiegun.pl/pl/items?id_currency=1",
+                )
+                self.assertEqual(
+                    scraper._biegun_response_tax_display(
+                        response, "https://fajerwerkibiegun.pl/pl/items"
+                    ),
+                    expected,
+                )
+
+    def test_get_rejects_pln_biegun_response_when_prices_are_tax_excluded(self):
+        response = Mock(
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            content=b'<html><body class="lang-pl currency-pln tax-display-disabled"></body></html>',
+            url="https://fajerwerkibiegun.pl/pl/items?id_currency=1",
+        )
+        session = Mock()
+        session.return_value.get.return_value = response
+        stats = Counter()
+        with (
+            patch.object(scraper, "allowed", return_value=True),
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "throttle"),
+            patch.object(scraper, "session", session),
+            patch.object(scraper, "_proxies", []),
+            patch.object(scraper, "proxy_for", return_value=None),
+        ):
+            result = scraper.get(
+                "https://fajerwerkibiegun.pl/pl/items?id_currency=1",
+                stats=stats,
+                retries=1,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(stats["cena_brutto_niepotwierdzona"], 1)
 
     def test_biegun_listing_parses_prestashop_json_rendered_products(self):
         response = {
@@ -164,6 +210,19 @@ class ListingParserTests(unittest.TestCase):
         )
 
         self.assertEqual(result["price"], 149.0)
+
+    def test_product_page_prefers_gross_price_metadata_over_pretax_metadata(self):
+        result = scraper.extract(
+            """<html><head>
+              <meta property="product:pretax_price:amount" content="927.796748">
+              <meta property="product:price:amount" content="1141.19">
+              <meta property="product:price:currency" content="PLN">
+              </head><body><h1>POWER HUNTER</h1></body></html>""",
+            {},
+        )
+
+        self.assertEqual(result["price"], 1141.19)
+        self.assertEqual(result["currency"], "PLN")
 
 class AccessHandlingTests(unittest.TestCase):
     def test_direct_403_is_reported_as_failed_request(self):

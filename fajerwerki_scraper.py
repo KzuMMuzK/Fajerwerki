@@ -1607,20 +1607,30 @@ def from_selectors(soup, sel):
 
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
+
+    # 1) NAJWAŻNIEJSZE: cena z mikrodata (itemprop="price") – to co widzi klient
+    price_brutto = None
+    els = soup.find(attrs={"itemprop": "price"})  # zamiast find_all
+    if els:
+        price_brutto = parse_price(els.get("content") or els.get_text(" ", strip=True))
+    if len(els) == 1:
+        price_brutto = parse_price(els[0].get("content") or els[0].get_text(" ", strip=True))
+
+    # 2) Fallback: meta brutto (PrestaShop zawsze generuje)
+    if price_brutto is None:
+        price_brutto = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
+
+    # 3) JSON-LD (może mieć netto – używamy TYLKO gdy nie ma brutto wyżej)
     d = from_jsonld(soup) or {}
-    if d.get("price") is None:
+    if price_brutto is not None:
+        d["price"] = price_brutto
+    elif d.get("price") is None:
         d["price"] = parse_price(meta(soup, "product:price:amount", "og:price:amount", "price"))
-        d.setdefault("currency", meta(soup, "product:price:currency", "og:price:currency") or "PLN")
+
+    if not d.get("currency"):
+        d["currency"] = meta(soup, "product:price:currency", "og:price:currency") or "PLN"
     if not d.get("availability"):
         d["availability"] = norm_availability(meta(soup, "product:availability", "og:availability", "availability"))
-    if d.get("price") is None:
-        els = soup.find_all(attrs={"itemprop": "price"})
-        if len(els) == 1:
-            d["price"] = parse_price(els[0].get("content") or els[0].get_text(" ", strip=True))
-    if not d.get("availability"):
-        el = soup.find(attrs={"itemprop": "availability"})
-        if el is not None:
-            d["availability"] = norm_availability(el.get("href") or el.get("content") or el.get_text(" ", strip=True))
     if not d.get("name"):
         d["name"] = meta(soup, "og:title") or (soup.h1.get_text(strip=True) if soup.h1 else None)
     if site.get("selectors"):

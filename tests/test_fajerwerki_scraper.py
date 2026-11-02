@@ -90,7 +90,7 @@ class ListingParserTests(unittest.TestCase):
         count, products = scraper.parse_listing(
             """<article class="product-miniature">
               <h3 class="product-title"><a href="/item">Produkt</a></h3>
-              <span class="product-price" content="1980">459,69 zł</span>
+              <span class="product-price" content="3104.88">3 819,00 zł</span>
               <ins><span class="unrelated-price">0,01 zł</span></ins>
             </article>""",
             "https://fajerwerkibiegun.pl/pl/",
@@ -98,7 +98,7 @@ class ListingParserTests(unittest.TestCase):
         )
 
         self.assertEqual(count, 1)
-        self.assertEqual(products[0]["price"], 1980.0)
+        self.assertEqual(products[0]["price"], 3819.0)
 
     def test_listing_keeps_sale_status_unknown_without_a_promotion_marker(self):
         count, products = scraper.parse_listing(
@@ -144,35 +144,71 @@ class ListingParserTests(unittest.TestCase):
 
         self.assertEqual(result["code_raw"], "TW213")
 
-    def test_listing_code_enrichment_fetches_detail_only_without_existing_code(self):
+    def test_biegun_product_page_uses_gross_price_metadata(self):
+        result = scraper.extract(
+            """<html>
+              <meta property="product:pretax_price:amount" content="3104.88">
+              <meta property="product:price:amount" content="3819">
+              <meta property="product:price:currency" content="PLN">
+              <h1>THE APOCALYPSE 1+2</h1>
+            </html>""",
+            scraper.SITES["biegun"],
+        )
+
+        self.assertEqual(result["price"], 3819.0)
+
+    def test_new_biegun_product_fetches_catalog_code_when_listing_has_none(self):
         product = {
-            "name": "Produkt",
-            "url": "https://fajerwerkibiegun.pl/pl/produkt",
-            "hint": "Produkt",
+            "name": "Nowy produkt",
+            "url": "https://fajerwerkibiegun.pl/pl/nowy-produkt",
+            "hint": "Nowy produkt",
         }
-        response = SimpleNamespace(content="""<html><h1>Produkt</h1>
-          <span itemprop="sku">TW213</span>
-          <span itemprop="price" content="299.00"></span></html>""")
+        response = SimpleNamespace(content="""<html>
+          <div itemprop="description"><ul>
+            <li>Index katalogowy / handlowy - <b>TW213</b></li>
+          </ul></div></html>""")
         stats = Counter()
         headers = {"User-Agent": "test"}
 
         with patch.object(scraper, "get", return_value=response) as get:
             scraper.enrich_listing_product_code(
-                product, scraper.SITES["biegun"], stats, headers=headers
+                product,
+                scraper.SITES["biegun"],
+                stats,
+                is_new=True,
+                headers=headers,
             )
 
         self.assertEqual(product["code_raw"], "TW213")
         get.assert_called_once_with(product["url"], stats, cookies=None, headers=headers)
 
-    def test_listing_code_enrichment_reuses_existing_code_without_fetching(self):
-        product = {"name": "Produkt", "url": "https://example.test/produkt"}
+    def test_existing_biegun_product_does_not_fetch_detail_only_for_code(self):
+        product = {
+            "name": "Produkt",
+            "url": "https://fajerwerkibiegun.pl/pl/produkt",
+            "hint": "Produkt",
+        }
 
         with patch.object(scraper, "get") as get:
             scraper.enrich_listing_product_code(
-                product, scraper.SITES["biegun"], Counter(), existing_code="TW213"
+                product, scraper.SITES["biegun"], Counter(), is_new=False
             )
 
-        self.assertEqual(product["code_raw"], "TW213")
+        self.assertNotIn("code_raw", product)
+        get.assert_not_called()
+
+    def test_new_biegun_product_with_code_in_url_does_not_fetch_detail(self):
+        product = {
+            "name": "Produkt",
+            "url": "https://fajerwerkibiegun.pl/pl/produkt-tw213.html",
+            "hint": "Produkt",
+        }
+
+        with patch.object(scraper, "get") as get:
+            scraper.enrich_listing_product_code(
+                product, scraper.SITES["biegun"], Counter(), is_new=True
+            )
+
         get.assert_not_called()
 
 

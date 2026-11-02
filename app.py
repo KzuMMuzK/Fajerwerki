@@ -285,6 +285,37 @@ def _coupon_code_candidates(text):
     return candidates[:20]
 
 
+def _coupon_percent(discount):
+    matches = re.findall(r"(?<![\d.,])(\d{1,2}(?:[.,]\d+)?)\s*%", str(discount or ""))
+    if len(matches) != 1:
+        return None
+    try:
+        percent = float(matches[0].replace(",", "."))
+    except ValueError:
+        return None
+    return percent if 0 < percent < 100 else None
+
+
+def _coupon_amount(discount):
+    text = str(discount or "")
+    if "%" in text:
+        return None
+    matches = re.findall(r"(?<![\d.,])(\d+(?:[.,]\d{1,2})?)\s*(?:zł|pln)\b", text, re.I)
+    if len(matches) != 1:
+        return None
+    try:
+        amount = float(matches[0].replace(",", "."))
+    except ValueError:
+        return None
+    return amount if amount > 0 else None
+
+
+def _coupon_shop_key(shop):
+    parts = re.findall(r"[a-z0-9]+", fold(str(shop or "")))
+    ignored = {"fajerwerki", "fajerwerk", "sklep", "hurtownia", "pl"}
+    return "".join(part for part in parts if part not in ignored)
+
+
 def _coupon_rows(data, active_only=False):
     today = datetime.now(timezone.utc).date().isoformat()
     rows = []
@@ -292,7 +323,18 @@ def _coupon_rows(data, active_only=False):
         expired = bool(coupon.get("valid_until") and coupon["valid_until"] < today)
         if active_only and (not coupon.get("active", True) or expired):
             continue
-        rows.append({**coupon, "id": coupon_id, "expired": expired})
+        percent = _coupon_percent(coupon.get("discount"))
+        amount = _coupon_amount(coupon.get("discount")) if percent is None else None
+        rows.append({
+            **coupon,
+            "id": coupon_id,
+            "expired": expired,
+            "percent": percent,
+            "amount": amount,
+            "discount_kind": "percent" if percent is not None else "amount" if amount is not None else None,
+            "discount_value": percent if percent is not None else amount,
+            "shop_key": _coupon_shop_key(coupon.get("shop")),
+        })
     return sorted(rows, key=lambda row: (row["expired"], row.get("valid_until") or "9999-12-31",
                                          row.get("created", "")), reverse=False)
 
@@ -998,8 +1040,14 @@ def common_ctx(c):
     adm = is_admin(g.user)
     shops = c.execute("SELECT site, COUNT(*) n FROM items" + ("" if adm else " WHERE hidden = 0") + " GROUP BY site ORDER BY site").fetchall()
     meta = dict(c.execute("SELECT k, v FROM meta").fetchall())
+    coupons = store.read(lambda data: _coupon_rows(data, active_only=True))
+    coupons_by_shop = {}
+    for coupon in coupons:
+        if coupon["discount_value"] is not None and coupon["shop_key"]:
+            coupons_by_shop.setdefault(coupon["shop_key"], []).append(coupon)
     return {"shops": shops, "last_seen": meta.get("last_seen"), "has_codes": meta.get("has_codes") == "1",
-            "refresh_error": _state["error"]}
+            "refresh_error": _state["error"], "coupons_by_shop": coupons_by_shop,
+            "coupon_shop_key": _coupon_shop_key}
 
 
 @app.route("/")
@@ -1746,6 +1794,7 @@ details{margin-top:8px}summary{color:var(--mut);cursor:pointer;font-size:14px}.f
 @media(prefers-color-scheme:dark){.down{background:#0b3d2a;color:#75e0a7}.up{background:#4a1a15;color:#fda29b}}
 .best{background:#fef0c7;color:#93370d;font-size:12px;font-weight:700;border-radius:6px;padding:1px 7px}.mini{font-size:13px;color:var(--mut);margin-left:auto;text-decoration:underline}
 .qa{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;align-items:center}.qa form{margin:0}.pager{display:flex;justify-content:space-between;align-items:center;margin:14px 0}.pager a{background:var(--chip);padding:9px 14px;border-radius:10px;font-weight:600}.pager .off{opacity:.35}
+.coupon-options{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;margin-top:8px;padding-top:7px;border-top:1px solid var(--line)}.coupon-choice{display:flex;align-items:center;gap:5px;font-size:13px}.coupon-choice input{width:auto}.coupon-result{display:inline-flex;align-items:baseline;gap:7px}.coupon-result-note{flex-basis:100%}
 .chart{width:100%;height:auto;margin:6px 0}.chart .line{fill:none;stroke:var(--accent);stroke-width:2}.chart .dot{fill:var(--accent)}.chart .ax{font-size:10px;fill:var(--mut)}.chart .oos{fill:var(--no);opacity:.18}
 table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:6px 4px;border-bottom:1px solid var(--line);text-align:left}h1{font-size:19px;margin:14px 0 4px}h2{font-size:16px;margin:18px 0 6px}
 .err{background:#fee4e2;color:#7a271a;border-radius:10px;padding:8px 10px;margin:8px 0;font-size:14px}.okm{background:#d1fadf;color:#05603a;border-radius:10px;padding:8px 10px;margin:8px 0;font-size:14px}
@@ -1776,6 +1825,79 @@ TEMPLATES = {
 {% block body %}{% endblock %}
 {% if last_seen %}<p class="note">Dane z: {{ last_seen|dt('%d.%m.%Y %H:%M') }}. Kody produktów są wyciągane z nazw i mogą się mylić - przed zakupem sprawdź, czy to ten sam model.</p>{% endif %}
 </div>
+<script>
+(function(){
+  const storageKey = 'fajerwerki-coupons-v1';
+  let selected = {};
+  let storageError = false;
+  try { selected = JSON.parse(localStorage.getItem(storageKey) || '{}'); }
+  catch (_) { storageError = true; }
+  if (!selected || typeof selected !== 'object' || Array.isArray(selected)){
+    selected = {};
+    storageError = true;
+  }
+
+  function formatPrice(value){
+    return new Intl.NumberFormat('pl-PL', { style: 'currency', currency: 'PLN' }).format(value);
+  }
+  function update(){
+    document.querySelectorAll('[data-coupon-shop-group]').forEach(card => {
+      const shop = card.dataset.couponShopGroup;
+      const choices = [...card.querySelectorAll('[data-store-coupon]')];
+      choices.forEach(input => { input.checked = !input.disabled && selected[shop] === input.dataset.couponId; });
+      const active = choices.find(input => input.checked);
+      const base = Number(card.dataset.couponBasePrice);
+      const basePrice = card.querySelector('[data-coupon-base]');
+      const original = card.querySelector('[data-coupon-original]');
+      const discounted = card.querySelector('[data-coupon-discounted]');
+      const result = card.querySelector('[data-coupon-result]');
+      if (active && Number.isFinite(base) && original && discounted && result){
+        const discount = Number(active.dataset.discountValue);
+        const price = active.dataset.discountKind === 'percent'
+          ? Math.round(base * (1 - discount / 100) * 100) / 100
+          : Math.max(0, Math.round((base - discount) * 100) / 100);
+        if (basePrice) basePrice.hidden = true;
+        original.textContent = formatPrice(base);
+        discounted.textContent = formatPrice(price);
+        result.hidden = false;
+        result.dataset.activeCode = active.dataset.couponCode;
+        result.setAttribute('aria-label', `Szacunkowa cena po kodzie ${active.dataset.couponCode}: ${formatPrice(price)}`);
+      } else if (result) {
+        if (basePrice) basePrice.hidden = false;
+        result.hidden = true;
+        result.dataset.activeCode = '';
+      }
+      const note = card.querySelector('[data-coupon-result-note]');
+      if (note) note.hidden = !active;
+      const storageWarning = card.querySelector('[data-coupon-storage-error]');
+      if (storageWarning) storageWarning.hidden = !storageError;
+    });
+  }
+  document.addEventListener('change', event => {
+    const input = event.target.closest('[data-store-coupon]');
+    if (!input) return;
+    const shop = input.dataset.shop;
+    if (input.checked) selected[shop] = input.dataset.couponId;
+    else if (selected[shop] === input.dataset.couponId) delete selected[shop];
+    try { localStorage.setItem(storageKey, JSON.stringify(selected)); storageError = false; }
+    catch (_) { storageError = true; }
+    update();
+  });
+  document.addEventListener('click', async event => {
+    const button = event.target.closest('[data-copy-coupon]');
+    if (!button) return;
+    try {
+      await navigator.clipboard.writeText(button.dataset.couponCode);
+      button.textContent = 'Skopiowano';
+      setTimeout(() => { button.textContent = 'Kopiuj kod'; }, 1400);
+    } catch (_) {
+      button.textContent = button.dataset.couponCode;
+    }
+  });
+  document.addEventListener('fajerwerki:products-updated', update);
+  update();
+})();
+</script>
 <script>
 (function(){
   if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
@@ -2363,13 +2485,16 @@ TEMPLATES = {
 </script>
 </body></html>""",
 
-    "card.html": """{% macro card(it) %}<div class="card{{ ' dim' if it.hidden }}"><div class="top"><span class="shop">{{ it.site }}</span>{% if it.code %}<span class="code">{{ it.code }}</span>{% endif %}{% if it.promo %}<span class="badge r">promocja wykryta</span>{% endif %}
+    "coupon_controls.html": """{% macro coupon_controls(it) %}{% set shop_key = coupon_shop_key(it.site) %}{% set coupon_options = coupons_by_shop.get(shop_key, []) if shop_key else [] %}{% if coupon_options and it.price is not none %}<div class="coupon-options"><span class="note">Kod rabatowy dla {{ it.site }}:</span>{% for coupon in coupon_options %}<label class="coupon-choice"><input type="checkbox" data-store-coupon data-shop="{{ shop_key }}" data-coupon-id="{{ coupon.id }}" data-coupon-code="{{ coupon.code }}" data-discount-kind="{{ coupon.discount_kind }}" data-discount-value="{{ coupon.discount_value }}" title="{{ coupon.terms or '' }}" {% if coupon.excludes_promos and it.promo %}disabled{% endif %}> Uwzględnij {{ coupon.code }} (−{{ coupon.percent ~ '%' if coupon.discount_kind=='percent' else coupon.amount ~ ' zł' }}){% if coupon.excludes_promos and it.promo %} — wyklucza wykrytą promocję{% endif %}</label><button type="button" class="sec sm" data-copy-coupon data-coupon-code="{{ coupon.code }}">Kopiuj kod</button>{% endfor %}<div class="coupon-result-note note" data-coupon-result-note hidden>Cena jest szacunkowa dla jednej sztuki; sprawdź warunki kodu i wklej go w sklepie.</div><div class="coupon-storage-error note" data-coupon-storage-error aria-live="polite" hidden>Nie udało się zapamiętać wyboru kuponu; pozostanie aktywny tylko do odświeżenia strony.</div></div>{% endif %}{% endmacro %}""",
+
+    "card.html": """{% from 'coupon_controls.html' import coupon_controls with context %}{% macro card(it) %}{% set shop_key = coupon_shop_key(it.site) %}{% set coupon_options = coupons_by_shop.get(shop_key, []) if shop_key else [] %}<div class="card{{ ' dim' if it.hidden }}"{% if coupon_options and it.price is not none %} data-coupon-shop-group="{{ shop_key }}" data-coupon-base-price="{{ it.price }}"{% endif %}><div class="top"><span class="shop">{{ it.site }}</span>{% if it.code %}<span class="code">{{ it.code }}</span>{% endif %}{% if it.promo %}<span class="badge r">promocja wykryta</span>{% endif %}
 {% if it.rank is not none %}<span class="code">przypięty</span>{% endif %}{% if it.hidden %}<span class="code">ukryty</span>{% endif %}{% if it.note %}<span class="best">{{ it.note }}</span>{% endif %}
 {% if is_admin and it.edited %}<span class="code">edytowany</span>{% endif %}<span class="dot {{ 'ok' if it.avail=='in_stock' }}" title="{{ 'dostępny' if it.avail=='in_stock' else 'niedostępny' }}"></span></div>
-<a class="name" href="{{ url_for('product', u=it.url) }}">{{ it.name }}</a><div class="row"><span class="price">{{ it.price|pln }}</span>
+<a class="name" href="{{ url_for('product', u=it.url) }}">{{ it.name }}</a><div class="row"><span class="price" data-coupon-base>{{ it.price|pln }}</span>{% if coupon_options and it.price is not none %}<span class="coupon-result" data-coupon-result hidden><span class="old" data-coupon-original></span><b class="price" data-coupon-discounted></b></span>{% endif %}
 {% if it.prev_price and it.price is not none and it.price != it.prev_price %}<span class="old">{{ it.prev_price|pln }}</span><span class="{{ 'down' if it.price < it.prev_price else 'up' }}">{{ '−' if it.price < it.prev_price else '+' }}{{ it.drop_pct|pct }}</span>{% endif %}
 {% if it.key_shops and it.key_shops > 1 %}{% if it.avail=='in_stock' and it.price is not none and it.price == it.key_min %}<span class="best">najtaniej</span>{% endif %}<a class="mini" href="{{ url_for('compare', k=it.code_key) }}">{{ it.key_shops|shops }}</a>{% endif %}
 </div><div class="note">zmiana: {{ it.changed_at|dt }}</div>
+{{ coupon_controls(it) }}
 {% if is_admin %}<form method="post" action="{{ url_for('admin_quick') }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="u" value="{{ it.url }}"><input type="hidden" name="back" value="{{ request.full_path.rstrip('?') }}">
 <button class="sec sm" name="act" value="{{ 'unpin' if it.rank is not none else 'pin' }}">{{ 'Odepnij' if it.rank is not none else 'Przypnij na górze' }}</button>
 <button class="sec sm" name="act" value="{{ 'unhide' if it.hidden else 'hide' }}">{{ 'Pokaż' if it.hidden else 'Ukryj' }}</button><a class="btn sm sec" href="{{ url_for('admin_product', u=it.url) }}">Edytuj</a></form>{% endif %}</div>{% endmacro %}""",
@@ -2426,6 +2551,7 @@ TEMPLATES = {
       const currentResults = document.getElementById('product-results');
       if (!next || !currentResults) throw new Error('Nieprawidłowa odpowiedź serwera.');
       currentResults.replaceWith(next);
+      document.dispatchEvent(new Event('fajerwerki:products-updated'));
       const filterQuery = document.querySelector('.f input[name="q"]');
       if (filterQuery) filterQuery.value = input.value;
       url.searchParams.delete('_partial');
@@ -2443,9 +2569,10 @@ TEMPLATES = {
 {% for it in items %}{{ card(it) }}{% else %}<div class="card">Brak wyników.</div>{% endfor %}
 <div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1) if page<pages else '#' }}">dalej →</a></div></div>""",
 
-    "product.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}
+    "product.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}{% from 'coupon_controls.html' import coupon_controls with context %}
 {% block body %}<h1>{{ it.name }}</h1><div class="top"><span class="shop">{{ it.site }}</span>{% if it.code %}<span class="code">{{ it.code }}</span>{% endif %}<span class="note">{{ 'dostępny' if it.avail=='in_stock' else 'niedostępny' }}</span>{% if it.note %}<span class="best">{{ it.note }}</span>{% endif %}</div>
-<div class="stats"><div class="stat"><span class="note">teraz</span><b>{{ it.price|pln }}</b></div><div class="stat"><span class="note">najniżej</span><b>{{ it.min_price|pln }}</b></div><div class="stat"><span class="note">najwyżej</span><b>{{ it.max_price|pln }}</b></div></div>
+{% set shop_key = coupon_shop_key(it.site) %}{% set coupon_options = coupons_by_shop.get(shop_key, []) if shop_key else [] %}
+<div class="stats"><div class="stat"{% if coupon_options and it.price is not none %} data-coupon-shop-group="{{ shop_key }}" data-coupon-base-price="{{ it.price }}"{% endif %}><span class="note">teraz</span><b data-coupon-base>{{ it.price|pln }}</b>{% if coupon_options and it.price is not none %}<span class="coupon-result" data-coupon-result hidden><span class="old" data-coupon-original></span><b class="price" data-coupon-discounted></b></span>{{ coupon_controls(it) }}{% endif %}</div><div class="stat"><span class="note">najniżej</span><b>{{ it.min_price|pln }}</b></div><div class="stat"><span class="note">najwyżej</span><b>{{ it.max_price|pln }}</b></div></div>
 {{ chart|safe }}{% if not chart %}<p class="note">Brak historii cen.</p>{% endif %}<p><a class="btn" href="{{ it.url }}" target="_blank" rel="noopener noreferrer">Otwórz w sklepie</a>
 {% if is_admin %} <a class="btn sec" href="{{ url_for('admin_product', u=it.url) }}">Edytuj</a>{% endif %}</p>
 {% if is_admin and it.edited %}<div class="note">Ten produkt ma ręczne zmiany (cena ze scrapera: {{ it.o_price|pln }}).</div>{% endif %}

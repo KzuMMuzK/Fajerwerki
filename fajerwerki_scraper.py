@@ -1950,11 +1950,23 @@ def parse_listing(html, page_url, cfg):
         href = _pick(tile, cfg["link"]) or _pick(tile, cfg.get("link_fallback"))
         if not name or not href:
             continue
-        raw_price = _pick_price(tile, cfg.get("price"))
-        if raw_price:
-            for pat in cfg.get("price_strip", []):
-                raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
-        price = parse_price(raw_price)
+            
+        # NOWOŚĆ: Wymuś cenę brutto z itemprop="price", jeśli jest w kafelku
+        price_brutto = None
+        el_micro = tile.find(attrs={"itemprop": "price"})
+        if el_micro is not None:
+            price_brutto = parse_price(el_micro.get("content") or el_micro.get_text(" ", strip=True))
+
+        if price_brutto is not None:
+            price = price_brutto
+            raw_price = str(price_brutto) # tylko do logów/bezpieczeństwa
+        else:
+            raw_price = _pick_price(tile, cfg.get("price"))
+            if raw_price:
+                for pat in cfg.get("price_strip", []):
+                    raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
+            price = parse_price(raw_price)
+
         raw_text = tile.get_text(" ", strip=True)
         text = raw_text.lower()
         out = False
@@ -1968,8 +1980,7 @@ def parse_listing(html, page_url, cfg):
             "name": name.strip(), "currency": cfg.get("currency", "PLN"),
             "hint": raw_text[:400], "code_raw": _pick(tile, cfg.get("code")),
             "availability": "out_of_stock" if out else "in_stock",
-            "price": price,
-            "promo": promo_from_markup(tile, price, cfg.get("promo")),
+            "price": price, "promo": promo_from_markup(tile, price, cfg.get("promo")),
             "url": urljoin(page_url, href.strip()),
         })
     return len(tiles), products

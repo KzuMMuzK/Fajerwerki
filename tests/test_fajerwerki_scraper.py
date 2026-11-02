@@ -184,6 +184,25 @@ class ListingParserTests(unittest.TestCase):
 
         self.assertEqual(result["price"], 3819.0)
 
+    def test_biegun_product_page_prefers_gross_metadata_over_net_jsonld(self):
+        result = scraper.extract(
+            """<html><head>
+              <script type="application/ld+json">
+                {"@type":"Product","name":"THE APOCALYPSE",
+                 "offers":{"@type":"Offer","price":"3104.88","priceCurrency":"PLN"}}
+              </script>
+              <meta property="product:pretax_price:amount" content="3104.88">
+              <meta property="product:price:amount" content="3819">
+              <meta property="product:price:currency" content="PLN">
+              </head><body>
+                <span itemprop="price" class="product-price" content="3819">3 819,00 zł</span>
+              </body></html>""",
+            scraper.SITES["biegun"],
+        )
+
+        self.assertEqual(result["price"], 3819.0)
+        self.assertEqual(result["currency"], "PLN")
+
     def test_new_biegun_product_fetches_catalog_code_when_listing_has_none(self):
         product = {
             "name": "Nowy produkt",

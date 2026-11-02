@@ -134,7 +134,7 @@ class ListingParserTests(unittest.TestCase):
                     expected,
                 )
 
-    def test_get_rejects_pln_biegun_response_when_prices_are_tax_excluded(self):
+    def test_get_keeps_biegun_category_response_when_tax_display_is_excluded(self):
         response = Mock(
             status_code=200,
             headers={"Content-Type": "text/html"},
@@ -158,8 +158,9 @@ class ListingParserTests(unittest.TestCase):
                 retries=1,
             )
 
-        self.assertIsNone(result)
-        self.assertEqual(stats["cena_brutto_niepotwierdzona"], 1)
+        self.assertIs(result, response)
+        self.assertEqual(stats["pobrane_ok"], 1)
+        self.assertEqual(stats["cena_brutto_niepotwierdzona"], 0)
 
     def test_biegun_listing_parses_prestashop_json_rendered_products(self):
         response = {
@@ -253,7 +254,7 @@ class BiegunDetailPriceTests(unittest.TestCase):
           <meta property="product:pretax_price:amount" content="927.796748">
           <meta property="product:price:amount" content="1141.19">
           <meta property="product:price:currency" content="PLN">
-          </head><body class="currency-pln tax-display-enabled">
+          </head><body class="currency-pln tax-display-disabled">
             <h1>POWER HUNTER</h1><span itemprop="price" content="1141.19">1 141,19 zł</span>
           </body></html>""".encode("utf-8"))
         product = {
@@ -271,7 +272,7 @@ class BiegunDetailPriceTests(unittest.TestCase):
         self.assertEqual(product["price"], 1141.19)
         self.assertEqual(product["currency"], "PLN")
 
-    def test_listing_price_is_not_saved_from_unverified_jsonld_price(self):
+    def test_unverified_detail_price_keeps_product_but_drops_candidate_price(self):
         response = SimpleNamespace(content="""<html><head>
           <script type="application/ld+json">
             {"@context":"https://schema.org","@type":"Product","offers":
@@ -291,8 +292,26 @@ class BiegunDetailPriceTests(unittest.TestCase):
                 "biegun", scraper.SITES["biegun"], product, Counter(), None
             )
 
-        self.assertFalse(valid)
-        self.assertEqual(product["price"], 927.8)
+        self.assertTrue(valid)
+        self.assertIsNone(product["price"])
+        self.assertIsNone(product["currency"])
+
+    def test_tax_excluded_itemprop_is_not_treated_as_gross_price(self):
+        result = scraper.extract(
+            """<html><head>
+              <script type="application/ld+json">
+                {"@context":"https://schema.org","@type":"Product","offers":
+                  {"@type":"Offer","price":"927.796748","priceCurrency":"PLN"}}
+              </script>
+              </head><body class="currency-pln tax-display-disabled">
+                <h1>POWER HUNTER</h1>
+                <span itemprop="price" content="927.796748">927,80 zł</span>
+              </body></html>""",
+            scraper.SITES["biegun"],
+        )
+
+        self.assertIsNone(result["price"])
+        self.assertFalse(result.get("_gross_price_confirmed", False))
 
     def test_listing_price_is_not_saved_when_detail_price_cannot_be_verified(self):
         product = {
@@ -307,8 +326,9 @@ class BiegunDetailPriceTests(unittest.TestCase):
                 "biegun", scraper.SITES["biegun"], product, stats, None
             )
 
-        self.assertFalse(valid)
-        self.assertEqual(product["price"], 927.8)
+        self.assertTrue(valid)
+        self.assertIsNone(product["price"])
+        self.assertIsNone(product["currency"])
         self.assertEqual(stats["cena_szczegoly_blad"], 1)
 
 
@@ -463,11 +483,12 @@ class BiegunCurrencyTests(unittest.TestCase):
             "PLN",
         )
 
-    def test_get_rejects_non_pln_and_unmarked_biegun_responses(self):
-        for currency_markup in (
-            b'<html><body class="country-fr currency-eur"></body></html>',
-            b"<html><body></body></html>",
-        ):
+    def test_get_rejects_explicit_non_pln_but_keeps_unmarked_biegun_response(self):
+        examples = (
+            (b'<html><body class="country-fr currency-eur"></body></html>', False),
+            (b"<html><body></body></html>", True),
+        )
+        for currency_markup, expected_success in examples:
             with self.subTest(markup=currency_markup):
                 response = Mock(
                     status_code=200,
@@ -492,8 +513,8 @@ class BiegunCurrencyTests(unittest.TestCase):
                         retries=1,
                     )
 
-                self.assertIsNone(result)
-                self.assertEqual(stats["waluta_niepotwierdzona"], 1)
+                self.assertEqual(result is response, expected_success)
+                self.assertEqual(stats["waluta_niepotwierdzona"], 0 if expected_success else 1)
                 requested_url = session.return_value.get.call_args.args[0]
                 self.assertEqual(
                     parse_qs(urlparse(requested_url).query),
@@ -711,6 +732,34 @@ class StoreApiTests(unittest.TestCase):
 
 
 class ScanHistoryTests(unittest.TestCase):
+    def test_unverified_price_still_saves_product_without_price_history(self):
+        connection = sqlite3.connect(":memory:")
+        connection.executescript("""
+            CREATE TABLE products(
+                url TEXT PRIMARY KEY,site TEXT,name TEXT,code TEXT,code_key TEXT,
+                first_seen TEXT,last_seen TEXT,promo INTEGER
+            );
+            CREATE TABLE prices(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,url TEXT,ts TEXT,
+                price REAL,currency TEXT,availability TEXT
+            );
+        """)
+        try:
+            scraper.save(connection, "biegun", "https://fajerwerkibiegun.pl/pl/item", {
+                "name": "POWER HUNTER",
+                "price": None,
+                "currency": None,
+                "_skip_price_save": True,
+            })
+
+            self.assertEqual(
+                connection.execute("SELECT name FROM products").fetchone()[0],
+                "POWER HUNTER",
+            )
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM prices").fetchone()[0], 0)
+        finally:
+            connection.close()
+
     def test_database_migrates_scan_tracking_and_saves_scan_ids(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "prices.db")

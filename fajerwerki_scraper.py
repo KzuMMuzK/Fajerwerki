@@ -58,7 +58,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -1167,6 +1167,32 @@ def throttle(host):
         time.sleep(slot - now)
 
 
+def _biegun_request_url(url):
+    parsed = urlsplit(url)
+    if (parsed.hostname or "").lower() != "fajerwerkibiegun.pl" or parsed.path.lower() == "/robots.txt":
+        return url
+    query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+             if key.lower() != "id_currency"]
+    query.append(("id_currency", "1"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
+def _biegun_response_currency(response, request_url):
+    requested = urlsplit(request_url)
+    if (requested.hostname or "").lower() != "fajerwerkibiegun.pl":
+        return "not-applicable"
+    parsed = urlsplit(getattr(response, "url", request_url))
+    if parsed.path.lower() == "/robots.txt":
+        return "not-applicable"
+    if parsed.path.lower().endswith((".xml", ".xml.gz")):
+        return "not-applicable"
+    body = re.search(rb"<body\b[^>]*>", response.content[:20000], re.I | re.S)
+    if not body:
+        return None
+    currency = re.search(rb"\bcurrency-([a-z]{3})\b", body.group(0), re.I)
+    return currency.group(1).decode("ascii").upper() if currency else None
+
+
 def get(url, stats=None, retries=3, cookies=None, headers=None):
     def bump(key):
         if stats is not None:
@@ -1178,6 +1204,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         log.debug("robots.txt zabrania: %s", url)
         _tls.last_fail = _robots_note.get(urlparse(url).netloc, "robots.txt zabrania tej ścieżki")
         return None
+    url = _biegun_request_url(url)
     host = urlparse(url).netloc
     url_scheme = urlparse(url).scheme
     last_err = "?"
@@ -1202,6 +1229,15 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
             code = r.status_code
             if code == 200:
                 report_proxy(px, True)
+                currency = _biegun_response_currency(r, url)
+                if currency not in ("PLN", "not-applicable"):
+                    _tls.last_fail = (
+                        f"waluta Bieguna niepotwierdzona jako PLN "
+                        f"({currency or 'brak oznaczenia'})"
+                    )
+                    log.error("%s: %s; pomijam odpowiedź: %s", host, _tls.last_fail, url)
+                    bump("nieudane")
+                    return None
                 proxy_fails = 0
                 with _lock:
                     _host_proxy_fails[host] = 0
@@ -1894,8 +1930,20 @@ def has(tile, css):
     return tile.select_one(css) is not None or sv.match(css, tile)
 
 
+def listing_soup(content):
+    text = content.decode("utf-8-sig", "replace") if isinstance(content, bytes) else str(content)
+    if text.lstrip().startswith("{"):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("rendered_products"), str):
+            return BeautifulSoup(payload["rendered_products"], "lxml")
+    return BeautifulSoup(content, "lxml")
+
+
 def parse_listing(html, page_url, cfg):
-    soup = BeautifulSoup(html, "lxml")
+    soup = listing_soup(html)
     sel = cfg["item"]
     tiles = []
     for one in ([sel] if isinstance(sel, str) else sel):

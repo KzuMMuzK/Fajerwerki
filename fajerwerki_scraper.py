@@ -58,7 +58,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -1166,6 +1166,54 @@ def throttle(host):
         time.sleep(slot - now)
 
 
+def _biegun_request_url(url):
+    parsed = urlsplit(url)
+    if (parsed.hostname or "").lower() != "fajerwerkibiegun.pl" or parsed.path.lower() == "/robots.txt":
+        return url
+    if parsed.path.lower().endswith((".xml", ".xml.gz")):
+        return url
+    query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+             if key.lower() != "id_currency"]
+    query.append(("id_currency", "1"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
+def _biegun_response_currency(response, request_url):
+    requested = urlsplit(request_url)
+    if (requested.hostname or "").lower() != "fajerwerkibiegun.pl":
+        return "not-applicable"
+    parsed = urlsplit(getattr(response, "url", request_url))
+    if parsed.path.lower() == "/robots.txt" or parsed.path.lower().endswith((".xml", ".xml.gz")):
+        return "not-applicable"
+    content = response.content[:200000]
+    body = re.search(rb"<body\b[^>]*>", content, re.I | re.S)
+    if body:
+        currency = re.search(rb"\bcurrency-([a-z]{3})\b", body.group(0), re.I)
+        if currency:
+            return currency.group(1).decode("ascii").upper()
+    currencies = set()
+    for tag in re.finditer(rb"<(?:meta|link)\b[^>]*>", content, re.I | re.S):
+        raw_tag = tag.group(0)
+        if not re.search(
+            rb"""\b(?:itemprop=["']priceCurrency["']|"""
+            rb"""property=["'](?:product|og):price:currency["']|"""
+            rb"""name=["']priceCurrency["'])""",
+            raw_tag,
+            re.I,
+        ):
+            continue
+        currency = re.search(rb"""\bcontent=["']([A-Z]{3})["']""", raw_tag, re.I)
+        if currency:
+            currencies.add(currency.group(1).decode("ascii").upper())
+    for currency in re.finditer(
+        rb"""["'](?:priceCurrency|currency_code)["']\s*:\s*["']([A-Z]{3})["']""",
+        content,
+        re.I,
+    ):
+        currencies.add(currency.group(1).decode("ascii").upper())
+    return next(iter(currencies)) if len(currencies) == 1 else None
+
+
 def get(url, stats=None, retries=3, cookies=None, headers=None):
     def bump(key):
         if stats is not None:
@@ -1177,6 +1225,7 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         log.debug("robots.txt zabrania: %s", url)
         _tls.last_fail = _robots_note.get(urlparse(url).netloc, "robots.txt zabrania tej ścieżki")
         return None
+    url = _biegun_request_url(url)
     host = urlparse(url).netloc
     url_scheme = urlparse(url).scheme
     last_err = "?"
@@ -1200,6 +1249,16 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                     r = session().get(url, timeout=to, cookies=cookies, headers=headers, **proxy_kw(px))
             code = r.status_code
             if code == 200:
+                currency = _biegun_response_currency(r, url)
+                if currency not in ("PLN", "not-applicable"):
+                    _tls.last_fail = (
+                        f"waluta Bieguna niepotwierdzona jako PLN "
+                        f"({currency or 'brak oznaczenia'})"
+                    )
+                    log.error("%s: %s; pomijam odpowiedź: %s", host, _tls.last_fail, url)
+                    bump("nieudane")
+                    bump("waluta_niepotwierdzona")
+                    return None
                 report_proxy(px, True)
                 proxy_fails = 0
                 with _lock:

@@ -1610,11 +1610,9 @@ def extract(html, site):
 
     # 1) NAJWAŻNIEJSZE: cena z mikrodata (itemprop="price") – to co widzi klient
     price_brutto = None
-    els = soup.find(attrs={"itemprop": "price"})  # zamiast find_all
-    if els:
-        price_brutto = parse_price(els.get("content") or els.get_text(" ", strip=True))
-    if len(els) == 1:
-        price_brutto = parse_price(els[0].get("content") or els[0].get_text(" ", strip=True))
+    el = soup.find(attrs={"itemprop": "price"})
+    if el is not None:
+        price_brutto = parse_price(el.get("content") or el.get_text(" ", strip=True))
 
     # 2) Fallback: meta brutto (PrestaShop zawsze generuje)
     if price_brutto is None:
@@ -1633,11 +1631,13 @@ def extract(html, site):
         d["availability"] = norm_availability(meta(soup, "product:availability", "og:availability", "availability"))
     if not d.get("name"):
         d["name"] = meta(soup, "og:title") or (soup.h1.get_text(strip=True) if soup.h1 else None)
+    
     if site.get("selectors"):
         s = from_selectors(soup, site["selectors"])
         for k, v in s.items():
             if v is not None and (d.get(k) is None or site.get("prefer_selectors")):
                 d[k] = v
+                
     d["promo"] = promo_from_markup(soup, d.get("price"), site.get("promo"))
     if not d.get("name"):
         return None

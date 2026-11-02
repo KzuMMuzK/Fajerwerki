@@ -1608,25 +1608,12 @@ def from_selectors(soup, sel):
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
 
-    # 1) NAJWAŻNIEJSZE: szukamy ceny TYLKO w widocznych kontenerach (z pominięciem ukrytych tagów netto)
+    # 1) NAJWAŻNIEJSZE: cena z mikrodata (itemprop="price") – to co widzi klient
     price_brutto = None
-    
-    # Selektory celujące w widoczną cenę (PrestaShop, WooCommerce, itp.)
-    price_selectors = [
-        ".current-price [itemprop='price']",   # Biegun/PrestaShop
-        ".current-price .product-price",
-        "[itemprop='offers'] [itemprop='price']",
-        "span.product-price[content]",
-        "span.price[content]"
-    ]
-    
-    for sel in price_selectors:
-        el = soup.select_one(sel)
-        if el is not None:
-            price_brutto = parse_price(el.get("content") or el.get_text(" ", strip=True))
-            if price_brutto is not None:
-                break
-                
+    el = soup.find(attrs={"itemprop": "price"})
+    if el is not None:
+        price_brutto = parse_price(el.get("content") or el.get_text(" ", strip=True))
+
     # 2) Fallback: meta brutto (PrestaShop zawsze generuje to w <head>)
     if price_brutto is None:
         price_brutto = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
@@ -1895,17 +1882,14 @@ _OLD_PRICE_SELECTOR = (
     "[class*='price_old'], [class*='was_price'], [class*='price_was']"
 )
 
-
 def _is_old_price(node):
     if node.name in ("del", "s", "strike"):
         return True
     classes = node.get("class", [])
     if isinstance(classes, str):
         classes = classes.split()
-    markers = ("old-price", "price-old", "was-price", "price-was",
-               "old_price", "price_old", "was_price", "price_was")
+    markers = ("old-price", "price-old", "was-price", "price-was", "old_price", "price_old", "was_price", "price_was")
     return any(any(marker in token.lower() for marker in markers) for token in classes)
-
 
 def _pick_price(el, spec):
     if not spec:

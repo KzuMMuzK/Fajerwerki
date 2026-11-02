@@ -1,0 +1,22 @@
+app = "fajerwerki"  # Zmień na unikalną nazwę, np. "twoj-login-fajerwerki"
+primary_region = "waw"    # Region Warszawa
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true     # Oszczędza koszty, gdy nie ma ruchu
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"

@@ -1608,13 +1608,26 @@ def from_selectors(soup, sel):
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
 
-    # 1) NAJWAŻNIEJSZE: cena z mikrodata (itemprop="price") – to co widzi klient
+    # 1) NAJWAŻNIEJSZE: szukamy ceny TYLKO w widocznych kontenerach (z pominięciem ukrytych tagów netto)
     price_brutto = None
-    el = soup.find(attrs={"itemprop": "price"})
-    if el is not None:
-        price_brutto = parse_price(el.get("content") or el.get_text(" ", strip=True))
-
-    # 2) Fallback: meta brutto (PrestaShop zawsze generuje)
+    
+    # Selektory celujące w widoczną cenę (PrestaShop, WooCommerce, itp.)
+    price_selectors = [
+        ".current-price [itemprop='price']",   # Biegun/PrestaShop
+        ".current-price .product-price",
+        "[itemprop='offers'] [itemprop='price']",
+        "span.product-price[content]",
+        "span.price[content]"
+    ]
+    
+    for sel in price_selectors:
+        el = soup.select_one(sel)
+        if el is not None:
+            price_brutto = parse_price(el.get("content") or el.get_text(" ", strip=True))
+            if price_brutto is not None:
+                break
+                
+    # 2) Fallback: meta brutto (PrestaShop zawsze generuje to w <head>)
     if price_brutto is None:
         price_brutto = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
 
@@ -1644,7 +1657,6 @@ def extract(html, site):
     if d.get("price") is None and not d.get("_ld"):
         return None
     return d
-
 
 # ----------------------------- kody produktów -------------------------------
 _UNITS = (r"MM|CM|M|G|KG|ML|L|SZT|S|SEK|SEC|MIN|H|X|V|W|HZ|PCS|SHOT|SHOTS|STRZ\w*|STRZAL\w*|ST|K|CAL|CALI|CALA|CALE|"

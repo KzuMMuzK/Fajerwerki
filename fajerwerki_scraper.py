@@ -431,6 +431,7 @@ SITES = {
         "base": "https://fajerwerkibiegun.pl",
         "delay": 1, "max_parallel": 2, "use_proxy": True, "browser_ua": True,
         "detail_code_for_new_products": True,
+        "prefer_gross_price_metadata": True,
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
@@ -1618,6 +1619,17 @@ def enrich_listing_product_code(product, site, stats, is_new, headers=None):
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
     d = from_jsonld(soup) or {}
+    if site.get("prefer_gross_price_metadata"):
+        gross_price = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
+        if gross_price is None:
+            price_elements = soup.find_all(attrs={"itemprop": "price"})
+            if len(price_elements) == 1:
+                gross_price = parse_price(
+                    price_elements[0].get("content") or price_elements[0].get_text(" ", strip=True)
+                )
+        if gross_price is not None:
+            d["price"] = gross_price
+            d["currency"] = meta(soup, "product:price:currency", "og:price:currency") or d.get("currency") or "PLN"
     if not d.get("code_raw"):
         d["code_raw"] = product_page_code(soup)
     if d.get("price") is None:

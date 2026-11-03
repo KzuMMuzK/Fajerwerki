@@ -5,7 +5,7 @@ name: scrape-fajerwerki
 
 on:
   schedule:
-    - cron: "0 5 * * *"   # codziennie 05:00 UTC (06:00/07:00 w Polsce)
+    - cron: "0 1 * * *"   # codziennie 05:00 UTC (06:00/07:00 w Polsce)
   workflow_dispatch:        # przycisk "Run workflow" z polami poniżej
     inputs:
       only:

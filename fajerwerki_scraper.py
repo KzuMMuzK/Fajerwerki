@@ -1186,11 +1186,6 @@ def _biegun_response_currency(response, request_url):
     if parsed.path.lower() == "/robots.txt" or parsed.path.lower().endswith((".xml", ".xml.gz")):
         return "not-applicable"
     content = response.content[:200000]
-    body = re.search(rb"<body\b[^>]*>", content, re.I | re.S)
-    if body:
-        currency = re.search(rb"\bcurrency-([a-z]{3})\b", body.group(0), re.I)
-        if currency:
-            return currency.group(1).decode("ascii").upper()
     currencies = set()
     for tag in re.finditer(rb"<(?:meta|link)\b[^>]*>", content, re.I | re.S):
         raw_tag = tag.group(0)

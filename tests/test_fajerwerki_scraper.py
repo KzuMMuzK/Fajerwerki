@@ -165,6 +165,7 @@ class ListingParserTests(unittest.TestCase):
 
         self.assertEqual(result["price"], 149.0)
 
+
 class ListingPageFailureTests(unittest.TestCase):
     def test_mid_category_page_failure_is_reported_with_page_number_and_reason(self):
         html = """<article class="product-miniature">

@@ -80,8 +80,9 @@ class ListingParserTests(unittest.TestCase):
         self.assertTrue(site["browser_ua"])
         self.assertEqual(site["mode"], "listing")
         self.assertEqual(len(site["listing"]["categories"]), 16)
-        self.assertTrue(site["detail_price_for_listing"])
-        self.assertTrue(site["prefer_gross_price_metadata"])
+        self.assertEqual(site["listing"]["price"], "span.product-price")
+        self.assertNotIn("detail_price_for_listing", site)
+        self.assertNotIn("prefer_gross_price_metadata", site)
         self.assertNotIn("detail_code_for_new_products", site)
 
     def test_listing_ignores_ins_price_when_shop_selector_does_not_match(self):
@@ -114,53 +115,6 @@ class ListingParserTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertEqual(products[0]["price"], 14.4)
-
-    def test_response_tax_display_requires_explicit_tax_included_marker(self):
-        examples = (
-            (b'<body class="lang-pl tax-display-enabled">', "tax-included"),
-            (b'<body class="lang-pl tax-display-disabled">', "tax-excluded"),
-            (b"<body class=\"lang-pl\">", None),
-        )
-        for body, expected in examples:
-            with self.subTest(body=body):
-                response = SimpleNamespace(
-                    content=b"<html>" + body + b"</body></html>",
-                    url="https://fajerwerkibiegun.pl/pl/items?id_currency=1",
-                )
-                self.assertEqual(
-                    scraper._biegun_response_tax_display(
-                        response, "https://fajerwerkibiegun.pl/pl/items"
-                    ),
-                    expected,
-                )
-
-    def test_get_keeps_biegun_category_response_when_tax_display_is_excluded(self):
-        response = Mock(
-            status_code=200,
-            headers={"Content-Type": "text/html"},
-            content=b'<html><body class="lang-pl currency-pln tax-display-disabled"></body></html>',
-            url="https://fajerwerkibiegun.pl/pl/items?id_currency=1",
-        )
-        session = Mock()
-        session.return_value.get.return_value = response
-        stats = Counter()
-        with (
-            patch.object(scraper, "allowed", return_value=True),
-            patch.object(scraper, "ensure_fallback_proxies"),
-            patch.object(scraper, "throttle"),
-            patch.object(scraper, "session", session),
-            patch.object(scraper, "_proxies", []),
-            patch.object(scraper, "proxy_for", return_value=None),
-        ):
-            result = scraper.get(
-                "https://fajerwerkibiegun.pl/pl/items?id_currency=1",
-                stats=stats,
-                retries=1,
-            )
-
-        self.assertIs(result, response)
-        self.assertEqual(stats["pobrane_ok"], 1)
-        self.assertEqual(stats["cena_brutto_niepotwierdzona"], 0)
 
     def test_biegun_listing_parses_prestashop_json_rendered_products(self):
         response = {
@@ -211,127 +165,6 @@ class ListingParserTests(unittest.TestCase):
 
         self.assertEqual(result["price"], 149.0)
 
-    def test_product_page_prefers_gross_price_metadata_over_pretax_metadata(self):
-        result = scraper.extract(
-            """<html><head>
-              <script type="application/ld+json">
-                {"@context":"https://schema.org","@type":"Product","offers":
-                  {"@type":"Offer","price":"927.796748","priceCurrency":"PLN"}}
-              </script>
-              <meta property="product:pretax_price:amount" content="927.796748">
-              <meta property="product:price:amount" content="1141.19">
-              <meta property="product:price:currency" content="PLN">
-              </head><body><h1>POWER HUNTER</h1></body></html>""",
-            scraper.SITES["biegun"],
-        )
-
-        self.assertEqual(result["price"], 1141.19)
-        self.assertEqual(result["currency"], "PLN")
-        self.assertTrue(result["_gross_price_confirmed"])
-
-    def test_product_page_does_not_confirm_jsonld_price_as_gross_without_gross_metadata(self):
-        result = scraper.extract(
-            """<html><head>
-              <script type="application/ld+json">
-                {"@context":"https://schema.org","@type":"Product","offers":
-                  {"@type":"Offer","price":"927.796748","priceCurrency":"PLN"}}
-              </script>
-              </head><body><h1>POWER HUNTER</h1></body></html>""",
-            scraper.SITES["biegun"],
-        )
-
-        self.assertIsNone(result["price"])
-        self.assertFalse(result.get("_gross_price_confirmed", False))
-
-
-class BiegunDetailPriceTests(unittest.TestCase):
-    def test_listing_price_is_replaced_with_gross_detail_price(self):
-        response = SimpleNamespace(content="""<html><head>
-          <script type="application/ld+json">
-            {"@context":"https://schema.org","@type":"Product","offers":
-              {"@type":"Offer","price":"927.796748","priceCurrency":"PLN"}}
-          </script>
-          <meta property="product:pretax_price:amount" content="927.796748">
-          <meta property="product:price:amount" content="1141.19">
-          <meta property="product:price:currency" content="PLN">
-          </head><body class="currency-pln tax-display-disabled">
-            <h1>POWER HUNTER</h1><span itemprop="price" content="1141.19">1 141,19 zł</span>
-          </body></html>""".encode("utf-8"))
-        product = {
-            "url": "https://fajerwerkibiegun.pl/pl/item",
-            "price": 927.8,
-            "currency": "PLN",
-        }
-
-        with patch.object(scraper, "get", return_value=response):
-            valid = scraper.enrich_listing_price(
-                "biegun", scraper.SITES["biegun"], product, Counter(), None
-            )
-
-        self.assertTrue(valid)
-        self.assertEqual(product["price"], 1141.19)
-        self.assertEqual(product["currency"], "PLN")
-
-    def test_unverified_detail_price_keeps_product_but_drops_candidate_price(self):
-        response = SimpleNamespace(content="""<html><head>
-          <script type="application/ld+json">
-            {"@context":"https://schema.org","@type":"Product","offers":
-              {"@type":"Offer","price":"927.796748","priceCurrency":"PLN"}}
-          </script>
-          </head><body class="currency-pln tax-display-enabled">
-            <h1>POWER HUNTER</h1>
-          </body></html>""".encode("utf-8"))
-        product = {
-            "url": "https://fajerwerkibiegun.pl/pl/item",
-            "price": 927.8,
-            "currency": "PLN",
-        }
-
-        with patch.object(scraper, "get", return_value=response):
-            valid = scraper.enrich_listing_price(
-                "biegun", scraper.SITES["biegun"], product, Counter(), None
-            )
-
-        self.assertTrue(valid)
-        self.assertIsNone(product["price"])
-        self.assertIsNone(product["currency"])
-
-    def test_tax_excluded_itemprop_is_not_treated_as_gross_price(self):
-        result = scraper.extract(
-            """<html><head>
-              <script type="application/ld+json">
-                {"@context":"https://schema.org","@type":"Product","offers":
-                  {"@type":"Offer","price":"927.796748","priceCurrency":"PLN"}}
-              </script>
-              </head><body class="currency-pln tax-display-disabled">
-                <h1>POWER HUNTER</h1>
-                <span itemprop="price" content="927.796748">927,80 zł</span>
-              </body></html>""",
-            scraper.SITES["biegun"],
-        )
-
-        self.assertIsNone(result["price"])
-        self.assertFalse(result.get("_gross_price_confirmed", False))
-
-    def test_listing_price_is_not_saved_when_detail_price_cannot_be_verified(self):
-        product = {
-            "url": "https://fajerwerkibiegun.pl/pl/item",
-            "price": 927.8,
-            "currency": "PLN",
-        }
-        stats = Counter()
-        scraper._tls.last_fail = "HTTP 503"
-        with patch.object(scraper, "get", return_value=None):
-            valid = scraper.enrich_listing_price(
-                "biegun", scraper.SITES["biegun"], product, stats, None
-            )
-
-        self.assertTrue(valid)
-        self.assertIsNone(product["price"])
-        self.assertIsNone(product["currency"])
-        self.assertEqual(stats["cena_szczegoly_blad"], 1)
-
-
 class ListingPageFailureTests(unittest.TestCase):
     def test_mid_category_page_failure_is_reported_with_page_number_and_reason(self):
         html = """<article class="product-miniature">
@@ -340,10 +173,13 @@ class ListingPageFailureTests(unittest.TestCase):
         </article>"""
         first_page = SimpleNamespace(
             content=html.encode(),
-            url="https://fajerwerkibiegun.pl/pl/3-wyrzutnie?id_currency=1&id_country=14",
+            url="https://fajerwerkibiegun.pl/pl/3-wyrzutnie?id_currency=1",
         )
 
+        requested_urls = []
+
         def get_page(url, *_args, **_kwargs):
+            requested_urls.append(url)
             if "page=2" in url:
                 scraper._tls.last_fail = "HTTP 503"
                 return None
@@ -363,6 +199,8 @@ class ListingPageFailureTests(unittest.TestCase):
         messages = [events.get_nowait(), events.get_nowait()]
         self.assertEqual(messages[0][0], "items")
         self.assertEqual(messages[1][0], "done")
+        self.assertEqual(messages[0][4][0]["price"], 14.4)
+        self.assertFalse(any("/pl/item" in url for url in requested_urls))
         self.assertIn("stronie 2", messages[1][5])
         self.assertIn("HTTP 503", messages[1][5])
 
@@ -453,7 +291,7 @@ class BiegunCurrencyTests(unittest.TestCase):
 
         self.assertEqual(
             parse_qs(urlparse(url).query),
-            {"page": ["2"], "id_currency": ["1"], "id_country": ["14"]},
+            {"page": ["2"], "id_currency": ["1"]},
         )
         self.assertEqual(
             scraper._biegun_request_url("https://example.test/items?page=2"),
@@ -518,7 +356,7 @@ class BiegunCurrencyTests(unittest.TestCase):
                 requested_url = session.return_value.get.call_args.args[0]
                 self.assertEqual(
                     parse_qs(urlparse(requested_url).query),
-                    {"page": ["2"], "id_currency": ["1"], "id_country": ["14"]},
+                    {"page": ["2"], "id_currency": ["1"]},
                 )
 
 
@@ -732,34 +570,6 @@ class StoreApiTests(unittest.TestCase):
 
 
 class ScanHistoryTests(unittest.TestCase):
-    def test_unverified_price_still_saves_product_without_price_history(self):
-        connection = sqlite3.connect(":memory:")
-        connection.executescript("""
-            CREATE TABLE products(
-                url TEXT PRIMARY KEY,site TEXT,name TEXT,code TEXT,code_key TEXT,
-                first_seen TEXT,last_seen TEXT,promo INTEGER
-            );
-            CREATE TABLE prices(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,url TEXT,ts TEXT,
-                price REAL,currency TEXT,availability TEXT
-            );
-        """)
-        try:
-            scraper.save(connection, "biegun", "https://fajerwerkibiegun.pl/pl/item", {
-                "name": "POWER HUNTER",
-                "price": None,
-                "currency": None,
-                "_skip_price_save": True,
-            })
-
-            self.assertEqual(
-                connection.execute("SELECT name FROM products").fetchone()[0],
-                "POWER HUNTER",
-            )
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM prices").fetchone()[0], 0)
-        finally:
-            connection.close()
-
     def test_database_migrates_scan_tracking_and_saves_scan_ids(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "prices.db")

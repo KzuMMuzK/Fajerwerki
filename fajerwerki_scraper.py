@@ -430,8 +430,6 @@ SITES = {
     "biegun": {
         "base": "https://fajerwerkibiegun.pl",
         "delay": 1, "max_parallel": 2, "use_proxy": True, "browser_ua": True,
-        "detail_price_for_listing": True,
-        "prefer_gross_price_metadata": True,
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
@@ -1176,7 +1174,7 @@ def _biegun_request_url(url):
         return url
     query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
              if key.lower() not in ("id_currency", "id_country")]
-    query.extend((("id_currency", "1"), ("id_country", "14")))
+    query.append(("id_currency", "1"))
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 
@@ -1214,27 +1212,6 @@ def _biegun_response_currency(response, request_url):
     ):
         currencies.add(currency.group(1).decode("ascii").upper())
     return next(iter(currencies)) if len(currencies) == 1 else None
-
-
-def _biegun_response_tax_display(response, request_url):
-    requested = urlsplit(request_url)
-    if (requested.hostname or "").lower() != "fajerwerkibiegun.pl":
-        return "not-applicable"
-    parsed = urlsplit(getattr(response, "url", request_url))
-    if parsed.path.lower() == "/robots.txt" or parsed.path.lower().endswith((".xml", ".xml.gz")):
-        return "not-applicable"
-    body = re.search(rb"<body\b[^>]*>", response.content[:200000], re.I | re.S)
-    if not body:
-        return None
-    classes = re.search(rb"""\bclass=["']([^"']*)["']""", body.group(0), re.I | re.S)
-    if not classes:
-        return None
-    class_names = set(classes.group(1).lower().split())
-    if b"tax-display-enabled" in class_names:
-        return "tax-included"
-    if b"tax-display-disabled" in class_names:
-        return "tax-excluded"
-    return None
 
 
 def get(url, stats=None, retries=3, cookies=None, headers=None):
@@ -1630,21 +1607,6 @@ def from_selectors(soup, sel):
 def extract(html, site):
     soup = BeautifulSoup(html, "lxml")
     d = from_jsonld(soup) or {}
-    if site.get("prefer_gross_price_metadata"):
-        gross_price = parse_price(meta(soup, "product:price:amount", "og:price:amount"))
-        body_classes = {
-            str(name).lower() for name in (soup.body.get("class") or [])
-        } if soup.body else set()
-        if gross_price is None:
-            price_elements = soup.find_all(attrs={"itemprop": "price"})
-            if len(price_elements) == 1 and "tax-display-disabled" not in body_classes:
-                gross_price = parse_price(
-                    price_elements[0].get("content") or price_elements[0].get_text(" ", strip=True)
-                )
-        if gross_price is not None:
-            d["price"] = gross_price
-            d["currency"] = meta(soup, "product:price:currency", "og:price:currency") or d.get("currency") or "PLN"
-            d["_gross_price_confirmed"] = True
     if d.get("price") is None:
         d["price"] = parse_price(meta(soup, "product:price:amount", "og:price:amount", "price"))
         d.setdefault("currency", meta(soup, "product:price:currency", "og:price:currency") or "PLN")
@@ -1665,8 +1627,6 @@ def extract(html, site):
         for k, v in s.items():
             if v is not None and (d.get(k) is None or site.get("prefer_selectors")):
                 d[k] = v
-    if site.get("prefer_gross_price_metadata") and not d.get("_gross_price_confirmed"):
-        d["price"] = None
     d["promo"] = promo_from_markup(soup, d.get("price"), site.get("promo"))
     if not d.get("name"):
         return None
@@ -1833,8 +1793,6 @@ def save(con, site_name, url, d):
     if scan_id is not None:
         con.execute("UPDATE scrape_runs SET products_checked = products_checked + 1 WHERE id = ?",
                     (scan_id,))
-    if d.get("_skip_price_save"):
-        return False
     last = con.execute("SELECT price, availability FROM prices WHERE url=? "
                        "ORDER BY id DESC LIMIT 1", (url,)).fetchone()
     cur = (d["price"], d.get("availability"))
@@ -2010,36 +1968,6 @@ def parse_listing(html, page_url, cfg):
     return len(tiles), products
 
 
-def enrich_listing_price(name, site, product, stats, headers):
-    if not site.get("detail_price_for_listing"):
-        return True
-    response = get(
-        product["url"],
-        stats,
-        cookies=site.get("cookies"),
-        headers=headers,
-    )
-    detail = extract(response.content, site) if response else None
-    if (
-        not detail
-        or detail.get("price") is None
-        or detail.get("currency") != "PLN"
-        or not detail.get("_gross_price_confirmed")
-    ):
-        stats["cena_szczegoly_blad"] += 1
-        reason = _tls.last_fail if not response else "brak potwierdzonej ceny brutto w HTML produktu"
-        log.warning("[%s] pomijam zapis ceny; nie udało się potwierdzić ceny brutto: %s (%s)",
-                    name, product["url"], reason)
-        product["price"] = None
-        product["currency"] = None
-        product["_skip_price_save"] = True
-        return True
-    product["price"] = detail["price"]
-    product["currency"] = detail["currency"]
-    product["availability"] = detail.get("availability") or product.get("availability")
-    return True
-
-
 def site_headers(name, site):
     h = dict(site.get("headers") or {})
     wanted = {x.strip() for x in BROWSER_UA_SPEC.split(",") if x.strip()}
@@ -2196,8 +2124,7 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                 break
             seen.update(it["url"] for it in new)
             total += len(new)
-            verified = [it for it in new if enrich_listing_price(name, site, it, stats, hdrs)]
-            q.put(("items", name, cat_url, page, verified))
+            q.put(("items", name, cat_url, page, new))
             page += 1
         if total and page - start == 1 and last_r is not None:
             visited, cur, ordinal, extra = {last_r.url}, last_r, 1, 0
@@ -2217,8 +2144,7 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                     break
                 seen.update(it["url"] for it in new)
                 total += len(new)
-                verified = [it for it in new if enrich_listing_price(name, site, it, stats, hdrs)]
-                q.put(("items", name, cat_url, start + ordinal, verified))
+                q.put(("items", name, cat_url, start + ordinal, new))
                 ordinal, extra, cur = ordinal + 1, extra + 1, r
             if extra:
                 page = start + ordinal

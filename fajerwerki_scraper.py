@@ -1166,18 +1166,6 @@ def throttle(host):
         time.sleep(slot - now)
 
 
-def _biegun_request_url(url):
-    parsed = urlsplit(url)
-    if (parsed.hostname or "").lower() != "fajerwerkibiegun.pl" or parsed.path.lower() == "/robots.txt":
-        return url
-    if parsed.path.lower().endswith((".xml", ".xml.gz")):
-        return url
-    query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-             if key.lower() not in ("id_currency", "id_country")]
-    query.append(("id_country", "14"))
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
-
-
 def get(url, stats=None, retries=3, cookies=None, headers=None):
     def bump(key):
         if stats is not None:
@@ -1189,7 +1177,6 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         log.debug("robots.txt zabrania: %s", url)
         _tls.last_fail = _robots_note.get(urlparse(url).netloc, "robots.txt zabrania tej ścieżki")
         return None
-    url = _biegun_request_url(url)
     host = urlparse(url).netloc
     url_scheme = urlparse(url).scheme
     last_err = "?"

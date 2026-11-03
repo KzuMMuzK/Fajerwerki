@@ -432,6 +432,7 @@ SITES = {
     "biegun": {
         "base": "https://fajerwerkibiegun.pl",
         "delay": 1, "max_parallel": 2, "use_proxy": True, "browser_ua": True,
+        "fresh_session": True,
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
@@ -1203,6 +1204,10 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
         _tls.last_fail = _robots_note.get(urlparse(url).netloc, "robots.txt zabrania tej ścieżki")
         return None
     host = urlparse(url).netloc
+    site_cfg = next((s for s in SITES.values()
+                     if urlparse(s["base"]).netloc == host), None)
+    if site_cfg and site_cfg.get("fresh_session"):
+        session().cookies.clear()
     url_scheme = urlparse(url).scheme
     last_err = "?"
     use_proxy_mode = bool(_proxies) and (PROXY_ALL or host in _proxy_hosts)

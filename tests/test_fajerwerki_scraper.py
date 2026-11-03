@@ -298,7 +298,7 @@ class BiegunCurrencyTests(unittest.TestCase):
             "https://example.test/items?page=2",
         )
 
-    def test_response_currency_uses_store_currency_class_or_explicit_price_metadata(self):
+    def test_response_currency_uses_explicit_price_metadata_not_page_currency_class(self):
         class_response = SimpleNamespace(
             content=b'<html><body class="lang-pl country-pl currency-pln"></body></html>',
             url="https://fajerwerkibiegun.pl/pl/items?id_currency=1",
@@ -312,7 +312,7 @@ class BiegunCurrencyTests(unittest.TestCase):
             scraper._biegun_response_currency(
                 class_response, "https://fajerwerkibiegun.pl/pl/items"
             ),
-            "PLN",
+            None,
         )
         self.assertEqual(
             scraper._biegun_response_currency(
@@ -321,9 +321,10 @@ class BiegunCurrencyTests(unittest.TestCase):
             "PLN",
         )
 
-    def test_get_rejects_explicit_non_pln_but_keeps_unmarked_biegun_response(self):
+    def test_get_ignores_page_currency_class_but_rejects_explicit_non_pln_price_currency(self):
         examples = (
-            (b'<html><body class="country-fr currency-eur"></body></html>', False),
+            (b'<html><body class="country-fr currency-eur"></body></html>', True),
+            (b'<meta itemprop="priceCurrency" content="EUR">', False),
             (b"<html><body></body></html>", True),
         )
         for currency_markup, expected_success in examples:

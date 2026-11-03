@@ -285,7 +285,18 @@ class AccessHandlingTests(unittest.TestCase):
 
 
 class BiegunCurrencyTests(unittest.TestCase):
-    def test_get_preserves_original_category_url_without_currency_overrides(self):
+    def test_request_url_sets_polish_country_without_forcing_currency(self):
+        url = scraper._biegun_request_url(
+            "https://fajerwerkibiegun.pl/pl/items?page=2&id_currency=1&id_country=21"
+        )
+
+        self.assertEqual(parse_qs(urlparse(url).query), {"page": ["2"], "id_country": ["14"]})
+        self.assertEqual(
+            scraper._biegun_request_url("https://example.test/items?page=2"),
+            "https://example.test/items?page=2",
+        )
+
+    def test_get_applies_polish_country_to_request_url(self):
         response = Mock(
             status_code=200,
             headers={"Content-Type": "text/html"},
@@ -306,7 +317,10 @@ class BiegunCurrencyTests(unittest.TestCase):
             result = scraper.get(url, retries=1)
 
         self.assertIs(result, response)
-        self.assertEqual(session.return_value.get.call_args.args[0], url)
+        self.assertEqual(
+            session.return_value.get.call_args.args[0],
+            "https://fajerwerkibiegun.pl/pl/items?page=2&id_country=14",
+        )
 
 
 class StoreApiTests(unittest.TestCase):

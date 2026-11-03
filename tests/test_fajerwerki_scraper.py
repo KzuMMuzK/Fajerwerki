@@ -284,81 +284,28 @@ class AccessHandlingTests(unittest.TestCase):
 
 
 class BiegunCurrencyTests(unittest.TestCase):
-    def test_requests_force_pln_and_preserve_pagination(self):
-        url = scraper._biegun_request_url(
-            "https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=2&id_currency=3&id_country=21"
+    def test_get_preserves_original_category_url_without_currency_overrides(self):
+        response = Mock(
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            content=b'<html><body class="currency-eur"></body></html>',
+            url="https://fajerwerkibiegun.pl/pl/items?page=2",
         )
+        session = Mock()
+        session.return_value.get.return_value = response
+        url = "https://fajerwerkibiegun.pl/pl/items?page=2"
+        with (
+            patch.object(scraper, "allowed", return_value=True),
+            patch.object(scraper, "ensure_fallback_proxies"),
+            patch.object(scraper, "throttle"),
+            patch.object(scraper, "session", session),
+            patch.object(scraper, "_proxies", []),
+            patch.object(scraper, "proxy_for", return_value=None),
+        ):
+            result = scraper.get(url, retries=1)
 
-        self.assertEqual(
-            parse_qs(urlparse(url).query),
-            {"page": ["2"], "id_currency": ["1"]},
-        )
-        self.assertEqual(
-            scraper._biegun_request_url("https://example.test/items?page=2"),
-            "https://example.test/items?page=2",
-        )
-
-    def test_response_currency_uses_explicit_price_metadata_not_page_currency_class(self):
-        class_response = SimpleNamespace(
-            content=b'<html><body class="lang-pl country-pl currency-pln"></body></html>',
-            url="https://fajerwerkibiegun.pl/pl/items?id_currency=1",
-        )
-        meta_response = SimpleNamespace(
-            content=b'<meta content="PLN" itemprop="priceCurrency">',
-            url="https://fajerwerkibiegun.pl/pl/item?id_currency=1",
-        )
-
-        self.assertEqual(
-            scraper._biegun_response_currency(
-                class_response, "https://fajerwerkibiegun.pl/pl/items"
-            ),
-            None,
-        )
-        self.assertEqual(
-            scraper._biegun_response_currency(
-                meta_response, "https://fajerwerkibiegun.pl/pl/item"
-            ),
-            "PLN",
-        )
-
-    def test_get_ignores_page_currency_class_but_rejects_explicit_non_pln_price_currency(self):
-        examples = (
-            (b'<html><body class="country-fr currency-eur"></body></html>', True),
-            (b'<meta itemprop="priceCurrency" content="EUR">', False),
-            (b"<html><body></body></html>", True),
-        )
-        for currency_markup, expected_success in examples:
-            with self.subTest(markup=currency_markup):
-                response = Mock(
-                    status_code=200,
-                    headers={"Content-Type": "text/html"},
-                    content=currency_markup,
-                    url="https://fajerwerkibiegun.pl/pl/items?id_currency=1",
-                )
-                session = Mock()
-                session.return_value.get.return_value = response
-                stats = Counter()
-                with (
-                    patch.object(scraper, "allowed", return_value=True),
-                    patch.object(scraper, "ensure_fallback_proxies"),
-                    patch.object(scraper, "throttle"),
-                    patch.object(scraper, "session", session),
-                    patch.object(scraper, "_proxies", []),
-                    patch.object(scraper, "proxy_for", return_value=None),
-                ):
-                    result = scraper.get(
-                        "https://fajerwerkibiegun.pl/pl/items?page=2&id_currency=3",
-                        stats=stats,
-                        retries=1,
-                    )
-
-                self.assertEqual(result is response, expected_success)
-                self.assertEqual(stats["waluta_niepotwierdzona"], 0 if expected_success else 1)
-                requested_url = session.return_value.get.call_args.args[0]
-                self.assertEqual(
-                    parse_qs(urlparse(requested_url).query),
-                    {"page": ["2"], "id_currency": ["1"]},
-                )
+        self.assertIs(result, response)
+        self.assertEqual(session.return_value.get.call_args.args[0], url)
 
 
 class StoreApiTests(unittest.TestCase):

@@ -78,6 +78,8 @@ DB_PATH = env("SCRAPER_DB", "fajerwerki.db")  # w Actions: data/fajerwerki.db (p
 USER_AGENT = "Mozilla/5.0 (compatible; FajerwerkiPrices/1.0" + (f"; +kontakt: {env('SCRAPER_CONTACT')}" if env("SCRAPER_CONTACT") else "") + ")"
 DELAY = float(env('SCRAPER_DELAY', 0.5))   # min. odstęp (s) między ZAPYTANIAMI do jednego hosta (wspólny dla wszystkich wątków)
 WORKERS = int(env('SCRAPER_WORKERS', 16))   # większy bufor żądań; DELAY nadal ogranicza tempo per host
+MAX_RETRY_SECONDS = float(env("SCRAPER_MAX_RETRY_SECONDS", 600))  # budżet czasu na URL przez proxy; 0 = bez limitu
+MAX_SLEEP = float(env("SCRAPER_MAX_SLEEP", 30))                    # maks. sen między próbami
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
 BROWSER_UA_SPEC = (env("SCRAPER_BROWSER_UA", "") or "").lower()  # "" = nikt, "1" = wszystkie, albo lista sklepów
@@ -1165,6 +1167,29 @@ def throttle(host):
     if slot > now:
         time.sleep(slot - now)
 
+_proxy_only_hosts_cache = {}
+
+def _proxy_only_host(host):
+    """True jeśli jakikolwiek sklep z use_proxy=True celuje w ten host.
+    Dla takich hostów NIGDY nie wyłączamy proxy — rotujemy dalej."""
+    cached = _proxy_only_hosts_cache.get(host)
+    if cached is not None:
+        return cached
+    result = False
+    for site in SITES.values():
+        if not site.get("use_proxy"):
+            continue
+        if urlparse(site["base"]).netloc == host:
+            result = True
+            break
+        for cat in site.get("listing", {}).get("categories", []):
+            if urlparse(cat).netloc == host:
+                result = True
+                break
+        if result:
+            break
+    _proxy_only_hosts_cache[host] = result
+    return result
 
 def get(url, stats=None, retries=3, cookies=None, headers=None):
     def bump(key):
@@ -1180,11 +1205,19 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
     host = urlparse(url).netloc
     url_scheme = urlparse(url).scheme
     last_err = "?"
-    if _proxies and (PROXY_ALL or host in _proxy_hosts):
-        retries = max(retries, _live_count() + 1)
+    use_proxy_mode = bool(_proxies) and (PROXY_ALL or host in _proxy_hosts)
+    deadline = time.time() + MAX_RETRY_SECONDS if (use_proxy_mode and MAX_RETRY_SECONDS > 0) else None
     gate = _gate(host)
     proxy_fails = 0
-    for attempt in range(retries):
+    attempt = 0
+
+    while True:
+        if not use_proxy_mode and attempt >= retries:
+            break
+        if deadline is not None and time.time() >= deadline:
+            last_err = f"budżet {MAX_RETRY_SECONDS:.0f}s wyczerpany"
+            break
+        attempt += 1
         ensure_fallback_proxies()
         throttle(host)
         px = None
@@ -1236,18 +1269,20 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                     report_proxy(px, False, dead=True)
                     proxy_fails += 1
                     if proxy_fails >= 20 and host in _proxy_hosts:
-                        _proxy_hosts.discard(host)
-                        log.warning("%s: 20 kolejnych 403 przez proxy – przełączam na direct", host)
+                        if _proxy_only_host(host):
+                            proxy_fails = 0  # host wymaga proxy — rotuj dalej
+                        else:
+                            _proxy_hosts.discard(host)
+                            log.warning("%s: 20 kolejnych 403 przez proxy – przełączam na direct", host)
                     _warn_rate_limited(host, "403",
-                                       f"HTTP 403 przez {mask(px)} – próbuję kolejne proxy: {url}", every=60)
+                                       f"HTTP 403 przez {mask(px)} – kolejne proxy: {url}", every=60)
                     continue
                 if _proxies and host not in _proxy_hosts:
-                    log.warning("HTTP 403 bez proxy dla %s – włączam proxy dla tego hosta", host)
+                    log.warning("HTTP 403 bez proxy dla %s – włączam proxy", host)
                     _proxy_hosts.add(host)
                     if host not in _host_sem:
                         _host_sem[host] = threading.Semaphore(4)
                     continue
-                log.debug("HTTP 403 (bez proxy, brak proxy do przełączenia): %s", url)
                 bump("nieudane")
                 return None
             if code in (404, 410):
@@ -1256,19 +1291,20 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                 log.debug("HTTP %s: %s", code, url)
                 return None
             last_err = f"HTTP {code}"
-            _warn_rate_limited(host, f"http_{code}", f"HTTP {code} (próba {attempt + 1}/{retries}): {url}", every=30)
-            if code >= 500:
-                # nie bumpujemy delay - to błąd serwera, nie rate-limit
-                pass
+            _warn_rate_limited(host, f"http_{code}", f"HTTP {code} (próba {attempt}): {url}", every=30)
+            # 5xx → leci do backoffu poniżej
         except requests.exceptions.SSLError as e:
             report_proxy(px, False, dead=True)
             last_err = short_err(e)
             with _lock:
                 _host_proxy_fails[host] += 1
                 if _host_proxy_fails[host] >= 20 and host in _proxy_hosts:
-                    _proxy_hosts.discard(host)
-                    _host_proxy_fails[host] = 0
-                    log.warning("%s: 20 kolejnych failów proxy – przełączam na direct", host)
+                    if _proxy_only_host(host):
+                        _host_proxy_fails[host] = 0
+                    else:
+                        _proxy_hosts.discard(host)
+                        _host_proxy_fails[host] = 0
+                        log.warning("%s: 20 failów proxy – direct", host)
             continue
         except requests.Timeout as e:
             report_proxy(px, False, dead=(px is not None))
@@ -1279,10 +1315,13 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                 with _lock:
                     _host_proxy_fails[host] += 1
                     if _host_proxy_fails[host] >= 20 and host in _proxy_hosts:
-                        _proxy_hosts.discard(host)
-                        _host_proxy_fails[host] = 0
-                        log.warning("%s: 20 kolejnych failów proxy – przełączam na direct", host)
-            if px is None and attempt >= 1:
+                        if _proxy_only_host(host):
+                            _host_proxy_fails[host] = 0
+                        else:
+                            _proxy_hosts.discard(host)
+                            _host_proxy_fails[host] = 0
+                            log.warning("%s: 20 failów proxy – direct", host)
+            if px is None and attempt >= 2:
                 break
             continue
         except requests.ConnectionError as e:
@@ -1294,20 +1333,28 @@ def get(url, stats=None, retries=3, cookies=None, headers=None):
                 with _lock:
                     _host_proxy_fails[host] += 1
                     if _host_proxy_fails[host] >= 20 and host in _proxy_hosts:
-                        _proxy_hosts.discard(host)
-                        _host_proxy_fails[host] = 0
-                        log.warning("%s: 20 kolejnych failów proxy – przełączam na direct", host)
+                        if _proxy_only_host(host):
+                            _host_proxy_fails[host] = 0
+                        else:
+                            _proxy_hosts.discard(host)
+                            _host_proxy_fails[host] = 0
+                            log.warning("%s: 20 failów proxy – direct", host)
+            if px is None and attempt >= 2:
+                break
             continue
         except requests.RequestException as e:
             report_proxy(px, False)
             last_err = short_err(e)
             _warn_rate_limited(host, type(e).__name__,
-                               f"błąd sieci przez {mask(px)} (próba {attempt + 1}/{retries}): {url} | {last_err}", every=30)
+                               f"błąd sieci przez {mask(px)} (próba {attempt}): {url} | {last_err}", every=30)
             if px is not None:
                 continue
-        time.sleep(2 ** attempt)
+
+        # Backoff (cap 30 s) — dotyczy tylko 5xx / direct network error
+        time.sleep(min(MAX_SLEEP, 2 ** min(attempt, 5)))
+
     bump("nieudane")
-    _tls.last_fail = f"nieudane po {retries} próbach ({last_err})"
+    _tls.last_fail = f"nieudane po {attempt} próbach ({last_err})"
     return None
 
 

@@ -513,14 +513,14 @@ SITES = {
         "sitemaps": ["https://pirolux.com.pl/sitemap-produkty.xml"],
         "url_regex": r"^https://(?:www\.)?pirolux\.com\.pl/[^/]+-p\d+$",
     },
-    "piroshop": {
-        "base": "https://piroshop.pl",
-        "mode": "sitemap",
-        "browser_ua": True, "use_proxy": True,
-        "delay": 1.0, "max_parallel": 1,
-        "sitemaps": ["https://piroshop.pl/1_pl_0_sitemap.xml"],
-        "url_regex": r"^https://piroshop\.pl/pl/.+/\d+-[^/]+\.html$",
-    },
+    #--"piroshop": {
+        #"base": "https://piroshop.pl",
+        #"mode": "sitemap",
+        #"browser_ua": True, "use_proxy": True,
+        #"delay": 1.0, "max_parallel": 1,
+        #"sitemaps": ["https://piroshop.pl/1_pl_0_sitemap.xml"],
+        #"url_regex": r"^https://piroshop\.pl/pl/.+/\d+-[^/]+\.html$",
+    #},
     "pirotechnika.net": {
         "base": "https://pirotechnika.net",
         "mode": "api",

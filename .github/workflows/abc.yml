@@ -4,17 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL produktu/kategorii do testu'
+        description: 'URL'
         required: false
         default: 'https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=16'
       samples:
-        description: 'Ile udanych próbek per wariant nagłówków'
+        description: 'Udanych probek per wariant'
         required: false
-        default: '5'
+        default: '3'
       tries:
-        description: 'Max prób per wariant (żeby nie wisieć na padniętych proxy)'
+        description: 'Max prob per wariant'
         required: false
-        default: '20'
+        default: '10'
+      working_proxies:
+        description: 'Ile dzialajacych proxy na start'
+        required: false
+        default: '6'
 
 permissions:
   contents: read
@@ -22,7 +26,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -36,27 +40,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install 'requests[socks]' beautifulsoup4 lxml
 
-      - name: Ensure 'python' command exists
-        run: |
-          command -v python >/dev/null 2>&1 || sudo ln -sf "$(command -v python3)" /usr/local/bin/python
-
       - name: Run diagnostic
         shell: python
         env:
+          PYTHONUNBUFFERED: '1'
           TARGET_URL: ${{ inputs.url }}
           SAMPLES: ${{ inputs.samples }}
           TRIES: ${{ inputs.tries }}
+          WORKING_PROXIES: ${{ inputs.working_proxies }}
         run: |
           import os
           import sys
           import re
-          import threading
+          import time
           from collections import Counter, defaultdict
+          from concurrent.futures import (
+              ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout,
+          )
 
           try:
               import socks  # noqa
           except ImportError:
-              print("ERROR: PySocks not installed")
+              print("ERROR: PySocks not installed", flush=True)
               sys.exit(1)
 
           import requests
@@ -64,15 +69,17 @@ jobs:
 
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-
           PROXIFLY_JSON = ("https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/"
                            "proxies/protocols/socks5/data.json")
           PROXIFLY_TXT = ("https://raw.githubusercontent.com/proxifly/free-proxy-list/main/"
                           "proxies/protocols/socks5/data.txt")
+          GEONODE_API = "https://proxylist.geonode.com/api/proxy-list"
 
           URL = os.environ.get("TARGET_URL", "https://fajerwerkibiegun.pl/pl/3-wyrzutnie?page=16")
-          SAMPLES = int(os.environ.get("SAMPLES", "5"))
-          TRIES = int(os.environ.get("TRIES", "20"))
+          SAMPLES = int(os.environ.get("SAMPLES", "3"))
+          TRIES = int(os.environ.get("TRIES", "10"))
+          WANT_WORKING = int(os.environ.get("WORKING_PROXIES", "6"))
+          VALIDATE_BUDGET = 90
 
           HEADERS_VARIANTS = {
               "A_minimal": {
@@ -95,25 +102,49 @@ jobs:
               },
           }
 
-          def fetch_proxifly():
-              data, source = None, "?"
+          def log(msg):
+              print(msg, flush=True)
+
+          def fetch_geonode():
+              try:
+                  r = requests.get(GEONODE_API, params={
+                      "limit": 100, "page": 1,
+                      "sort_by": "lastChecked", "sort_type": "desc",
+                  }, timeout=30, headers={"User-Agent": UA})
+                  r.raise_for_status()
+                  data = r.json().get("data", [])
+              except Exception as e:
+                  log(f"[geonode] blad: {e.__class__.__name__}")
+                  return []
+              out = []
+              for it in data:
+                  try:
+                      ip, port = str(it["ip"]), str(it["port"])
+                  except (KeyError, TypeError):
+                      continue
+                  if str(it.get("anonymityLevel", "")).lower() == "transparent":
+                      continue
+                  up = float(it.get("upTime") or 0)
+                  if up < 80:
+                      continue
+                  protos = {str(x).lower() for x in (it.get("protocols") or [])}
+                  if "socks5" not in protos:
+                      continue
+                  country = str(it.get("country", "")).upper() or "?"
+                  out.append({"proxy": f"socks5h://{ip}:{port}", "country": country,
+                              "score": int(up)})
+              out.sort(key=lambda e: e["score"], reverse=True)
+              log(f"[geonode] pobrano {len(out)} SOCKS5 (uptime>=80%)")
+              return out
+
+          def fetch_proxifly_json():
               try:
                   r = requests.get(PROXIFLY_JSON, timeout=30, headers={"User-Agent": UA})
                   r.raise_for_status()
                   data = r.json()
-                  source = "json"
               except (requests.RequestException, ValueError) as e:
-                  print(f"[proxifly] JSON niedostepny ({e.__class__.__name__}) - fallback TXT")
-              if not data:
-                  try:
-                      r = requests.get(PROXIFLY_TXT, timeout=30, headers={"User-Agent": UA})
-                      r.raise_for_status()
-                      data = [{"proxy": line.strip()} for line in r.text.splitlines()
-                              if line.strip().startswith("socks5://")]
-                      source = "txt"
-                  except requests.RequestException as e:
-                      print(f"[proxifly] TXT tez padl ({e.__class__.__name__})")
-                      return []
+                  log(f"[proxifly] JSON niedostepny ({e.__class__.__name__})")
+                  return []
               out, seen = [], set()
               for item in data:
                   px = item.get("proxy")
@@ -124,31 +155,53 @@ jobs:
                   out.append({"proxy": px, "country": country,
                               "score": int(item.get("score", 0) or 0)})
               out.sort(key=lambda e: e["score"], reverse=True)
-              countries = sorted({e["country"] for e in out})
-              print(f"[proxifly] zrodlo={source} | w puli={len(out)} | kraje={countries[:15]}")
+              log(f"[proxifly] JSON: {len(out)} SOCKS5")
               return out
 
-          class ProxyPool:
-              def __init__(self, entries):
-                  self.alive = list(entries)
-                  self.i = 0
-                  self.lock = threading.Lock()
-              def next(self):
-                  with self.lock:
-                      if not self.alive:
-                          return None
-                      e = self.alive[self.i % len(self.alive)]
-                      self.i += 1
-                      return e
-              def mark_dead(self, entry):
-                  with self.lock:
+          def fetch_proxifly_txt(limit=200):
+              try:
+                  r = requests.get(PROXIFLY_TXT, timeout=30, headers={"User-Agent": UA})
+                  r.raise_for_status()
+                  lines = [l.strip() for l in r.text.splitlines()
+                           if l.strip().startswith("socks5://")]
+              except requests.RequestException as e:
+                  log(f"[proxifly] TXT niedostepny ({e.__class__.__name__})")
+                  return []
+              log(f"[proxifly] TXT: {len(lines)} SOCKS5 (bez kraju, biorę {min(limit, len(lines))})")
+              return [{"proxy": p, "country": "?", "score": 0} for p in lines[:limit]]
+
+          def validate_one(entry, budget=12):
+              try:
+                  r = requests.head(URL, proxies={"http": entry["proxy"], "https": entry["proxy"]},
+                                    timeout=(5, budget), headers={"User-Agent": UA},
+                                    allow_redirects=True)
+                  return entry if r.status_code < 500 else None
+              except requests.RequestException:
+                  return None
+
+          def find_working(candidates, want, budget_sec):
+              log(f"[validate] sprawdzam {len(candidates)} proxy, potrzebuje {want}, budzet {budget_sec}s")
+              t0 = time.time()
+              working = []
+              pool = ThreadPoolExecutor(max_workers=40)
+              try:
+                  futs = {pool.submit(validate_one, e): e for e in candidates}
+                  for fut in as_completed(futs, timeout=budget_sec):
+                      if len(working) >= want:
+                          break
                       try:
-                          self.alive.remove(entry)
-                      except ValueError:
-                          pass
-              def alive_count(self):
-                  with self.lock:
-                      return len(self.alive)
+                          res = fut.result(timeout=1)
+                      except Exception:
+                          continue
+                      if res is not None:
+                          working.append(res)
+                          log(f"  [OK] [{res['country']:>3}] {res['proxy']}")
+              except FuturesTimeout:
+                  pass
+              finally:
+                  pool.shutdown(wait=False, cancel_futures=True)
+              log(f"[validate] znaleziono {len(working)} dzialajacych w {time.time()-t0:.1f}s")
+              return working
 
           def first_product_price(html_bytes):
               text = html_bytes.decode("utf-8-sig", "replace")
@@ -167,7 +220,8 @@ jobs:
                       return None, None, "JSON-parse-err"
               soup = BeautifulSoup(text, "lxml")
               for article in soup.select("article.product-miniature"):
-                  name_el = article.select_one("h3.product-title a") or article.select_one("h3.product-title")
+                  name_el = (article.select_one("h3.product-title a")
+                             or article.select_one("h3.product-title"))
                   price_el = article.select_one("span.product-price")
                   if not name_el or not price_el:
                       continue
@@ -176,7 +230,7 @@ jobs:
                           source)
               return None, None, source + "-0-tiles"
 
-          def make_request(url, headers, proxy, timeout=25):
+          def do_request(url, headers, proxy, timeout=25):
               session = requests.Session()
               session.headers.update(headers)
               try:
@@ -190,7 +244,7 @@ jobs:
                   name, price, source = first_product_price(r.content)
                   return {"status": "ok", "price": price, "name": name, "source": source}, cookies
               except requests.RequestException as e:
-                  return {"status": f"{e.__class__.__name__}", "price": None,
+                  return {"status": e.__class__.__name__, "price": None,
                           "name": None, "source": "?"}, {}
               finally:
                   session.close()
@@ -211,84 +265,72 @@ jobs:
                   return None
 
           def main():
-              pool_entries = fetch_proxifly()
-              if not pool_entries:
-                  print("ERROR: brak proxy z Proxifly.")
+              candidates = fetch_geonode()
+              if len(candidates) < WANT_WORKING * 3:
+                  candidates += fetch_proxifly_json()
+              if len(candidates) < WANT_WORKING * 3:
+                  candidates += fetch_proxifly_txt()
+              if not candidates:
+                  log("ERROR: brak proxy z zadnego zrodla")
                   sys.exit(1)
-              pool = ProxyPool(pool_entries)
 
-              print(f"\nTest: {len(HEADERS_VARIANTS)} wariantow x do {SAMPLES} probek")
-              print(f"| pula: {pool.alive_count()} proxy | URL: {URL}\n")
+              working = find_working(candidates[:300], WANT_WORKING, VALIDATE_BUDGET)
+              if not working:
+                  log("ERROR: nie znaleziono dzialajacego proxy w budzecie")
+                  sys.exit(1)
+              if len(working) < 2:
+                  log(f"UWAGA: tylko {len(working)} proxy - wyniki moga byc malo wiarygodne")
+
+              log(f"\nTest: {len(HEADERS_VARIANTS)} wariantow x do {SAMPLES} probek "
+                  f"| pula: {len(working)} proxy | URL: {URL}\n")
 
               matrix = defaultdict(list)
-              attempts = 0
-              failed_total = 0
-
+              wi = 0
               for variant_name, headers in HEADERS_VARIANTS.items():
-                  print(f"=== {variant_name} ===")
+                  log(f"=== {variant_name} ===")
                   ok = 0
-                  while ok < SAMPLES and attempts < TRIES * len(HEADERS_VARIANTS):
-                      attempts += 1
-                      entry = pool.next()
-                      if entry is None:
-                          print("  ! pula pusta")
-                          break
-                      result, cookies = make_request(URL, headers, entry["proxy"])
+                  tries_left = TRIES
+                  while ok < SAMPLES and tries_left > 0:
+                      tries_left -= 1
+                      entry = working[wi % len(working)]
+                      wi += 1
+                      result, cookies = do_request(URL, headers, entry["proxy"])
                       short = entry["proxy"].split("://", 1)[1][:22]
                       country = entry["country"]
-
                       if result["status"] != "ok" or not result["price"]:
-                          pool.mark_dead(entry)
-                          failed_total += 1
-                          print(f"  [{country:>3}] {short:<22} -> {result['status']} / {result['source']} (dead, alive={pool.alive_count()})")
+                          log(f"  [{country:>3}] {short:<22} -> {result['status']} / {result['source']}")
                           continue
-
                       ok += 1
-                      key = (variant_name, country)
-                      matrix[key].append(result)
+                      matrix[variant_name].append({
+                          "country": country, "result": result, "cookies": cookies,
+                      })
                       cookie_str = " ".join(f"{k}={v}" for k, v in cookies.items()) or "-"
-                      print(f"  [{country:>3}] {short:<22} -> {result['source']:4s} | {result['price']!r:>20} | cookie={cookie_str}")
-                  print()
+                      log(f"  [{country:>3}] {short:<22} -> {result['source']:4s} | "
+                          f"{result['price']!r:>20} | cookie={cookie_str}")
+                  log("")
 
-              lines = []
-              lines.append("=" * 120)
-              lines.append("PODSUMOWANIE: ceny zaobserwowane per wariant naglowkow\n")
-
+              lines = ["=" * 120, "PODSUMOWANIE", ""]
+              all_prices = set()
+              per_variant = {}
               for variant_name in HEADERS_VARIANTS:
                   prices = []
-                  for (v, country), results in matrix.items():
-                      if v != variant_name:
-                          continue
-                      for r in results:
-                          p = normalize_price(r["price"])
-                          if p:
-                              prices.append((p[0], p[1], country, r["source"]))
-
+                  for r in matrix.get(variant_name, []):
+                      p = normalize_price(r["result"]["price"])
+                      if p:
+                          prices.append((p[0], p[1], r["country"], r["result"]["source"]))
+                          all_prices.add(p)
+                  per_variant[variant_name] = prices
                   if not prices:
-                      lines.append(f"  {variant_name:<18} BRAK UDANYCH PROBEK")
+                      lines.append(f"  {variant_name:<18} BRAK PROBEK")
                       continue
-
                   counts = Counter((p[0], p[1]) for p in prices)
-                  parts = [f"{cnt}x {amount:>8.2f} {sym}" for (amount, sym), cnt in counts.most_common()]
+                  parts = [f"{cnt}x {a:>8.2f} {s}" for (a, s), cnt in counts.most_common()]
                   sources = Counter(p[3] for p in prices)
-                  lines.append(f"  {variant_name:<18} | {len(prices)} probek | zrodla={dict(sources)} | ceny={', '.join(parts)}")
+                  lines.append(f"  {variant_name:<18} | {len(prices)} probek | "
+                               f"zrodla={dict(sources)} | ceny={', '.join(parts)}")
 
               lines.append("")
               lines.append("=" * 120)
-              all_prices = set()
-              variant_prices = {}
-              for variant_name in HEADERS_VARIANTS:
-                  vprices = set()
-                  for (v, country), results in matrix.items():
-                      if v != variant_name:
-                          continue
-                      for r in results:
-                          p = normalize_price(r["price"])
-                          if p:
-                              vprices.add(p)
-                              all_prices.add(p)
-                  variant_prices[variant_name] = vprices
-
               if len(all_prices) <= 1:
                   lines.append("WSZYSTKIE probki daja TE SAMA cene -> problem NIE jest w naglowkach ani proxy.")
                   lines.append("   Wina w warstwie scrapera -> Fix A (walidacja zl) + Fix C (no_rendered_products).")
@@ -297,47 +339,40 @@ jobs:
                   for p in sorted(all_prices):
                       lines.append(f"   - {p[0]:>8.2f} {p[1]}")
 
-                  per_variant_differs = any(
-                      variant_prices[a] != variant_prices[b]
-                      for a in HEADERS_VARIANTS for b in HEADERS_VARIANTS if a < b
-                  )
-                  if per_variant_differs:
-                      lines.append("\n   >>> ROZNE WARIANTY NAGLOWKOW daja ROZNE ceny -> Fix B (naglowki bieguna = A_minimal)")
+                  variant_sets = {v: set((p[0], p[1]) for p in ps)
+                                  for v, ps in per_variant.items()}
+                  if any(variant_sets[a] != variant_sets[b]
+                         for a in HEADERS_VARIANTS for b in HEADERS_VARIANTS if a < b):
+                      lines.append("\n   >>> ROZNE WARIANTY NAGLOWKOW daja ROZNE ceny -> Fix B (naglowki = A_minimal)")
 
-                  for variant_name in HEADERS_VARIANTS:
-                      countries_prices = defaultdict(set)
-                      for (v, country), results in matrix.items():
-                          if v != variant_name:
-                              continue
-                          for r in results:
-                              p = normalize_price(r["price"])
-                              if p:
-                                  countries_prices[country].add(p)
-                      flat = set()
-                      for s in countries_prices.values():
-                          flat |= s
-                      if len(flat) > 1 and len(countries_prices) >= 2:
-                          lines.append(f"\n   >>> Wariant {variant_name}: rozne proxy daja rozne ceny:")
-                          for country, ps in countries_prices.items():
+                  for variant_name, prices in per_variant.items():
+                      by_country = defaultdict(set)
+                      for amount, sym, country, _ in prices:
+                          by_country[country].add((amount, sym))
+                      if len(by_country) >= 2 and any(len(s) > 1 for s in by_country.values()):
+                          lines.append(f"\n   >>> Wariant {variant_name}: rozne kraje proxy daja rozne ceny:")
+                          for country, ps in by_country.items():
                               lines.append(f"     {country:>3}: {sorted(ps)}")
-                          lines.append("     -> GeoIP: wymus force proxy country (tylko PL) LUB cookies")
+                          lines.append("     -> GeoIP: wymus proxy tylko PL LUB cookies")
 
-                  source_price = defaultdict(set)
-                  for results in matrix.values():
-                      for r in results:
-                          p = normalize_price(r["price"])
-                          if p:
-                              source_price[r["source"]].add(p)
-                  if len(source_price) >= 2:
-                      lines.append("\n   >>> Zrodlo (HTML vs JSON) koreluje z cena:")
-                      for src, ps in source_price.items():
+                  by_source = defaultdict(set)
+                  for prices in per_variant.values():
+                      for amount, sym, _, source in prices:
+                          by_source[source].add((amount, sym))
+                  if len(by_source) >= 2:
+                      lines.append("\n   >>> Zrodlo odpowiedzi koreluje z cena:")
+                      for src, ps in by_source.items():
                           lines.append(f"     {src:>5}: {sorted(ps)}")
                       lines.append("     -> Fix C (no_rendered_products: True dla bieguna)")
 
-              lines.append(f"\nStatystyki: {attempts} prob, {failed_total} nieudanych")
-
               output = "\n".join(lines)
-              print(output)
+              log(output)
+
+              try:
+                  with open("/tmp/result.txt", "w", encoding="utf-8") as f:
+                      f.write(output)
+              except Exception:
+                  pass
 
               summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
               if summary_path:

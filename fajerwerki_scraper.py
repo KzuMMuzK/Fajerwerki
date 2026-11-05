@@ -432,7 +432,24 @@ SITES = {
     "biegun": {
         "base": "https://fajerwerkibiegun.pl",
         "delay": 1, "max_parallel": 2, "use_proxy": True, "browser_ua": True,
-        "fresh_session": True,
+        "cookies": {
+            "PrestaShop-9c44e9d505181033d32e8754f58f952a":
+                "def50200ef3061e3065ab7660dae50ed4d7fbb39ea002d1a3d5a6e363238d70bbe4ffe"
+                "9ef8c0e96d9df2e8fe39551ee88e3cca6ba26db37c9588fb8cdca5820ed4d9025680d4"
+                "7e7446130d3bdf64ebc26a757f3f098d8c8ebe4aa1586388e273477a0afeeb7cd3128e"
+                "616901a2259657cc16334d6244d2ff46075329316640379645e7f3d3dd1d3245d47209"
+                "ef71e2383735c9c373a9eee24621f89d003da1b2d7cc3e8274dc43dd7295e85caae6a5"
+                "63227d36d84426a0c457e987b650935e6176d204fce38cafd27354fc4690b9e99601c5"
+                "47e88a5d33da3921253248b7f6c1bc792ffa18f56a6750f6",
+            "PrestaShop-e8122d330a82eeb3a03b670d90dd1d7c":
+                "def5020052aba4f8f25b0bf941003aaf755a3ee3539956cd9dd04f3c3abc6f16b38efb"
+                "6e3a4c61e112f636d2b0dd71d9b73a3d90e089b9300ab5dc32fb0e3a370f6af8c46159"
+                "388d82949cfe08d7f2cfed7104c91d01b8b008422b58c64f167d9bca403ed71721d70e"
+                "c4d0d272eca79672fd740d79bcb25e416be90e3895529866461e5702c73b030ad10446"
+                "7d1089cf886de1823d2ccb6e9b18addf885bda4c53f976b5bb7c16e6c9b74f1f9c06"
+                "daa510fbd76215eccc1f457c4d52a445b48613647ac184e798bb1b2d926c9cd9450b"
+                "8089d6f5553668aaf1",
+        },
         "mode": "listing",
         "listing": {"first": "{url}", "next": "{url}?page={page}", "start": 1,
             "item": "article.product-miniature",
@@ -1905,44 +1922,7 @@ def _pick_price(el, spec):
                     return value
     return None
 
-# --- kurs EUR/PLN z NBP (cache dzienny) + detekcja netto/brutto w HTML ---
-_eur_pln_cache = {"rate": None, "date": None}
-_eur_pln_lock = threading.Lock()
 
-
-def get_eur_pln_rate():
-    """Kurs EUR/PLN z NBP API (tabela A, mid). Cache dzienny.
-    Fallback: ostatni znany albo 4.30 przy błędzie sieci."""
-    with _eur_pln_lock:
-        today = datetime.now(timezone.utc).date().isoformat()
-        if _eur_pln_cache["date"] == today and _eur_pln_cache["rate"]:
-            return _eur_pln_cache["rate"]
-        try:
-            r = requests.get(
-                "https://api.nbp.pl/api/exchangerates/rates/a/eur/?format=json",
-                timeout=10,
-            )
-            r.raise_for_status()
-            rate = float(r.json()["rates"][0]["mid"])
-            _eur_pln_cache.update(rate=rate, date=today)
-            log.info("kurs EUR/PLN z NBP: %.4f", rate)
-            return rate
-        except Exception as e:
-            log.warning("NBP niedostępny (%s) — używam %.2f",
-                        e.__class__.__name__, _eur_pln_cache.get("rate") or 4.30)
-            return _eur_pln_cache.get("rate") or 4.30
-
-
-def _page_shows_netto(soup):
-    """None = brak markera (domyślnie traktujemy jak brutto),
-    True = strona pokazuje netto, False = brutto."""
-    for el in soup.select(".tax-shipping-delivery-label, [class*='tax-shipping']"):
-        text = el.get_text(" ", strip=True).lower()
-        if "brutto" in text:
-            return False
-        if "netto" in text:
-            return True
-    return None
 
 def has(tile, css):
     return tile.select_one(css) is not None or sv.match(css, tile)
@@ -1969,9 +1949,6 @@ def parse_listing(html, page_url, cfg):
         if tiles:
             break
 
-    page_netto = _page_shows_netto(soup)
-    eur_rate = None  # leniwa inicjalizacja — pobieramy dopiero gdy trafimy €
-
     products = []
     for tile in tiles:
         name = _pick(tile, cfg["name"]) or _pick(tile, cfg.get("name_fallback"))
@@ -1983,22 +1960,8 @@ def parse_listing(html, page_url, cfg):
             for pat in cfg.get("price_strip", []):
                 raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
         price = parse_price(raw_price)
-        currency = cfg.get("currency", "PLN")
 
-        # 1) Detekcja waluty — jeśli € lub EUR, konwertuj po kursie NBP
-        if price is not None and raw_price:
-            lowered = raw_price.lower()
-            if "€" in raw_price or "eur" in lowered:
-                if eur_rate is None:
-                    eur_rate = get_eur_pln_rate()
-                price = round(price * eur_rate, 2)
-                currency = "PLN"
-
-        # 2) Detekcja netto z markera strony → brutto (+VAT 23%)
-        if page_netto is True and price is not None:
-            price = round(price * 1.23, 2)
-
-        # 3) Sanity check — odrzuć absurdalne wartości (1 grosz / bańka)
+        # sanity check — odrzuć absurdalne wartości (1 grosz / bańka)
         if price is not None and not 0.5 <= price <= 50_000:
             log.debug("[listing] odrzucam cenę %r → %.2f dla %s",
                       raw_price, price, name)
@@ -2015,7 +1978,7 @@ def parse_listing(html, page_url, cfg):
             out = True
         products.append({
             "name": name.strip(),
-            "currency": currency,
+            "currency": cfg.get("currency", "PLN"),
             "hint": raw_text[:400],
             "code_raw": _pick(tile, cfg.get("code")),
             "availability": "out_of_stock" if out else "in_stock",

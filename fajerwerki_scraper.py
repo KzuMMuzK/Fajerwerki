@@ -1637,7 +1637,7 @@ _UNIT_LEAD_RE = re.compile(rf"^(?:X)\d+(?:{_UNITS})?$")
 _BLACK_RE = re.compile(r"^(?:F[1-4]|T[12]|P[12]|KAT\d|3D|4K|2K|HD|XL{1,2}|XS|RGB\d*|USB\d*|LED\d*|"
                        r"(?:CE|UN|EN|EAN|ISO|PN|DIN)\d*)$")
 _MARK_RE = re.compile(r"(?:kod(?:\s+produktu)?|nr\s*kat(?:alogowy)?\.?|numer\s+katalogowy|symbol|indeks|sku|"
-                      r"art(?:ykuł)?\.?|ref\.?|model)\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9\-_/.]{2,20})", re.I)
+                      r"art(?:ykuł)?\.?|ref\.?|model)\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9\-_/.]{2,58})", re.I)
 _SLUG_CODE_RE = re.compile(r"^[a-z]{2,5}\d{2,6}[a-z]{0,2}$")
 
 
@@ -1649,10 +1649,10 @@ def _fold(text):
 
 def _code_candidate(token, marker=False, trusted=False, slug=False):
     disp = token.strip(" \t.,;:()[]{}<>\"'!?*+")
-    if not 3 <= len(disp) <= 18 or not re.fullmatch(r"[\w][\w\-_/.]*[\w]", disp, re.U):
+    if not 3 <= len(disp) <= 60 or not re.fullmatch(r"[\w][\w\-_/.]*[\w]", disp, re.U):
         return None
     key = re.sub(r"[^0-9A-Z]", "", _fold(disp))
-    if not 3 <= len(key) <= 16 or not any(c.isdigit() for c in key):
+    if not 3 <= len(key) <= 50 or not any(c.isdigit() for c in key):
         return None
     if _UNIT_RE.match(key) and not key.isdigit() or _UNIT_LEAD_RE.match(key) or _BLACK_RE.match(key):
         return None
@@ -1681,7 +1681,6 @@ def _code_candidate(token, marker=False, trusted=False, slug=False):
     if trusted:
         score += 2
     return disp.upper(), key, score
-
 
 def extract_code(name, url=None, hint=None, sku=None, min_score=4):
     cands = []
@@ -1906,6 +1905,44 @@ def _pick_price(el, spec):
                     return value
     return None
 
+# --- kurs EUR/PLN z NBP (cache dzienny) + detekcja netto/brutto w HTML ---
+_eur_pln_cache = {"rate": None, "date": None}
+_eur_pln_lock = threading.Lock()
+
+
+def get_eur_pln_rate():
+    """Kurs EUR/PLN z NBP API (tabela A, mid). Cache dzienny.
+    Fallback: ostatni znany albo 4.30 przy błędzie sieci."""
+    with _eur_pln_lock:
+        today = datetime.now(timezone.utc).date().isoformat()
+        if _eur_pln_cache["date"] == today and _eur_pln_cache["rate"]:
+            return _eur_pln_cache["rate"]
+        try:
+            r = requests.get(
+                "https://api.nbp.pl/api/exchangerates/rates/a/eur/?format=json",
+                timeout=10,
+            )
+            r.raise_for_status()
+            rate = float(r.json()["rates"][0]["mid"])
+            _eur_pln_cache.update(rate=rate, date=today)
+            log.info("kurs EUR/PLN z NBP: %.4f", rate)
+            return rate
+        except Exception as e:
+            log.warning("NBP niedostępny (%s) — używam %.2f",
+                        e.__class__.__name__, _eur_pln_cache.get("rate") or 4.30)
+            return _eur_pln_cache.get("rate") or 4.30
+
+
+def _page_shows_netto(soup):
+    """None = brak markera (domyślnie traktujemy jak brutto),
+    True = strona pokazuje netto, False = brutto."""
+    for el in soup.select(".tax-shipping-delivery-label, [class*='tax-shipping']"):
+        text = el.get_text(" ", strip=True).lower()
+        if "brutto" in text:
+            return False
+        if "netto" in text:
+            return True
+    return None
 
 def has(tile, css):
     return tile.select_one(css) is not None or sv.match(css, tile)
@@ -1931,6 +1968,10 @@ def parse_listing(html, page_url, cfg):
         tiles = soup.select(one)
         if tiles:
             break
+
+    page_netto = _page_shows_netto(soup)
+    eur_rate = None  # leniwa inicjalizacja — pobieramy dopiero gdy trafimy €
+
     products = []
     for tile in tiles:
         name = _pick(tile, cfg["name"]) or _pick(tile, cfg.get("name_fallback"))
@@ -1942,6 +1983,27 @@ def parse_listing(html, page_url, cfg):
             for pat in cfg.get("price_strip", []):
                 raw_price = re.sub(pat, " ", raw_price, flags=re.I | re.S)
         price = parse_price(raw_price)
+        currency = cfg.get("currency", "PLN")
+
+        # 1) Detekcja waluty — jeśli € lub EUR, konwertuj po kursie NBP
+        if price is not None and raw_price:
+            lowered = raw_price.lower()
+            if "€" in raw_price or "eur" in lowered:
+                if eur_rate is None:
+                    eur_rate = get_eur_pln_rate()
+                price = round(price * eur_rate, 2)
+                currency = "PLN"
+
+        # 2) Detekcja netto z markera strony → brutto (+VAT 23%)
+        if page_netto is True and price is not None:
+            price = round(price * 1.23, 2)
+
+        # 3) Sanity check — odrzuć absurdalne wartości (1 grosz / bańka)
+        if price is not None and not 0.5 <= price <= 50_000:
+            log.debug("[listing] odrzucam cenę %r → %.2f dla %s",
+                      raw_price, price, name)
+            price = None
+
         raw_text = tile.get_text(" ", strip=True)
         text = raw_text.lower()
         out = False
@@ -1952,15 +2014,16 @@ def parse_listing(html, page_url, cfg):
         if any(t.lower() in text for t in cfg.get("out_text", [])):
             out = True
         products.append({
-            "name": name.strip(), "currency": cfg.get("currency", "PLN"),
-            "hint": raw_text[:400], "code_raw": _pick(tile, cfg.get("code")),
+            "name": name.strip(),
+            "currency": currency,
+            "hint": raw_text[:400],
+            "code_raw": _pick(tile, cfg.get("code")),
             "availability": "out_of_stock" if out else "in_stock",
             "price": price,
             "promo": promo_from_markup(tile, price, cfg.get("promo")),
             "url": urljoin(page_url, href.strip()),
         })
     return len(tiles), products
-
 
 def site_headers(name, site):
     h = dict(site.get("headers") or {})

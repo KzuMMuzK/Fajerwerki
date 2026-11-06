@@ -623,6 +623,22 @@ SITES = {
         "mode": "api",
         "store_api": {"endpoint": "https://wybuchy.pl/wp-json/wc/store/v1/products"},
     },
+    "stadiumstyle": {
+        "base": "https://stadiumstyle.pl",
+        "mode": "listing",
+        "listing": {
+            "first": "{url}",
+            "next": "{url}page/{page}/",
+            "start": 1,
+            "item": "li.product",
+            "name": "h2.woocommerce-loop-product__title",
+            "link": "a.woocommerce-LoopProduct-link@href",
+            "price": ["ins .woocommerce-Price-amount", ".woocommerce-Price-amount"],
+            "in_stock": ".instock",
+            "code": "a.add_to_cart_button@data-product_sku",
+            "categories": ["https://stadiumstyle.pl/sklep/"],
+        },
+    },
 }
 
 _tls = threading.local()

@@ -18,7 +18,6 @@ Zmienne środowiskowe (Render > Environment):
 import base64
 import copy
 import csv
-from difflib import SequenceMatcher
 import hmac
 import io
 import json
@@ -1318,54 +1317,22 @@ def _best_shop_offers(rows):
     )
 
 
-def _basket_product(c, query, price_mode="current", include_unavailable=False):
-    normalized = " ".join(fold(query).split())
-    code = keyify(query)
-    if len(code) >= 3:
-        matches = c.execute("SELECT * FROM items WHERE code_key = ? AND hidden = 0", (code,)).fetchall()
-        if matches:
-            variants = {}
-            for match in matches:
-                variants.setdefault(match["site"], set()).add(match["name_norm"])
-            warning = ("Ten kod oznacza kilka nazw/wariantów w jednym sklepie; "
-                       "sprawdź, czy wybrana oferta odpowiada dokładnie temu produktowi."
-                       if any(len(names) > 1 for names in variants.values()) else None)
-            return code, _basket_shop_offers(matches, price_mode, include_unavailable), matches[0]["name"], warning
-
-    pattern = "%" + normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-    matches = c.execute(
-        "SELECT * FROM items WHERE hidden = 0 AND name_norm LIKE ? ESCAPE '\\' LIMIT 300",
-        (pattern,),
-    ).fetchall()
-    if not matches:
-        tokens = [token for token in normalized.split() if len(token) > 1]
-        if tokens:
-            conditions = " AND ".join("name_norm LIKE ? ESCAPE '\\'" for _ in tokens)
-            matches = c.execute(
-                f"SELECT * FROM items WHERE hidden = 0 AND {conditions} LIMIT 300",
-                ["%" + token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-                 for token in tokens],
-            ).fetchall()
-    if not matches:
-        return None, [], None, "Nie znaleziono produktu."
-
-    groups = {}
-    for row in matches:
-        identity = ("code", row["code_key"]) if row["code_key"] else ("name", row["name_norm"])
-        score = SequenceMatcher(None, normalized, row["name_norm"] or "").ratio()
-        current = groups.get(identity)
-        if current is None or score > current[0]:
-            groups[identity] = (score, row)
-    identity, (score, representative) = max(groups.items(), key=lambda item: item[1][0])
-    if score < 0.35:
-        return None, [], None, "Nie udało się jednoznacznie dopasować produktu."
-    if identity[0] == "code":
-        matched = c.execute("SELECT * FROM items WHERE code_key = ? AND hidden = 0", (identity[1],)).fetchall()
+def _basket_product_by_url(c, url, price_mode="current", include_unavailable=False):
+    selected = c.execute("SELECT * FROM items WHERE url = ? AND hidden = 0", (url,)).fetchone()
+    if not selected:
+        return {"url": url, "name": "Produkt nie jest już dostępny w bazie", "offers": [],
+                "cheapest": None, "error": "Odśwież koszyk, aby usunąć tę pozycję."}
+    if selected["code_key"]:
+        matches = c.execute("SELECT * FROM items WHERE code_key = ? AND hidden = 0",
+                            (selected["code_key"],)).fetchall()
     else:
-        matched = c.execute("SELECT * FROM items WHERE name_norm = ? AND hidden = 0", (identity[1],)).fetchall()
-    offers = _basket_shop_offers(matched, price_mode, include_unavailable)
-    warning = "Dopasowanie po fragmencie nazwy — sprawdź, czy to właściwy produkt." if score < 0.75 else None
-    return identity[1] if identity[0] == "code" else None, offers, representative["name"], warning
+        matches = c.execute("SELECT * FROM items WHERE name_norm = ? AND hidden = 0",
+                            (selected["name_norm"],)).fetchall()
+    offers = _basket_shop_offers(matches, price_mode, include_unavailable)
+    cheapest = min(offers, key=lambda offer: (offer["basket_price"], offer["site"])) if offers else None
+    return {"url": url, "code": selected["code"], "name": selected["name"],
+            "offers": offers, "cheapest": cheapest,
+            "error": None if cheapest else "Brak dostępnej oferty z ceną w wybranym trybie."}
 
 
 def _basket_shop_offers(rows, price_mode, include_unavailable):
@@ -1383,20 +1350,15 @@ def _basket_shop_offers(rows, price_mode, include_unavailable):
         current = best.get(row["site"])
         if current is None or price < current["basket_price"]:
             best[row["site"]] = offer
-    return [best[site] for site in sorted(best)]
+    return sorted(best.values(), key=lambda offer: (
+        offer["avail"] != "in_stock", offer["basket_price"], offer["site"]
+    ))
 
 
-def _plan_basket(c, products, selected_site, price_mode="current", include_unavailable=False):
+def _plan_basket(c, product_urls, selected_site, price_mode="current", include_unavailable=False):
     shops = [row["site"] for row in c.execute("SELECT DISTINCT site FROM items WHERE hidden = 0 ORDER BY site")]
-    lines = []
-    for query in products:
-        code, offers, name, warning = _basket_product(
-            c, query, price_mode, include_unavailable
-        )
-        cheapest = min(offers, key=lambda offer: offer["basket_price"]) if offers else None
-        lines.append({"query": query, "code": code, "name": name, "offers": offers,
-                      "cheapest": cheapest, "warning": warning,
-                      "error": warning if not name else None})
+    lines = [_basket_product_by_url(c, url, price_mode, include_unavailable)
+             for url in product_urls]
 
     mix_total = sum(line["cheapest"]["basket_price"] for line in lines if line["cheapest"])
     mix_missing = sum(line["cheapest"] is None for line in lines)
@@ -1419,10 +1381,8 @@ def _plan_basket(c, products, selected_site, price_mode="current", include_unava
 @app.route("/basket")
 def basket():
     c = conn()
-    products_text = request.args.get("products", "")[:4000]
-    products = [line.strip()[:120] for line in products_text.splitlines() if line.strip()][:30]
-    context = common_ctx(c)
-    shops = context["shops"]
+    product_urls = list(dict.fromkeys(url[:1000] for url in request.args.getlist("u") if url))[:30]
+    shops = c.execute("SELECT site FROM items WHERE hidden = 0 GROUP BY site ORDER BY site").fetchall()
     selected_site = request.args.get("site", "").strip()
     if selected_site not in {shop["site"] for shop in shops}:
         selected_site = ""
@@ -1430,12 +1390,11 @@ def basket():
     if price_mode not in ("current", "historical"):
         price_mode = "current"
     include_unavailable = request.args.get("unavailable") == "1"
-    plan = _plan_basket(c, products, selected_site, price_mode, include_unavailable) if products else None
+    plan = _plan_basket(c, product_urls, selected_site, price_mode, include_unavailable) if product_urls else None
     template = "basket_results.html" if request.args.get("_partial") == "1" else "basket.html"
-    return render_template(template, products_text=products_text,
+    return render_template(template, product_urls=product_urls,
                            selected_site=selected_site, price_mode=price_mode,
-                           include_unavailable=include_unavailable, plan=plan, tab="basket",
-                           **context)
+                           include_unavailable=include_unavailable, plan=plan, tab="basket", shops=shops)
 
 
 @app.route("/changes")
@@ -1935,7 +1894,7 @@ TEMPLATES = {
 {% if user %}<div class="userbar"><span class="who"><img class="av" src="{{ user.avatar }}" alt="" width="24" height="24"><span class="un">{{ user.name }}</span></span>
 <a href="{{ url_for('invites') }}">Zaproszenia</a>{% if is_admin %}<a href="{{ url_for('admin_home') }}">Admin</a>{% endif %}
 <form method="post" action="{{ url_for('logout') }}" class="inl"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="lnk">Wyloguj</button></form></div>{% endif %}
-<header>{% if user %}<nav class="tabs"><a href="{{ url_for('index') }}" class="{{ 'on' if tab=='list' }}">Produkty</a><a href="{{ url_for('deals') }}" class="{{ 'on' if tab=='deals' }}">Okazje</a><a href="{{ url_for('basket') }}" class="{{ 'on' if tab=='basket' }}">Koszyk</a><a href="{{ url_for('coupons') }}" class="{{ 'on' if tab=='coupons' }}">Kody rabatowe</a><a href="{{ url_for('changes') }}" class="{{ 'on' if tab=='changes' }}">Zmiany</a></nav>{% endif %}{% block head %}{% endblock %}</header>
+<header>{% if user %}<nav class="tabs"><a href="{{ url_for('index') }}" class="{{ 'on' if tab=='list' }}">Produkty</a><a href="{{ url_for('deals') }}" class="{{ 'on' if tab=='deals' }}">Okazje</a><a href="{{ url_for('basket') }}" class="{{ 'on' if tab=='basket' }}">Koszyk <span data-cart-count>0</span></a><a href="{{ url_for('coupons') }}" class="{{ 'on' if tab=='coupons' }}">Kody rabatowe</a><a href="{{ url_for('changes') }}" class="{{ 'on' if tab=='changes' }}">Zmiany</a></nav>{% endif %}{% block head %}{% endblock %}</header>
 {% for cat, msg in messages %}<div class="{{ 'err' if cat == 'err' else 'okm' }}">{{ msg }}</div>{% endfor %}
 {% if refresh_error %}<div class="err">Nie udało się odświeżyć danych ({{ refresh_error }}). Pokazuję poprzednią wersję.</div>{% endif %}
 {% block body %}{% endblock %}
@@ -1989,6 +1948,42 @@ TEMPLATES = {
       if (storageWarning) storageWarning.hidden = !storageError;
     });
   }
+    const cartKey = 'fajerwerki-cart-v2';
+    function readCart(){
+        try {
+            const urls = JSON.parse(localStorage.getItem(cartKey) || '[]');
+            return Array.isArray(urls) ? [...new Set(urls.filter(url => typeof url === 'string'))].slice(0, 30) : [];
+        } catch (_) { return []; }
+    }
+    function updateCartControls(){
+        const urls = readCart();
+        document.querySelectorAll('[data-cart-count]').forEach(node => { node.textContent = urls.length; });
+        document.querySelectorAll('[data-cart-add]').forEach(button => {
+            const added = urls.includes(button.dataset.url);
+            button.textContent = added ? 'Dodano' : urls.length >= 30 ? 'Koszyk pełny' : 'Dodaj do koszyka';
+            button.disabled = added || urls.length >= 30;
+        });
+    }
+    window.fajerwerkiCart = {
+        read: readCart,
+        write(urls){
+            try {
+                localStorage.setItem(cartKey, JSON.stringify([...new Set(urls)].slice(0, 30)));
+                updateCartControls();
+                window.dispatchEvent(new Event('fajerwerki:cart-updated'));
+                return true;
+            } catch (_) { return false; }
+        },
+    };
+    document.addEventListener('click', event => {
+        const button = event.target.closest('[data-cart-add]');
+        if (!button) return;
+        const urls = readCart();
+        if (!urls.includes(button.dataset.url)) urls.push(button.dataset.url);
+        window.fajerwerkiCart.write(urls);
+    });
+    document.addEventListener('fajerwerki:products-updated', updateCartControls);
+    updateCartControls();
   document.addEventListener('change', event => {
     const input = event.target.closest('[data-store-coupon]');
     if (!input) return;
@@ -2611,9 +2606,9 @@ TEMPLATES = {
 {% if it.key_shops and it.key_shops > 1 %}{% if it.avail=='in_stock' and it.price is not none and it.price == it.key_min %}<span class="best">najtaniej</span>{% endif %}<a class="mini" href="{{ url_for('compare', k=it.code_key) }}">{{ it.key_shops|shops }}</a>{% endif %}
 </div><div class="note">zmiana: {{ it.changed_at|dt }}</div>
 {{ coupon_controls(it) }}
-{% if it.cheapest_url or is_admin %}<div class="qa">{% if it.cheapest_url %}<a class="btn sm" href="{{ it.cheapest_url }}" target="_blank" rel="noopener noreferrer">Najtaniej teraz</a>{% endif %}{% if is_admin %}<form method="post" action="{{ url_for('admin_quick') }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="u" value="{{ it.url }}"><input type="hidden" name="back" value="{{ request.full_path.rstrip('?') }}">
+<div class="qa"><button type="button" class="sec sm" data-cart-add data-url="{{ it.url }}">Dodaj do koszyka</button>{% if it.cheapest_url %}<a class="btn sm" href="{{ it.cheapest_url }}" target="_blank" rel="noopener noreferrer">Najtaniej teraz</a>{% endif %}{% if is_admin %}<form method="post" action="{{ url_for('admin_quick') }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="u" value="{{ it.url }}"><input type="hidden" name="back" value="{{ request.full_path.rstrip('?') }}">
 <button class="sec sm" name="act" value="{{ 'unpin' if it.rank is not none else 'pin' }}">{{ 'Odepnij' if it.rank is not none else 'Przypnij na górze' }}</button>
-<button class="sec sm" name="act" value="{{ 'unhide' if it.hidden else 'hide' }}">{{ 'Pokaż' if it.hidden else 'Ukryj' }}</button><a class="btn sm sec" href="{{ url_for('admin_product', u=it.url) }}">Edytuj</a></form>{% endif %}</div>{% endif %}</div>{% endmacro %}""",
+<button class="sec sm" name="act" value="{{ 'unhide' if it.hidden else 'hide' }}">{{ 'Pokaż' if it.hidden else 'Ukryj' }}</button><a class="btn sm sec" href="{{ url_for('admin_product', u=it.url) }}">Edytuj</a></form>{% endif %}</div></div>{% endmacro %}""",
 
     "error.html": """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>{{ css|safe }}</style>
 <body><div class="wrap center"><h1>Coś poszło nie tak</h1><p>{{ msg }}</p><p class="note">Sprawdź zmienne DATA_REPO i DATA_TOKEN oraz czy plik fajerwerki.db jest w repo z danymi.</p></div></body>""",
@@ -2731,49 +2726,52 @@ TEMPLATES = {
 {% else %}<p class="note">Brak historii cen dla tych ofert.</p>{% endif %}
 {% for r in rows %}{{ card(r) }}{% endfor %}{% endblock %}""",
 
-    "basket.html": """{% extends 'base.html' %}
-{% block body %}<h1>Planer koszyka</h1><p class="note">Wpisz po jednej nazwie lub kodzie produktu w wierszu. Sumy nie uwzględniają dostawy.</p>
-<form method="get" action="{{ url_for('basket') }}" class="f" data-basket-form><label style="grid-column:1/3">Produkty<textarea name="products" rows="7" placeholder="PXO310&#10;Nazwa produktu">{{ products_text }}</textarea></label>
-<label>Ceny<select name="price_mode"><option value="current" {{ 'selected' if price_mode=='current' }}>Aktualne</option><option value="historical" {{ 'selected' if price_mode=='historical' }}>Najniższe historyczne</option></select></label>
-<label>Sklep do sprawdzenia<select name="site"><option value="">Wszystkie sklepy</option>{% for sh in shops %}<option value="{{ sh.site }}" {{ 'selected' if sh.site==selected_site }}>{{ sh.site }}</option>{% endfor %}</select></label>
-<label class="chk" style="grid-column:1/3"><input type="checkbox" name="unavailable" value="1" {{ 'checked' if include_unavailable }}> Uwzględnij produkty obecnie niedostępne</label>
-<button style="grid-column:1/3">Policz koszyk</button></form>
+        "basket.html": """{% extends 'base.html' %}
+{% block body %}<h1>Koszyk</h1><p class="note">Dodaj produkty z listy, a tutaj porównasz aktualne oferty i pełne koszyki sklepów.</p>
+<div id="basket-settings" data-endpoint="{{ url_for('basket') }}" class="f">
+<label>Cena<select id="basket-price-mode"><option value="current">Aktualna</option><option value="historical">Najniższa historyczna</option></select></label>
+<label>Sklep<select id="basket-site"><option value="">Porównaj wszystkie</option>{% for sh in shops %}<option value="{{ sh.site }}">{{ sh.site }}</option>{% endfor %}</select></label>
+<label class="chk" style="grid-column:1/3"><input type="checkbox" id="basket-unavailable"> Uwzględnij także niedostępne oferty</label>
+<button type="button" class="sec" data-cart-clear style="grid-column:1/3">Wyczyść koszyk</button></div>
+<p id="basket-status" class="note" role="status" aria-live="polite">Wczytywanie koszyka...</p>
 {% include 'basket_results.html' %}
 <script>
 (() => {
-  const form = document.querySelector('[data-basket-form]');
-  const products = form.elements.products;
-  let result = document.getElementById('basket-results');
-  let timer;
-  let controller;
-  async function updateBasket() {
-    if (controller) controller.abort();
-    controller = new AbortController();
-    const url = new URL(form.action, location.href);
-    for (const [key, value] of new FormData(form)) {
-      if (key !== 'unavailable' || form.elements.unavailable.checked) url.searchParams.append(key, value);
+    const settings = document.getElementById('basket-settings');
+    const status = document.getElementById('basket-status');
+    const cart = window.fajerwerkiCart;
+    let controller;
+    async function renderBasket(){
+        if (controller) controller.abort();
+        controller = new AbortController();
+        const urls = cart.read();
+        const params = new URLSearchParams({ _partial: '1', price_mode: document.getElementById('basket-price-mode').value,
+            site: document.getElementById('basket-site').value });
+        if (document.getElementById('basket-unavailable').checked) params.set('unavailable', '1');
+        urls.forEach(url => params.append('u', url));
+        status.textContent = 'Przeliczam oferty...';
+        try {
+            const response = await fetch(`${settings.dataset.endpoint}?${params}`, { signal: controller.signal });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const parsed = new DOMParser().parseFromString(await response.text(), 'text/html');
+            const current = document.getElementById('basket-results');
+            const next = parsed.getElementById('basket-results');
+            if (!current || !next) throw new Error('Nieprawidłowa odpowiedź serwera.');
+            current.replaceWith(next);
+            status.textContent = `${urls.length} ${urls.length === 1 ? 'produkt' : 'produktów'} w koszyku`;
+        } catch (error) {
+            if (error.name !== 'AbortError') status.textContent = 'Nie udało się przeliczyć koszyka. Spróbuj ponownie.';
+        }
     }
-    if (form.elements.unavailable.checked) url.searchParams.set('unavailable', '1');
-    url.searchParams.set('_partial', '1');
-    try {
-      const response = await fetch(url, { signal: controller.signal });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const parsed = new DOMParser().parseFromString(await response.text(), 'text/html');
-      const next = parsed.getElementById('basket-results');
-      if (!next || !result.isConnected) throw new Error('Nieprawidłowa odpowiedź serwera.');
-      result.replaceWith(next);
-      result = next;
-      url.searchParams.delete('_partial');
-      history.replaceState(null, '', url);
-    } catch (error) {
-      if (error.name !== 'AbortError') result.textContent = 'Nie udało się przeliczyć koszyka. Spróbuj ponownie.';
-    }
-  }
-  form.addEventListener('submit', event => { event.preventDefault(); clearTimeout(timer); updateBasket(); });
-  form.addEventListener('input', event => {
-    if (event.target === products) { clearTimeout(timer); timer = setTimeout(updateBasket, 350); }
-  });
-  form.addEventListener('change', () => { clearTimeout(timer); updateBasket(); });
+    document.addEventListener('click', event => {
+        const remove = event.target.closest('[data-cart-remove]');
+        if (remove) cart.write(cart.read().filter(url => url !== remove.dataset.url));
+        if (event.target.closest('[data-cart-clear]')) cart.write([]);
+    });
+    settings.addEventListener('change', renderBasket);
+    window.addEventListener('fajerwerki:cart-updated', renderBasket);
+    window.addEventListener('storage', renderBasket);
+    renderBasket();
 })();
 </script>{% endblock %}""",
     "coupons.html": """{% extends 'base.html' %}{% block body %}<h1>Kody rabatowe</h1><p class="note">Sprawdź warunki i ważność kodu przed zakupem. Sklepy mogą wykluczać produkty w promocji; scraper wykrywa tylko część takich oznaczeń, więc brak etykiety nie potwierdza, że kod zadziała.</p>
@@ -2782,14 +2780,14 @@ TEMPLATES = {
 {% if c.terms %}<p>{{ c.terms }}</p>{% endif %}{% if c.excludes_promos %}<p class="note">Nie łączy się z innymi promocjami.</p>{% endif %}<div class="note">{% if c.valid_until %}ważny do {{ c.valid_until|dt('%d.%m.%Y') }}{% else %}brak podanej daty końca{% endif %}{% if c.source %} · <a href="{{ c.source }}" target="_blank" rel="noopener noreferrer" style="text-decoration:underline">źródło</a>{% endif %}</div></div>
 {% else %}<div class="card">Nie ma teraz aktywnych kodów rabatowych.</div>{% endfor %}{% endblock %}""",
 
-    "basket_results.html": """<div id="basket-results">{% if plan %}<h2>Porównanie sum</h2><div class="stats"><div class="stat"><span class="note">Najtańszy miks sklepów</span><b>{{ plan.mix_total|pln }}</b><span class="note">{% if plan.mix_missing %}brak {{ plan.mix_missing }} pozycji{% else %}wszystkie pozycje{% endif %}</span></div>
-<div class="stat"><span class="note">Najtaniej w jednym sklepie</span><b>{{ plan.best_store.total|pln if plan.best_store else 'brak pełnej oferty' }}</b><span class="note">{{ plan.best_store.site if plan.best_store else 'żaden sklep nie ma wszystkich pozycji' }}{% if plan.best_store and plan.best_store.missing %} · brak {{ plan.best_store.missing }}{% endif %}</span></div></div>
-<p class="note">Tryb: {{ 'historyczne minimum' if plan.price_mode=='historical' else 'aktualne ceny' }}{% if plan.include_unavailable %}; uwzględniono także niedostępne{% else %}; tylko dostępne{% endif %}. Historyczna cena nie oznacza, że produkt można teraz kupić.</p>
-{% if selected_site %}<div class="card"><b>{{ selected_site }}:</b> {% if plan.selected_total and not plan.selected_total.missing %}{{ plan.selected_total.total|pln }}{% elif plan.selected_total %}brakuje {{ plan.selected_total.missing }} pozycji{% else %}brak danych{% endif %}</div>{% endif %}
-{% for line in plan.lines %}<div class="card"><div class="top"><span class="code">{{ line.query }}</span>{% if line.cheapest %}<span class="best">{{ line.cheapest.site }} · {{ line.cheapest.basket_price|pln }}</span>{% endif %}</div>
-{% if line.name %}<div>{{ line.name }}</div>{% endif %}{% if line.error %}<div class="err">{{ line.error }}</div>{% elif line.warning %}<div class="note">{{ line.warning }}</div>{% endif %}
-{% if line.cheapest %}<div class="note">{% if line.cheapest.historical_price %}najniższa cena historyczna{% elif line.cheapest.avail=='in_stock' %}dostępny{% else %}obecnie niedostępny{% endif %}{% if line.cheapest.promo %} · wykryto promocję — kupon może nie obowiązywać{% endif %}</div><a class="btn sm" href="{{ line.cheapest.url }}" target="_blank" rel="noopener noreferrer">Otwórz ofertę</a>{% elif line.name %}<div class="note">Brak oferty pasującej do wybranych przełączników.</div>{% endif %}</div>{% endfor %}
-<details><summary>Porównaj sumy we wszystkich sklepach</summary>{% for total in plan.shop_totals %}<div class="row"><span>{{ total.site }}</span><span>{% if total.missing %}brakuje {{ total.missing }} pozycji · suma częściowa {{ total.total|pln }}{% else %}{{ total.total|pln }}{% endif %}</span></div>{% endfor %}</details>{% endif %}</div>""",
+    "basket_results.html": """<div id="basket-results">{% if plan %}<div class="stats"><div class="stat"><span class="note">Najtańszy miks sklepów</span><b>{{ plan.mix_total|pln }}</b><span class="note">{% if plan.mix_missing %}brak ofert dla {{ plan.mix_missing }} pozycji{% else %}wszystkie pozycje dostępne{% endif %}</span></div>
+<div class="stat"><span class="note">Najtaniej w jednym sklepie</span><b>{{ plan.best_store.total|pln if plan.best_store else 'brak pełnej oferty' }}</b><span class="note">{{ plan.best_store.site if plan.best_store else 'żaden sklep nie ma wszystkich dostępnych pozycji' }}</span></div></div>
+{% if plan.price_mode=='historical' %}<p class="note">Ceny historyczne nie oznaczają dostępności produktu w tej chwili.</p>{% endif %}
+{% if selected_site %}<div class="card"><b>{{ selected_site }}:</b> {% if plan.selected_total and not plan.selected_total.missing %}{{ plan.selected_total.total|pln }} · pełny koszyk{% elif plan.selected_total %}brak ofert dla {{ plan.selected_total.missing }} pozycji{% else %}brak danych{% endif %}</div>{% endif %}
+{% for line in plan.lines %}<div class="card"><div class="top"><strong>{{ line.name }}</strong>{% if line.code %}<span class="code">{{ line.code }}</span>{% endif %}<button type="button" class="sec sm" data-cart-remove data-url="{{ line.url }}">Usuń</button></div>
+{% if line.error %}<p class="note">{{ line.error }}</p>{% endif %}
+{% for offer in line.offers %}<div class="row"><span>{{ offer.site }} · {{ 'dostępny' if offer.avail=='in_stock' else 'niedostępny' }}</span><span class="price">{{ offer.basket_price|pln }}</span>{% if offer.url==line.cheapest.url %}<span class="best">najkorzystniej</span>{% endif %}<a class="mini" href="{{ offer.url }}" target="_blank" rel="noopener noreferrer">Otwórz ofertę</a></div>{% else %}<p class="note">Brak pasujących ofert z ceną w wybranym trybie.</p>{% endfor %}</div>{% endfor %}
+<details><summary>Porównaj pełny koszyk w każdym sklepie</summary>{% for total in plan.shop_totals %}<div class="row"><span>{{ total.site }}</span><span>{% if total.missing %}brak {{ total.missing }} pozycji · suma częściowa {{ total.total|pln }}{% else %}pełny koszyk · {{ total.total|pln }}{% endif %}</span></div>{% else %}<p class="note">Brak sklepów z ofertami.</p>{% endfor %}</details>{% else %}<div class="card">Koszyk jest pusty. Dodaj produkty z listy produktów.</div>{% endif %}</div>""",
 
     "deals.html": """{% extends 'base.html' %}
 {% block body %}<h1>Okazje</h1><p class="note">Porównanie dostępnych ofert między sklepami. Procent pokazuje oszczędność względem najwyższej ceny.</p>

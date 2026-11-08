@@ -823,7 +823,8 @@ def lowest_price_chart(points, w=680, h=250):
         label = htmllib.escape(
             f"{date} | {point['site']} | {point['price']:.2f} zł | {status}", quote=True
         )
-        markers.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4" class="price-point"><title>{label}</title></circle>')
+        markers.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4" class="price-point" '
+                   f'data-x="{px:.1f}" data-tooltip="{label}"><title>{label}</title></circle>')
     fmt = lambda ts: ts.astimezone(TZ).strftime("%d.%m.%Y")
     return (f'<svg viewBox="0 0 {w} {h}" class="chart price-history" role="img" '
             f'aria-label="Najniższa cena w czasie, najedź na punkt po szczegóły">'
@@ -1910,7 +1911,7 @@ details{margin-top:8px}summary{color:var(--mut);cursor:pointer;font-size:14px}.f
 .best{background:#fef0c7;color:#93370d;font-size:12px;font-weight:700;border-radius:6px;padding:1px 7px}.mini{font-size:13px;color:var(--mut);margin-left:auto;text-decoration:underline}
 .qa{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;align-items:center}.qa form{margin:0}.pager{display:flex;justify-content:space-between;align-items:center;margin:14px 0}.pager a{background:var(--chip);padding:9px 14px;border-radius:10px;font-weight:600}.pager .off{opacity:.35}
 .coupon-options{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;margin-top:8px;padding-top:7px;border-top:1px solid var(--line)}.coupon-choice{display:flex;align-items:center;gap:5px;font-size:13px}.coupon-choice input{width:auto}.coupon-result{display:inline-flex;align-items:baseline;gap:7px}.coupon-result-note{flex-basis:100%}
-.chart{width:100%;height:auto;margin:6px 0}.chart .line{fill:none;stroke:var(--accent);stroke-width:2}.chart .dot{fill:var(--accent)}.chart .ax{font-size:10px;fill:var(--mut)}.chart .oos{fill:var(--no);opacity:.18}
+.chart{width:100%;height:auto;margin:6px 0}.chart .line{fill:none;stroke:var(--accent);stroke-width:2}.chart .dot{fill:var(--accent)}.chart .ax{font-size:10px;fill:var(--mut)}.chart .oos{fill:var(--no);opacity:.18}.chart .price-point{fill:var(--accent);stroke:var(--card);stroke-width:2}.price-chart-wrap{position:relative}.price-chart-tooltip{position:absolute;z-index:3;max-width:min(320px,calc(100% - 8px));padding:6px 9px;border:1px solid var(--line);border-radius:6px;background:var(--fg);color:var(--bg);font-size:12px;line-height:1.35;box-shadow:0 2px 8px #0003;pointer-events:none}.price-chart-wrap svg{display:block;cursor:crosshair}
 table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:6px 4px;border-bottom:1px solid var(--line);text-align:left}h1{font-size:19px;margin:14px 0 4px}h2{font-size:16px;margin:18px 0 6px}
 .err{background:#fee4e2;color:#7a271a;border-radius:10px;padding:8px 10px;margin:8px 0;font-size:14px}.okm{background:#d1fadf;color:#05603a;border-radius:10px;padding:8px 10px;margin:8px 0;font-size:14px}
 .note{color:var(--mut);font-size:13px}.stats{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:8px 12px}.stat b{display:block;font-size:18px}
@@ -2608,11 +2609,11 @@ TEMPLATES = {
 <a class="name" href="{{ url_for('product', u=it.url) }}">{{ it.name }}</a><div class="row"><span class="price" data-coupon-base>{{ it.price|pln }}</span>{% if coupon_options and it.price is not none %}<span class="coupon-result" data-coupon-result hidden><span class="old" data-coupon-original></span><b class="price" data-coupon-discounted></b></span>{% endif %}
 {% if it.prev_price and it.price is not none and it.price != it.prev_price %}<span class="old">{{ it.prev_price|pln }}</span><span class="{{ 'down' if it.price < it.prev_price else 'up' }}">{{ '−' if it.price < it.prev_price else '+' }}{{ it.drop_pct|pct }}</span>{% endif %}
 {% if it.key_shops and it.key_shops > 1 %}{% if it.avail=='in_stock' and it.price is not none and it.price == it.key_min %}<span class="best">najtaniej</span>{% endif %}<a class="mini" href="{{ url_for('compare', k=it.code_key) }}">{{ it.key_shops|shops }}</a>{% endif %}
-</div>{% if it.cheapest_url %}<a class="btn sm" href="{{ it.cheapest_url }}" target="_blank" rel="noopener noreferrer">Najtaniej teraz</a>{% endif %}<div class="note">zmiana: {{ it.changed_at|dt }}</div>
+</div><div class="note">zmiana: {{ it.changed_at|dt }}</div>
 {{ coupon_controls(it) }}
-{% if is_admin %}<form method="post" action="{{ url_for('admin_quick') }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="u" value="{{ it.url }}"><input type="hidden" name="back" value="{{ request.full_path.rstrip('?') }}">
+{% if it.cheapest_url or is_admin %}<div class="qa">{% if it.cheapest_url %}<a class="btn sm" href="{{ it.cheapest_url }}" target="_blank" rel="noopener noreferrer">Najtaniej teraz</a>{% endif %}{% if is_admin %}<form method="post" action="{{ url_for('admin_quick') }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="u" value="{{ it.url }}"><input type="hidden" name="back" value="{{ request.full_path.rstrip('?') }}">
 <button class="sec sm" name="act" value="{{ 'unpin' if it.rank is not none else 'pin' }}">{{ 'Odepnij' if it.rank is not none else 'Przypnij na górze' }}</button>
-<button class="sec sm" name="act" value="{{ 'unhide' if it.hidden else 'hide' }}">{{ 'Pokaż' if it.hidden else 'Ukryj' }}</button><a class="btn sm sec" href="{{ url_for('admin_product', u=it.url) }}">Edytuj</a></form>{% endif %}</div>{% endmacro %}""",
+<button class="sec sm" name="act" value="{{ 'unhide' if it.hidden else 'hide' }}">{{ 'Pokaż' if it.hidden else 'Ukryj' }}</button><a class="btn sm sec" href="{{ url_for('admin_product', u=it.url) }}">Edytuj</a></form>{% endif %}</div>{% endif %}</div>{% endmacro %}""",
 
     "error.html": """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>{{ css|safe }}</style>
 <body><div class="wrap center"><h1>Coś poszło nie tak</h1><p>{{ msg }}</p><p class="note">Sprawdź zmienne DATA_REPO i DATA_TOKEN oraz czy plik fajerwerki.db jest w repo z danymi.</p></div></body>""",
@@ -2697,7 +2698,37 @@ TEMPLATES = {
 
     "compare.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}
     {% block body %}<h1>{{ rows[0].name }}</h1><p class="note">{% if key %}Kod {{ key }} · {% endif %}{{ rows|length }} ofert, dostępne przed niedostępnymi, od najtańszej. Najedź na punkt wykresu po szczegóły.</p>
-    {% if chart %}{{ chart|safe }}{% else %}<p class="note">Brak historii cen dla tych ofert.</p>{% endif %}
+        {% if chart %}<div class="price-chart-wrap">{{ chart|safe }}<div class="price-chart-tooltip" role="status" hidden></div></div>
+<script>
+(() => {
+    const wrap = document.querySelector('.price-chart-wrap');
+    if (!wrap) return;
+    const svg = wrap.querySelector('svg.price-history');
+    const tooltip = wrap.querySelector('.price-chart-tooltip');
+    const points = [...svg.querySelectorAll('.price-point')].map(point => ({
+        x: Number(point.dataset.x),
+        label: point.dataset.tooltip,
+    }));
+    if (!points.length) return;
+    wrap.addEventListener('pointermove', event => {
+        const rect = svg.getBoundingClientRect();
+        const x = (event.clientX - rect.left) * svg.viewBox.baseVal.width / rect.width;
+        let nearest = points[0];
+        for (const point of points) {
+            if (Math.abs(point.x - x) < Math.abs(nearest.x - x)) nearest = point;
+        }
+        tooltip.textContent = nearest.label;
+        tooltip.hidden = false;
+        const bounds = wrap.getBoundingClientRect();
+        const left = event.clientX - bounds.left + 12;
+        const top = event.clientY - bounds.top - tooltip.offsetHeight - 12;
+        tooltip.style.left = `${Math.max(4, Math.min(left, bounds.width - tooltip.offsetWidth - 4))}px`;
+        tooltip.style.top = `${Math.max(4, top)}px`;
+    });
+    wrap.addEventListener('pointerleave', () => { tooltip.hidden = true; });
+})();
+</script>
+{% else %}<p class="note">Brak historii cen dla tych ofert.</p>{% endif %}
 {% for r in rows %}{{ card(r) }}{% endfor %}{% endblock %}""",
 
     "basket.html": """{% extends 'base.html' %}

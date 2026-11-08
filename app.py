@@ -1364,17 +1364,27 @@ def _plan_basket(c, product_urls, selected_site, price_mode="current", include_u
     mix_missing = sum(line["cheapest"] is None for line in lines)
     shop_totals = []
     for shop in shops:
-        selected = [next((offer for offer in line["offers"] if offer["site"] == shop), None)
-                    for line in lines]
-        missing = sum(offer is None for offer in selected)
-        shop_totals.append({"site": shop, "total": sum(offer["basket_price"] for offer in selected if offer),
-                            "missing": missing})
+        products = []
+        for line in lines:
+            offer = next((offer for offer in line["offers"] if offer["site"] == shop), None)
+            if offer:
+                products.append({"name": line["name"], "url": offer["url"],
+                                 "price": offer["basket_price"], "availability": offer["avail"]})
+        shop_totals.append({"site": shop, "total": sum(product["price"] for product in products),
+                            "count": len(products), "products": products,
+                            "missing": len(lines) - len(products)})
     complete = [total for total in shop_totals if total["missing"] == 0]
     best_store = min(complete, key=lambda total: total["total"]) if complete else None
+    most_products_store = max(
+        shop_totals, key=lambda total: (total["count"], -total["total"], total["site"]), default=None
+    )
+    if most_products_store and not most_products_store["count"]:
+        most_products_store = None
     selected_total = next((total for total in shop_totals if total["site"] == selected_site), None)
     return {"lines": lines, "mix_total": mix_total, "mix_missing": mix_missing,
             "shop_totals": sorted(shop_totals, key=lambda total: (total["missing"], total["total"])),
-            "best_store": best_store, "selected_total": selected_total,
+            "best_store": best_store, "most_products_store": most_products_store,
+            "selected_total": selected_total,
             "price_mode": price_mode, "include_unavailable": include_unavailable}
 
 
@@ -1846,11 +1856,11 @@ def favicon():
 
 # ----------------------------------------------------------------------------- wygląd
 CSS = """
-:root{--bg:#f6f7f9;--card:#fff;--fg:#14171c;--mut:#667085;--line:#e4e7ec;--accent:#d92d20;--ok:#12b76a;--no:#98a2b3;--chip:#eef1f5}
-@media(prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#171b22;--fg:#eceff4;--mut:#98a2b3;--line:#2a303a;--accent:#ff6b5e;--chip:#222833}}
+:root{--bg:#080d18;--card:rgba(13,21,37,.9);--fg:#f1f5fb;--mut:#a6b1c3;--line:rgba(184,202,229,.18);--accent:#ff765f;--ok:#48d6a0;--no:#7e899b;--chip:rgba(143,164,193,.13)}
+@media(prefers-color-scheme:dark){:root{--bg:#080d18;--card:rgba(13,21,37,.9);--fg:#f1f5fb;--mut:#a6b1c3;--line:rgba(184,202,229,.18);--accent:#ff765f;--ok:#48d6a0;--no:#7e899b;--chip:rgba(143,164,193,.13)}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 a{color:inherit;text-decoration:none}.wrap{max-width:760px;margin:0 auto;padding:0 12px 40px}
-header{position:sticky;top:0;background:var(--bg);padding:8px 0;z-index:5;border-bottom:1px solid var(--line)}
+header{position:sticky;top:0;background:rgba(8,13,24,.84);backdrop-filter:blur(12px);padding:8px 0;z-index:5;border-bottom:1px solid var(--line)}
 .userbar{display:flex;gap:12px;align-items:center;font-size:14px;padding:8px 0 0;flex-wrap:wrap}.userbar a{color:var(--mut);text-decoration:underline}
 .av{border-radius:50%;background:var(--chip)}.un{font-weight:600}.inl{display:inline;margin:0}.lnk{background:none;border:0;color:var(--mut);text-decoration:underline;padding:0;font:inherit;cursor:pointer;font-weight:400}
 .tabs{display:flex;gap:6px;margin-bottom:8px}.tabs a{flex:1;text-align:center;padding:7px 4px;border-radius:10px;background:var(--chip);font-weight:600;font-size:14px}
@@ -1861,7 +1871,7 @@ button,.btn{font:inherit;background:var(--accent);color:#fff;border:0;border-rad
 .sec{background:var(--chip);color:var(--fg)}.dng{background:#b42318}.sm{padding:5px 10px;font-size:13px}
 details{margin-top:8px}summary{color:var(--mut);cursor:pointer;font-size:14px}.f{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
 .f label{font-size:13px;color:var(--mut);display:flex;flex-direction:column;gap:3px}.f .chk{flex-direction:row;align-items:center;gap:8px;font-size:15px;color:var(--fg)}
-.meta{color:var(--mut);font-size:13px;margin:10px 2px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:11px 12px;margin:8px 0}.card.dim{opacity:.55}
+.meta{color:var(--mut);font-size:13px;margin:10px 2px}.card{background:var(--card);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:10px;padding:11px 12px;margin:8px 0}.card.dim{opacity:.55}
 .top{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:12px;margin-bottom:4px}.shop{background:var(--chip);border-radius:6px;padding:1px 7px;font-weight:600}
 .code{border:1px solid var(--line);border-radius:6px;padding:0 6px;color:var(--mut)}.dot{width:9px;height:9px;border-radius:50%;background:var(--no);margin-left:auto}.dot.ok{background:var(--ok)}
 .name{font-weight:600;display:block;margin-bottom:6px}.row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}.price{font-size:20px;font-weight:700}
@@ -1881,8 +1891,18 @@ ul.clean{padding-left:18px;margin:6px 0}.who{display:flex;gap:8px;align-items:ce
 /* ---------- fajerwerki w tle ---------- */
 body{position:relative;isolation:isolate}
 body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;
-  background:radial-gradient(1200px 600px at 20% -10%,rgba(217,45,32,.10),transparent 60%),
-             radial-gradient(1000px 500px at 90% 110%,rgba(88,101,242,.10),transparent 60%)}
+    background:
+        radial-gradient(1px 1px at 8% 18%,rgba(228,239,255,.82) 99%,transparent 100%),
+        radial-gradient(1px 1px at 17% 72%,rgba(190,216,255,.72) 99%,transparent 100%),
+        radial-gradient(1px 1px at 31% 34%,rgba(255,255,255,.72) 99%,transparent 100%),
+        radial-gradient(1px 1px at 44% 11%,rgba(217,232,255,.7) 99%,transparent 100%),
+        radial-gradient(1px 1px at 58% 64%,rgba(255,255,255,.68) 99%,transparent 100%),
+        radial-gradient(1px 1px at 72% 25%,rgba(190,216,255,.76) 99%,transparent 100%),
+        radial-gradient(1px 1px at 86% 57%,rgba(255,255,255,.7) 99%,transparent 100%),
+        radial-gradient(1px 1px at 94% 12%,rgba(221,232,255,.72) 99%,transparent 100%),
+        radial-gradient(700px 420px at 12% 2%,rgba(42,112,151,.19),transparent 72%),
+        radial-gradient(760px 480px at 88% 8%,rgba(180,69,66,.14),transparent 72%),
+        linear-gradient(180deg,#07101f 0%,#090e1b 54%,#12111d 100%)}
 """
 
 
@@ -2035,8 +2055,8 @@ TEMPLATES = {
   addEventListener('resize', resize);
 
   const isMobile = /Mobi|Android/i.test(navigator.userAgent) || innerWidth < 700;
-  const MAX_PARTICLES = isMobile ? 1000 : 2600;
-  const MAX_ROCKETS   = 20;
+    const MAX_PARTICLES = isMobile ? 800 : 1900;
+    const MAX_ROCKETS   = isMobile ? 8 : 14;
 
   const PALETTES = {
     redGold: [0, 15, 40],
@@ -2074,6 +2094,7 @@ TEMPLATES = {
       trail: !!o.trail, trailLen: o.trailLen || 8,
       flicker: !!o.flicker, strobe: !!o.strobe,
       swim: !!o.swim, swimPhase: o.swimPhase || 0, swimAmp: o.swimAmp || 2,
+    flash: !!o.flash,
       hist: [],
       splitAt: o.splitAt || 0, splitType: o.splitType || null, splitDone: false,
       _colCache: null,
@@ -2114,6 +2135,8 @@ TEMPLATES = {
           flicker: opts.flicker, strobe: opts.strobe }));
     }
     if (!opts.noFlash){
+            addParticle(makeParticle(x, y, 0, 0, 14, color,
+                { size: 38 * power, gravity: 0, drag: 1, flash: true }));
       for (let i = 0; i < 6; i++){
         const ang = Math.random()*Math.PI*2, s = rnd(0.2, 0.9) * power;
         addParticle(makeParticle(x, y, Math.cos(ang)*s, Math.sin(ang)*s,
@@ -2331,7 +2354,7 @@ TEMPLATES = {
       x, y: baseY, vx: rnd(-0.3, 0.3), vy: -rnd(8.5, 11),
       targetY, hue: pick(pal), effect, pal,
       wobblePhase: rnd(0, Math.PI*2), wobbleAmp: rnd(0.15, 0.5),
-      age: 0,
+    age: 0, hist: [],
       power: heightPower(targetY),
     });
   }
@@ -2489,6 +2512,21 @@ TEMPLATES = {
 
     const color = particleColor(p, age);
 
+        if (p.flash){
+            const radius = p.size * (0.25 + age * 0.75);
+            const hue = p.hue === null ? 42 : p.hue;
+            const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, radius);
+            glow.addColorStop(0, `hsla(${hue}, 100%, 96%, ${alpha})`);
+            glow.addColorStop(0.14, `hsla(${hue}, 100%, 76%, ${alpha * 0.8})`);
+            glow.addColorStop(1, `hsla(${hue}, 100%, 55%, 0)`);
+            ctx.fillStyle = glow;
+            ctx.globalAlpha = 1;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, radius, 0, Math.PI*2);
+            ctx.fill();
+            return;
+        }
+
     if (p.trail && p.hist.length >= 4){
       const N = p.hist.length;
       const mid = (N >> 2) << 1;
@@ -2534,6 +2572,8 @@ TEMPLATES = {
 
     for (let i = rockets.length - 1; i >= 0; i--){
       const r = rockets[i];
+    r.hist.push(r.x, r.y);
+    if (r.hist.length > 22) r.hist.splice(0, 2);
       r.age += dt;
       const wob = Math.sin(r.age * 0.15 + r.wobblePhase) * r.wobbleAmp;
       r.x += (r.vx + wob * 0.1) * dt;
@@ -2549,9 +2589,27 @@ TEMPLATES = {
       }
 
       const rc = r.hue === null ? '#ffffff' : `hsl(${r.hue}, 100%, 78%)`;
+            if (r.hist.length >= 4){
+                const tail = ctx.createLinearGradient(r.hist[0], r.hist[1], r.x, r.y);
+                tail.addColorStop(0, 'rgba(255,255,255,0)');
+                tail.addColorStop(1, rc);
+                ctx.strokeStyle = tail;
+                ctx.globalAlpha = 0.85;
+                ctx.lineWidth = 2.2;
+                ctx.beginPath();
+                ctx.moveTo(r.hist[0], r.hist[1]);
+                for (let point = 2; point < r.hist.length; point += 2){
+                    ctx.lineTo(r.hist[point], r.hist[point + 1]);
+                }
+                ctx.lineTo(r.x, r.y);
+                ctx.stroke();
+            }
       ctx.fillStyle = rc;
       ctx.globalAlpha = 0.35;
+            ctx.shadowBlur = 18;
+            ctx.shadowColor = rc;
       ctx.beginPath(); ctx.arc(r.x, r.y, 9, 0, Math.PI*2); ctx.fill();
+            ctx.shadowBlur = 0;
       ctx.globalAlpha = 1;
       ctx.beginPath(); ctx.arc(r.x, r.y, 2.4, 0, Math.PI*2); ctx.fill();
 
@@ -2578,7 +2636,7 @@ TEMPLATES = {
   function autoLaunch(){
     if (document.hidden){ nextLaunch = setTimeout(autoLaunch, 1000); return; }
     launchRandom();
-    nextLaunch = setTimeout(autoLaunch, rnd(250, 850));
+    nextLaunch = setTimeout(autoLaunch, rnd(950, 1750));
   }
   setTimeout(autoLaunch, 350);
 
@@ -2782,12 +2840,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     "basket_results.html": """<div id="basket-results">{% if plan %}<div class="stats"><div class="stat"><span class="note">Najtańszy miks sklepów</span><b>{{ plan.mix_total|pln }}</b><span class="note">{% if plan.mix_missing %}brak ofert dla {{ plan.mix_missing }} pozycji{% else %}wszystkie pozycje dostępne{% endif %}</span></div>
 <div class="stat"><span class="note">Najtaniej w jednym sklepie</span><b>{{ plan.best_store.total|pln if plan.best_store else 'brak pełnej oferty' }}</b><span class="note">{{ plan.best_store.site if plan.best_store else 'żaden sklep nie ma wszystkich dostępnych pozycji' }}</span></div></div>
+{% if plan.most_products_store %}<div class="card"><div class="top"><strong>Najwięcej pozycji ma {{ plan.most_products_store.site }}</strong><span class="best">{{ plan.most_products_store.count }} z {{ plan.lines|length }} produktów</span><span class="price">{{ plan.most_products_store.total|pln }}</span></div>
+{% for product in plan.most_products_store.products %}<div class="row"><a class="name" href="{{ product.url }}" target="_blank" rel="noopener noreferrer">{{ product.name }}</a><span class="price">{{ product.price|pln }}</span><span class="note">{{ 'dostępny' if product.availability=='in_stock' else 'niedostępny' }}</span></div>{% endfor %}</div>{% endif %}
 {% if plan.price_mode=='historical' %}<p class="note">Ceny historyczne nie oznaczają dostępności produktu w tej chwili.</p>{% endif %}
 {% if selected_site %}<div class="card"><b>{{ selected_site }}:</b> {% if plan.selected_total and not plan.selected_total.missing %}{{ plan.selected_total.total|pln }} · pełny koszyk{% elif plan.selected_total %}brak ofert dla {{ plan.selected_total.missing }} pozycji{% else %}brak danych{% endif %}</div>{% endif %}
 {% for line in plan.lines %}<div class="card"><div class="top"><strong>{{ line.name }}</strong>{% if line.code %}<span class="code">{{ line.code }}</span>{% endif %}<button type="button" class="sec sm" data-cart-remove data-url="{{ line.url }}">Usuń</button></div>
 {% if line.error %}<p class="note">{{ line.error }}</p>{% endif %}
 {% for offer in line.offers %}<div class="row"><span>{{ offer.site }} · {{ 'dostępny' if offer.avail=='in_stock' else 'niedostępny' }}</span><span class="price">{{ offer.basket_price|pln }}</span>{% if offer.url==line.cheapest.url %}<span class="best">najkorzystniej</span>{% endif %}<a class="mini" href="{{ offer.url }}" target="_blank" rel="noopener noreferrer">Otwórz ofertę</a></div>{% else %}<p class="note">Brak pasujących ofert z ceną w wybranym trybie.</p>{% endfor %}</div>{% endfor %}
-<details><summary>Porównaj pełny koszyk w każdym sklepie</summary>{% for total in plan.shop_totals %}<div class="row"><span>{{ total.site }}</span><span>{% if total.missing %}brak {{ total.missing }} pozycji · suma częściowa {{ total.total|pln }}{% else %}pełny koszyk · {{ total.total|pln }}{% endif %}</span></div>{% else %}<p class="note">Brak sklepów z ofertami.</p>{% endfor %}</details>{% else %}<div class="card">Koszyk jest pusty. Dodaj produkty z listy produktów.</div>{% endif %}</div>""",
+<details><summary>Produkty i sumy według sklepu</summary>{% for total in plan.shop_totals %}<section><div class="row"><strong>{{ total.site }} · {{ total.count }}/{{ plan.lines|length }} produktów</strong><span>{% if total.missing %}brak {{ total.missing }} · suma częściowa {{ total.total|pln }}{% else %}pełny koszyk · {{ total.total|pln }}{% endif %}</span></div>{% for product in total.products %}<div class="row"><a class="mini" href="{{ product.url }}" target="_blank" rel="noopener noreferrer">{{ product.name }}</a><span>{{ product.price|pln }}</span></div>{% endfor %}</section>{% else %}<p class="note">Brak sklepów z ofertami.</p>{% endfor %}</details>{% else %}<div class="card">Koszyk jest pusty. Dodaj produkty z listy produktów.</div>{% endif %}</div>""",
 
     "deals.html": """{% extends 'base.html' %}
 {% block body %}<h1>Okazje</h1><p class="note">Porównanie dostępnych ofert między sklepami. Procent pokazuje oszczędność względem najwyższej ceny.</p>

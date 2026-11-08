@@ -2736,7 +2736,7 @@ TEMPLATES = {
 <p id="basket-status" class="note" role="status" aria-live="polite">Wczytywanie koszyka...</p>
 {% include 'basket_results.html' %}
 <script>
-(() => {
+document.addEventListener('DOMContentLoaded', () => {
     const settings = document.getElementById('basket-settings');
     const status = document.getElementById('basket-status');
     const cart = window.fajerwerkiCart;
@@ -2772,7 +2772,7 @@ TEMPLATES = {
     window.addEventListener('fajerwerki:cart-updated', renderBasket);
     window.addEventListener('storage', renderBasket);
     renderBasket();
-})();
+});
 </script>{% endblock %}""",
     "coupons.html": """{% extends 'base.html' %}{% block body %}<h1>Kody rabatowe</h1><p class="note">Sprawdź warunki i ważność kodu przed zakupem. Sklepy mogą wykluczać produkty w promocji; scraper wykrywa tylko część takich oznaczeń, więc brak etykiety nie potwierdza, że kod zadziała.</p>
 {% for c in rows %}<div class="card"><div class="top"><span class="shop">{{ c.shop }}</span><span class="code">{{ c.code }}</span><span class="best">{{ c.discount }}</span></div>

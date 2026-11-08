@@ -1881,6 +1881,85 @@ def save(con, site_name, url, d):
     return False
 
 
+def _name_tokens(name, code_key=None):
+    tokens = re.findall(r"[A-Z]+|\d+", _fold(name))
+    if code_key:
+        for start in range(len(tokens)):
+            for end in range(start + 1, len(tokens) + 1):
+                if "".join(tokens[start:end]) == code_key:
+                    del tokens[start:end]
+                    return tokens
+    return tokens
+
+
+def _name_similarity(first, second):
+    first_tokens = _name_tokens(first["name"], first["code_key"])
+    second_tokens = _name_tokens(second["name"], second["code_key"])
+    if not first_tokens or not second_tokens:
+        return 0
+    if {t for t in first_tokens if t.isdigit()} != {t for t in second_tokens if t.isdigit()}:
+        return 0
+    first_set, second_set = set(first_tokens), set(second_tokens)
+    shared = first_set & second_set
+    if sum(t.isalpha() for t in shared) < 2:
+        return 0
+    return len(shared) / max(len(first_set), len(second_set))
+
+
+def backfill_product_codes(con):
+    rows = con.execute(
+        "SELECT url, name, code, code_key FROM products WHERE name IS NOT NULL"
+    ).fetchall()
+    coded = [dict(zip(("url", "name", "code", "code_key"), row))
+             for row in rows if row[2] and row[3]]
+    missing = [dict(zip(("url", "name", "code", "code_key"), row))
+               for row in rows if not row[2] and row[1]]
+    if not coded or not missing:
+        return 0
+
+    by_token = {}
+    token_counts = Counter()
+    for product in coded:
+        tokens = set(t for t in _name_tokens(product["name"], product["code_key"])
+                     if t.isalpha() and len(t) >= 3)
+        token_counts.update(tokens)
+        for token in tokens:
+            by_token.setdefault(token, []).append(product)
+
+    updates = []
+    for product in missing:
+        tokens = set(t for t in _name_tokens(product["name"]) if t.isalpha() and len(t) >= 3)
+        if not tokens:
+            continue
+        search_tokens = sorted(tokens, key=lambda token: token_counts[token])[:3]
+        candidates = {}
+        for token in search_tokens:
+            for candidate in by_token.get(token, ()):
+                if candidate["url"] == product["url"]:
+                    continue
+                score = _name_similarity(product, candidate)
+                if score >= 0.8:
+                    candidates[candidate["url"]] = (candidate, score)
+        if not candidates:
+            continue
+        best_score = max(score for _, score in candidates.values())
+        best_codes = {candidate["code_key"] for candidate, score in candidates.values()
+                      if best_score - score <= 0.03}
+        if len(best_codes) == 1:
+            code_key = next(iter(best_codes))
+            code = next(candidate["code"] for candidate, _ in candidates.values()
+                        if candidate["code_key"] == code_key)
+            updates.append((code, code_key, product["url"]))
+
+    con.executemany(
+        "UPDATE products SET code = ?, code_key = ? WHERE url = ? AND code IS NULL",
+        updates,
+    )
+    if updates:
+        log.info("uzupełniono kody produktów na podstawie podobnych nazw: %d", len(updates))
+    return len(updates)
+
+
 # ----------------------------- komendy --------------------------------------
 def report_problems(problems, label):
     if not problems:
@@ -2773,6 +2852,8 @@ def cmd_scrape(args):
                 if in_actions:
                     print("::endgroup::", flush=True)
             summary += res
+
+        backfill_product_codes(con)
 
         if _suspicious:
             log.warning("PODEJRZANE ZMIANY CEN (skok >= 5x): %d szt.", len(_suspicious))

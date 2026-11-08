@@ -23,6 +23,7 @@ import hmac
 import io
 import json
 import os
+import html as htmllib
 import re
 import secrets
 import shutil
@@ -762,6 +763,77 @@ def history(url):
         c.close()
 
 
+def lowest_price_history(urls):
+    if not urls:
+        return []
+    src = os.path.join(WORK, "src.db")
+    c = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    try:
+        rows = c.execute(
+            "SELECT pr.url, p.site, pr.ts, pr.price, pr.availability "
+            "FROM prices pr JOIN products p ON p.url = pr.url "
+            "WHERE pr.url IN (" + ",".join("?" for _ in urls) + ") "
+            "ORDER BY pr.ts, pr.id",
+            urls,
+        ).fetchall()
+    finally:
+        c.close()
+
+    states, points = {}, []
+    position = 0
+    while position < len(rows):
+        ts = rows[position][2]
+        while position < len(rows) and rows[position][2] == ts:
+            url, site, _, price, availability = rows[position]
+            states[url] = (site, price, availability)
+            position += 1
+        priced = [(site, price, availability) for site, price, availability in states.values()
+                  if price is not None]
+        if not priced:
+            continue
+        site, price, availability = min(
+            priced, key=lambda item: (item[1], item[2] != "in_stock", item[0])
+        )
+        point = {"ts": ts, "site": site, "price": price, "availability": availability}
+        if not points or any(points[-1][key] != point[key] for key in ("site", "price", "availability")):
+            points.append(point)
+    return points
+
+
+def lowest_price_chart(points, w=680, h=250):
+    timed = [(parse_ts(point["ts"]), point) for point in points]
+    timed = [(ts, point) for ts, point in timed if ts]
+    if not timed:
+        return ""
+    t0, t1 = timed[0][0], timed[-1][0]
+    span = max((t1 - t0).total_seconds(), 1.0)
+    prices = [point["price"] for _, point in timed]
+    lo, hi = min(prices), max(prices)
+    if hi - lo < 0.01:
+        lo, hi = max(0, lo - 1), hi + 1
+    left, right, top, bottom = 52, 12, 12, 30
+    x = lambda ts: left + (w - left - right) * (ts - t0).total_seconds() / span
+    y = lambda price: top + (h - top - bottom) * (1 - (price - lo) / (hi - lo))
+    path, markers = [], []
+    for index, (ts, point) in enumerate(timed):
+        px, py = x(ts), y(point["price"])
+        path.append(f"M{px:.1f},{py:.1f}" if index == 0 else f"H{px:.1f}V{py:.1f}")
+        date = ts.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+        status = "dostępny" if point["availability"] == "in_stock" else "niedostępny"
+        label = htmllib.escape(
+            f"{date} | {point['site']} | {point['price']:.2f} zł | {status}", quote=True
+        )
+        markers.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4" class="price-point"><title>{label}</title></circle>')
+    fmt = lambda ts: ts.astimezone(TZ).strftime("%d.%m.%Y")
+    return (f'<svg viewBox="0 0 {w} {h}" class="chart price-history" role="img" '
+            f'aria-label="Najniższa cena w czasie, najedź na punkt po szczegóły">'
+            f'<path d="{"".join(path)}H{x(t1):.1f}" class="line"/>{"".join(markers)}'
+            f'<text x="2" y="{top + 9}" class="ax">{hi:.2f} zł</text>'
+            f'<text x="2" y="{h - bottom}" class="ax">{lo:.2f} zł</text>'
+            f'<text x="{left}" y="{h - 6}" class="ax">{fmt(t0)}</text>'
+            f'<text x="{w - right}" y="{h - 6}" class="ax" text-anchor="end">{fmt(t1)}</text></svg>')
+
+
 # ----------------------------------------------------------------------------- dostęp: sesja, CSRF, Discord
 PUBLIC = {"health", "robots", "login", "invite_page", "auth_discord", "auth_callback", "logout", "favicon"}
 
@@ -1085,8 +1157,18 @@ def index():
     except ValueError:
         page = 1
     total = c.execute("SELECT COUNT(*) FROM items" + where, args).fetchone()[0]
-    items = c.execute(f"SELECT * FROM items{where} ORDER BY {order} LIMIT ? OFFSET ?",
-                      args + [PER_PAGE, (page - 1) * PER_PAGE]).fetchall()
+    offer_visibility = "" if is_admin(g.user) else " AND best.hidden = 0"
+    items = c.execute(f"""
+        SELECT i.*,
+               CASE WHEN i.code_key IS NOT NULL THEN (
+                   SELECT best.url FROM items best
+                   WHERE best.code_key = i.code_key AND best.avail = 'in_stock'
+                     AND best.price IS NOT NULL{offer_visibility}
+                   ORDER BY best.price, best.site LIMIT 1
+               ) WHEN i.avail = 'in_stock' AND i.price IS NOT NULL THEN i.url END AS cheapest_url
+        FROM items i{where}
+        ORDER BY {order} LIMIT ? OFFSET ?
+    """, args + [PER_PAGE, (page - 1) * PER_PAGE]).fetchall()
     context = dict(items=items, total=total, page=page,
                    pages=max((total + PER_PAGE - 1) // PER_PAGE, 1),
                    q=q, s=s, sorts=SORTS, sel_sites=request.args.getlist("site"),
@@ -1116,13 +1198,14 @@ def product():
     it = c.execute("SELECT * FROM items WHERE url = ?" + vis(), (url,)).fetchone()
     if not it:
         abort(404)
-    hist = history(url)
-    others = []
     if it["code_key"]:
-        others = c.execute("SELECT * FROM items WHERE code_key = ? AND url != ?" + vis() +
-                           " ORDER BY (avail = 'in_stock') DESC, price ASC", (it["code_key"], url)).fetchall()
-    return render_template("product.html", it=it, hist=list(reversed(hist))[:40], chart=chart_svg(hist, it["last_seen"]),
-                           others=others, tab="list", **common_ctx(c))
+        rows = c.execute("SELECT * FROM items WHERE code_key = ?" + vis(), (it["code_key"],)).fetchall()
+    else:
+        rows = c.execute("SELECT * FROM items WHERE name_norm = ?" + vis(), (it["name_norm"],)).fetchall()
+    rows = _best_shop_offers(rows)
+    chart = lowest_price_chart(lowest_price_history([row["url"] for row in rows]))
+    return render_template("compare.html", rows=rows, key=it["code"] or "", chart=chart,
+                           tab="deals", **common_ctx(c))
 
 
 @app.route("/compare")
@@ -1135,7 +1218,9 @@ def compare():
     rows = _best_shop_offers(rows)
     if not rows:
         abort(404)
-    return render_template("compare.html", rows=rows, key=key, tab="deals", **common_ctx(c))
+    chart = lowest_price_chart(lowest_price_history([row["url"] for row in rows]))
+    return render_template("compare.html", rows=rows, key=key, chart=chart,
+                           tab="deals", **common_ctx(c))
 
 
 @app.route("/deals")
@@ -1225,7 +1310,11 @@ def _best_shop_offers(rows):
         current = best.get(row["site"])
         if current is None or rank > current[0]:
             best[row["site"]] = (rank, row)
-    return [entry[1] for entry in sorted(best.values(), key=lambda entry: entry[1]["site"])]
+    return sorted(
+        (entry[1] for entry in best.values()),
+        key=lambda row: (row["avail"] != "in_stock", row["price"] is None,
+                         row["price"] if row["price"] is not None else float("inf"), row["site"]),
+    )
 
 
 def _basket_product(c, query, price_mode="current", include_unavailable=False):
@@ -2519,7 +2608,7 @@ TEMPLATES = {
 <a class="name" href="{{ url_for('product', u=it.url) }}">{{ it.name }}</a><div class="row"><span class="price" data-coupon-base>{{ it.price|pln }}</span>{% if coupon_options and it.price is not none %}<span class="coupon-result" data-coupon-result hidden><span class="old" data-coupon-original></span><b class="price" data-coupon-discounted></b></span>{% endif %}
 {% if it.prev_price and it.price is not none and it.price != it.prev_price %}<span class="old">{{ it.prev_price|pln }}</span><span class="{{ 'down' if it.price < it.prev_price else 'up' }}">{{ '−' if it.price < it.prev_price else '+' }}{{ it.drop_pct|pct }}</span>{% endif %}
 {% if it.key_shops and it.key_shops > 1 %}{% if it.avail=='in_stock' and it.price is not none and it.price == it.key_min %}<span class="best">najtaniej</span>{% endif %}<a class="mini" href="{{ url_for('compare', k=it.code_key) }}">{{ it.key_shops|shops }}</a>{% endif %}
-</div><div class="note">zmiana: {{ it.changed_at|dt }}</div>
+</div>{% if it.cheapest_url %}<a class="btn sm" href="{{ it.cheapest_url }}" target="_blank" rel="noopener noreferrer">Najtaniej teraz</a>{% endif %}<div class="note">zmiana: {{ it.changed_at|dt }}</div>
 {{ coupon_controls(it) }}
 {% if is_admin %}<form method="post" action="{{ url_for('admin_quick') }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="u" value="{{ it.url }}"><input type="hidden" name="back" value="{{ request.full_path.rstrip('?') }}">
 <button class="sec sm" name="act" value="{{ 'unpin' if it.rank is not none else 'pin' }}">{{ 'Odepnij' if it.rank is not none else 'Przypnij na górze' }}</button>
@@ -2607,7 +2696,8 @@ TEMPLATES = {
 <h2>Historia zmian</h2><table><tr><th>kiedy</th><th>cena</th><th>stan</th></tr>{% for ts,p,av in hist %}<tr><td>{{ ts|dt('%d.%m.%Y %H:%M') }}</td><td>{{ p|pln }}</td><td>{{ 'dostępny' if av=='in_stock' else 'brak' }}</td></tr>{% endfor %}</table>{% endblock %}""",
 
     "compare.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}
-{% block body %}<h1>Kod {{ rows[0].code or key }}</h1><p class="note">{{ rows|length }} ofert · najtańsza dostępna oznaczona jako „najtaniej". Sprawdź, czy nazwy to na pewno ten sam produkt.</p>
+    {% block body %}<h1>{{ rows[0].name }}</h1><p class="note">{% if key %}Kod {{ key }} · {% endif %}{{ rows|length }} ofert, dostępne przed niedostępnymi, od najtańszej. Najedź na punkt wykresu po szczegóły.</p>
+    {% if chart %}{{ chart|safe }}{% else %}<p class="note">Brak historii cen dla tych ofert.</p>{% endif %}
 {% for r in rows %}{{ card(r) }}{% endfor %}{% endblock %}""",
 
     "basket.html": """{% extends 'base.html' %}

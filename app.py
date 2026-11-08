@@ -593,7 +593,7 @@ def _build_derived(src, dst):
         CREATE TABLE change_events(
             url TEXT, site TEXT, name TEXT, name_norm TEXT, code TEXT, code_key TEXT,
             ts TEXT, price REAL, availability TEXT, currency TEXT,
-            prev_price REAL, prev_availability TEXT, scan_id INTEGER
+            prev_price REAL, prev_availability TEXT, scan_id INTEGER, event_type TEXT
         );
         CREATE INDEX ix_change_events_ts ON change_events(ts);
         CREATE INDEX ix_change_events_site_ts ON change_events(site, ts);
@@ -638,7 +638,10 @@ def _build_derived(src, dst):
         FROM numbered_days
     """)
     out.execute(f"""
-        INSERT INTO change_events
+        INSERT INTO change_events(
+            url, site, name, name_norm, code, code_key, ts, price, availability, currency,
+            prev_price, prev_availability, scan_id, event_type
+        )
         WITH ordered_prices AS (
             SELECT url, ts, price, availability, currency, {source_scan_expr} AS scan_id,
                    LAG(price) OVER (PARTITION BY url ORDER BY id) AS prev_price,
@@ -653,9 +656,30 @@ def _build_derived(src, dst):
                    WHERE s.site = i.site AND s.status = 'legacy'
                      AND substr(s.started_at, 1, 10) = substr(p.ts, 1, 10)
                    LIMIT 1
-               ))
+               )), 'change'
         FROM ordered_prices p JOIN items i ON i.url = p.url
         WHERE p.event_number > 1
+    """)
+    out.execute(f"""
+        INSERT INTO change_events(
+            url, site, name, name_norm, code, code_key, ts, price, availability, currency,
+            prev_price, prev_availability, scan_id, event_type
+        )
+        WITH first_prices AS (
+            SELECT url, ts, price, availability, currency, {source_scan_expr} AS scan_id,
+                   ROW_NUMBER() OVER (PARTITION BY url ORDER BY id) AS event_number
+            FROM source_db.prices p
+        )
+        SELECT i.url, i.site, i.name, i.name_norm, i.code, i.code_key,
+               p.ts, p.price, p.availability, p.currency, NULL, NULL,
+               COALESCE(p.scan_id, (
+                   SELECT s.scan_id FROM scan_options s
+                   WHERE s.site = i.site AND s.status = 'legacy'
+                     AND substr(s.started_at, 1, 10) = substr(p.ts, 1, 10)
+                   LIMIT 1
+               )), 'new'
+        FROM first_prices p JOIN items i ON i.url = p.url
+        WHERE p.event_number = 1
     """)
     try:  # ręczne zmiany z magazynu aplikacji; brak magazynu nie blokuje pokazania cen
         overrides = store.read(lambda d: copy.deepcopy(d["overrides"]))
@@ -1335,12 +1359,13 @@ def changes():
     site_args = [site] if site else []
     t = request.args.get("t", "drops")
     conds = {
-        "drops": ("e.prev_price IS NOT NULL AND e.price < e.prev_price",
+        "new": ("e.event_type = 'new'", "e.ts DESC"),
+        "drops": ("e.event_type = 'change' AND e.prev_price IS NOT NULL AND e.price < e.prev_price",
                   "e.prev_price - e.price DESC, e.ts DESC"),
-        "rises": ("e.prev_price IS NOT NULL AND e.price > e.prev_price",
+        "rises": ("e.event_type = 'change' AND e.prev_price IS NOT NULL AND e.price > e.prev_price",
                   "e.price - e.prev_price DESC, e.ts DESC"),
-        "back": ("e.prev_availability = 'out_of_stock' AND e.availability = 'in_stock'", "e.ts DESC"),
-        "gone": ("e.prev_availability = 'in_stock' AND e.availability = 'out_of_stock'", "e.ts DESC"),
+        "back": ("e.event_type = 'change' AND e.prev_availability = 'out_of_stock' AND e.availability = 'in_stock'", "e.ts DESC"),
+        "gone": ("e.event_type = 'change' AND e.prev_availability = 'in_stock' AND e.availability = 'out_of_stock'", "e.ts DESC"),
     }
     if t not in conds:
         t = "drops"
@@ -1422,6 +1447,7 @@ def changes():
         item["avail"] = item["event_availability"]
         item["prev_price"] = item["event_prev_price"]
         item["prev_avail"] = item["event_prev_availability"]
+        item["is_new"] = t == "new"
         previous, current = item["prev_price"], item["price"]
         item["drop_pct"] = (
             (previous - current) * 100 / previous
@@ -2656,7 +2682,7 @@ TEMPLATES = {
 <div class="pager"><a class="{{ '' if page>1 else 'off' }}" href="{{ url_with(page=page-1) if page>1 else '#' }}">← wstecz</a><span class="note">{{ page }} / {{ pages }}</span><a class="{{ '' if page<pages else 'off' }}" href="{{ url_with(page=page+1) if page<pages else '#' }}">dalej →</a></div>{% endblock %}""",
 
     "changes.html": """{% extends 'base.html' %}{% from 'card.html' import card with context %}
-{% block head %}<nav class="tabs">{% for k,l in [('drops','Obniżki'),('rises','Podwyżki'),('back','Wróciły'),('gone','Zniknęły')] %}<a class="{{ 'on' if t==k }}" href="{{ url_with(t=k, scan=None, page=None) }}">{{ l }} {{ counts[k] }}</a>{% endfor %}</nav>
+{% block head %}<nav class="tabs">{% for k,l in [('new','Nowości'),('drops','Obniżki'),('rises','Podwyżki'),('back','Wróciły'),('gone','Zniknęły')] %}<a class="{{ 'on' if t==k }}" href="{{ url_with(t=k, scan=None, page=None) }}">{{ l }} {{ counts[k] }}</a>{% endfor %}</nav>
 <form class="f" method="get"><input type="hidden" name="t" value="{{ t }}">
 <label>Zakres skanów<select name="scan_mode" id="scan-mode"><option value="last" {{ 'selected' if scan_mode=='last' }}>Ostatni skan</option><option value="range" {{ 'selected' if scan_mode=='range' }}>Od–do</option></select></label>
 <label>Sklep<select name="site"><option value="">Wszystkie sklepy</option>{% for sh in shops %}<option value="{{ sh.site }}" {{ 'selected' if sh.site==site }}>{{ sh.site }}</option>{% endfor %}</select></label>

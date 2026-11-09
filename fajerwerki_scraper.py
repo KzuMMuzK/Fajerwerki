@@ -1714,6 +1714,28 @@ def _fold(text):
     return "".join(c for c in text if not unicodedata.combining(c))
 
 
+_CATEGORY_RULES = (
+    ("Zestawy", r"zestaw|komplet|pakiet|bundle|set of"),
+    ("Wyrzutnie", r"wyrzutni|bateri|compound|salw|cake|barrage"),
+    ("Petardy", r"petard|firecracker|hukow|emiter.?dzwieku"),
+    ("Rakiety", r"rakiet|rocket"),
+    ("Fontanny i wulkany", r"fontann|wulkan|fountain|volcano"),
+    ("Rzymskie ognie", r"rzymsk|roman candle"),
+    ("Dymy", r"dym|smoke"),
+    ("Race i flary", r"race|flar|flare"),
+    ("Stroboskopy", r"strob|bengalsk"),
+    ("Zimne ognie", r"zimne.?ognie|sparkler"),
+    ("Pirotechnika sceniczna", r"sceniczn|teatraln|wroclawsk|stage|theatrical"),
+    ("Akcesoria", r"lont|zapalnik|zapalniczk|odpal|akcesori|okular|ochronn|accessor"),
+)
+
+
+def _category_labels(text):
+    folded = _fold(text)
+    return [category for category, pattern in _CATEGORY_RULES
+            if re.search(pattern, folded, re.I)]
+
+
 def _code_candidate(token, marker=False, trusted=False, slug=False):
     disp = token.strip(" \t.,;:()[]{}<>\"'!?*+")
     if not 3 <= len(disp) <= 60 or not re.fullmatch(r"[\w][\w\-_/.]*[\w]", disp, re.U):
@@ -1797,6 +1819,9 @@ def db():
       id INTEGER PRIMARY KEY AUTOINCREMENT, site TEXT, started_at TEXT,
       completed_at TEXT, status TEXT, products_checked INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS nonproduct(url TEXT PRIMARY KEY, ts TEXT);
+        CREATE TABLE IF NOT EXISTS product_categories(
+            url TEXT NOT NULL, category TEXT NOT NULL, source TEXT, updated_at TEXT,
+            PRIMARY KEY(url, category));
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(products)")}
     if "promo" not in cols:
@@ -1849,6 +1874,16 @@ def save(con, site_name, url, d):
                    ON CONFLICT(url) DO UPDATE SET name=excluded.name, code=excluded.code,
                    code_key=excluded.code_key, last_seen=excluded.last_seen, promo=excluded.promo""",
                 (url, site_name, d["name"], code, key, now, now, d.get("promo")))
+    source_categories = d.get("categories") or _category_labels(url)
+    category_source = d.get("category_source") or ("listing" if d.get("categories") else "url")
+    if not source_categories:
+        source_categories = _category_labels(d["name"])
+        category_source = "name"
+    for category in source_categories:
+        con.execute("""INSERT INTO product_categories(url, category, source, updated_at)
+                       VALUES(?,?,?,?) ON CONFLICT(url, category) DO UPDATE SET
+                       source=excluded.source, updated_at=excluded.updated_at""",
+                    (url, category, category_source, now))
     scan_id = _active_scan_ids.get(site_name)
     if scan_id is not None:
         con.execute("UPDATE scrape_runs SET products_checked = products_checked + 1 WHERE id = ?",
@@ -2240,6 +2275,7 @@ def listing_category(name, site, cfg, cat_url, q, stats):
     first = cfg.get("first")
     max_pages = cfg.get("max_pages", 400)
     hdrs = site_headers(name, site)
+    categories = _category_labels(cat_url)
     seen, page, total, reason, last_r = set(), start, 0, None, None
     try:
         while page < start + max_pages:
@@ -2273,6 +2309,10 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                 break
             seen.update(it["url"] for it in new)
             total += len(new)
+            for item in new:
+                if categories:
+                    item["categories"] = categories
+                    item["category_source"] = "listing"
             q.put(("items", name, cat_url, page, new))
             page += 1
         if total and page - start == 1 and last_r is not None:
@@ -2293,6 +2333,10 @@ def listing_category(name, site, cfg, cat_url, q, stats):
                     break
                 seen.update(it["url"] for it in new)
                 total += len(new)
+                for item in new:
+                    if categories:
+                        item["categories"] = categories
+                        item["category_source"] = "listing"
                 q.put(("items", name, cat_url, start + ordinal, new))
                 ordinal, extra, cur = ordinal + 1, extra + 1, r
             if extra:
@@ -2419,6 +2463,12 @@ def parse_store_api_product(raw):
     availability = "in_stock" if in_stock is True else (
         "out_of_stock" if in_stock is False else None
     )
+    categories = []
+    for raw_category in raw.get("categories") or []:
+        if isinstance(raw_category, dict):
+            label = " ".join(str(raw_category.get(key) or "") for key in ("name", "slug"))
+            categories.extend(_category_labels(label))
+    categories = list(dict.fromkeys(categories))
     return {
         "name": name,
         "currency": prices.get("currency_code") or "PLN",
@@ -2427,6 +2477,8 @@ def parse_store_api_product(raw):
         "availability": availability,
         "price": price,
         "promo": promo,
+        "categories": categories,
+        "category_source": "api" if categories else None,
         "url": url,
     }
 
@@ -2445,7 +2497,7 @@ def store_api_driver(name, site, args, q, stats):
             url = endpoint + ("&" if "?" in endpoint else "?") + urlencode({
                 "per_page": page_size,
                 "page": page,
-                "_fields": "id,name,permalink,sku,prices,is_in_stock",
+                "_fields": "id,name,permalink,sku,prices,is_in_stock,categories",
             })
             response = get(url, stats, headers=headers)
             if response is None:

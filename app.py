@@ -333,9 +333,13 @@ _CATEGORY_RULES = (
 PRODUCT_CATEGORIES = tuple(category for category, _ in _CATEGORY_RULES) + ("Pozostałe",)
 
 
-def _product_categories(name, category=None):
-    if category in PRODUCT_CATEGORIES:
-        return [category]
+def _product_categories(name, category_override=None, categories=None):
+    if category_override in PRODUCT_CATEGORIES:
+        return [category_override]
+    source_categories = [value for value in (categories or "").split("|")
+                         if value in PRODUCT_CATEGORIES]
+    if source_categories:
+        return list(dict.fromkeys(source_categories))
     text = fold(name or "")
     matches = [category for category, pattern in _CATEGORY_RULES if re.search(pattern, text)]
     return matches or ["Pozostałe"]
@@ -562,21 +566,24 @@ def _recompute_keys(c, keys=None):
 
 def _apply_override(c, url, ov):
     """Nakłada ręczne zmiany (ov) na wiersz produktu; ov=None przywraca dane ze scrapera."""
-    row = c.execute("SELECT o_name, o_price, o_avail, o_code, o_key, o_prev, o_drop FROM items WHERE url = ?", (url,)).fetchone()
+    row = c.execute("SELECT o_name, o_price, o_avail, o_code, o_key, o_prev, o_drop, categories "
+                    "FROM items WHERE url = ?", (url,)).fetchone()
     if not row:
         return None
-    o_name, o_price, o_avail, o_code, o_key, o_prev, o_drop = row
+    o_name, o_price, o_avail, o_code, o_key, o_prev, o_drop, categories = row
     ov = ov or {}
     name = ov.get("name") or o_name
     price = ov["price"] if ov.get("price") is not None else o_price
     avail = ov.get("avail") or o_avail
     code, key = (ov["code"], keyify(ov["code"])) if ov.get("code") else (o_code, o_key)
     prev, drop = (None, None) if ov.get("price") is not None else (o_prev, o_drop)
-    category = ov.get("category") if ov.get("category") in PRODUCT_CATEGORIES else _product_categories(name)[0]
+    category_override = ov.get("category") if ov.get("category") in PRODUCT_CATEGORIES else None
+    category = category_override or (categories.split("|")[0] if categories else _product_categories(name)[0])
     c.execute("""UPDATE items SET name = ?, name_norm = ?, price = ?, avail = ?, code = ?, code_key = ?, prev_price = ?,
-                                 drop_pct = ?, hidden = ?, rank = ?, note = ?, edited = ?, category = ? WHERE url = ?""",
+                                 drop_pct = ?, hidden = ?, rank = ?, note = ?, edited = ?, category = ?, category_override = ?
+                                 WHERE url = ?""",
               (name, fold(name), price, avail, code, key, prev, drop, 1 if ov.get("hidden") else 0,
-                             ov.get("rank"), ov.get("note"), 1 if ov else 0, category, url))
+                             ov.get("rank"), ov.get("note"), 1 if ov else 0, category, category_override, url))
     return o_key
 
 
@@ -610,6 +617,16 @@ def _build_derived(src, dst):
     """Z bazy scrapera robi płaską tabelę 'items' (ostatnia cena, poprzednia cena, min/max...) i nakłada ręczne zmiany."""
     con = sqlite3.connect(src)
     cols = {r[1] for r in con.execute("PRAGMA table_info(products)")}
+    source_tables = {row[0] for row in con.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    )}
+    source_categories = {}
+    if "product_categories" in source_tables:
+        for url, category, category_source in con.execute(
+                "SELECT url, category, source FROM product_categories"):
+            source = source_categories.setdefault(url, {"confirmed": [], "fallback": []})
+            bucket = "confirmed" if category_source in ("listing", "api") else "fallback"
+            source[bucket].append(category)
     code_sel = "p.code, p.code_key" if "code_key" in cols else "NULL, NULL"
     promo_sel = "p.promo" if "promo" in cols else "NULL"
     rows = con.execute(f"""
@@ -635,7 +652,7 @@ def _build_derived(src, dst):
             drop_pct REAL, key_shops INTEGER, key_min REAL,
             o_name TEXT, o_price REAL, o_avail TEXT, o_code TEXT, o_key TEXT, o_prev REAL, o_drop REAL,
             hidden INTEGER DEFAULT 0, rank INTEGER, note TEXT, edited INTEGER DEFAULT 0, promo INTEGER,
-            category TEXT);
+            category TEXT, categories TEXT, category_override TEXT);
         CREATE INDEX ix_site ON items(site); CREATE INDEX ix_key ON items(code_key);
         CREATE INDEX ix_changed ON items(changed_at);
         CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
@@ -654,13 +671,27 @@ def _build_derived(src, dst):
         );
     """)
     batch = []
+    confirmed_by_code = {}
+    for row in rows:
+        code_key = row[4]
+        confirmed = source_categories.get(row[0], {}).get("confirmed", [])
+        if code_key and confirmed:
+            confirmed_by_code.setdefault(code_key, []).extend(confirmed)
+
     for (url, site, name, code, key, first, last, price, av, ts, cur, prev, prev_av, mn, mx, n,
          promo) in rows:
         pct = (prev - price) * 100.0 / prev if (prev and price is not None and prev > 0) else None
+        source = source_categories.get(url, {"confirmed": [], "fallback": []})
+        categories = source["confirmed"]
+        if not categories and key:
+            categories = confirmed_by_code.get(key, [])
+        if not categories:
+            categories = source["fallback"] or _product_categories(name)
+        categories = [category for category in PRODUCT_CATEGORIES if category in categories]
         batch.append((url, site, name, fold(name), code, key, first, last, price, av, ts, cur or "PLN", prev, prev_av,
                       mn, mx, n, pct, None, None, name, price, av, code, key, prev, pct, 0, None, None, 0, promo,
-                      _product_categories(name)[0]))
-    out.executemany("INSERT INTO items VALUES(" + ",".join("?" * 33) + ")", batch)
+                      categories[0], "|".join(categories), None))
+    out.executemany("INSERT INTO items VALUES(" + ",".join("?" * 35) + ")", batch)
     out.execute("ATTACH DATABASE ? AS source_db", (src,))
     source_tables = {row[0] for row in out.execute(
         "SELECT name FROM source_db.sqlite_master WHERE type = 'table'"
@@ -1380,7 +1411,7 @@ def _basket_product_by_url(c, url, price_mode="current", include_unavailable=Fal
     else:
         matches = c.execute("SELECT * FROM items WHERE name_norm = ? AND hidden = 0",
                             (selected["name_norm"],)).fetchall()
-    categories = _product_categories(selected["name"], selected["category"])
+    categories = _product_categories(selected["name"], selected["category_override"], selected["categories"])
     offers = _basket_shop_offers(matches, price_mode, include_unavailable, coupons_by_shop)
     cheapest = min(offers, key=lambda offer: (offer["basket_price"], offer["site"])) if offers else None
     return {"url": url, "code": selected["code"], "name": selected["name"],
@@ -1402,7 +1433,9 @@ def _basket_shop_offers(rows, price_mode, include_unavailable, coupons_by_shop=N
         offer["base_price"] = price
         offer["basket_price"] = price
         offer["historical_price"] = price_mode == "historical"
-        offer["categories"] = _product_categories(offer["name"], offer.get("category"))
+        offer["categories"] = _product_categories(
+            offer["name"], offer.get("category_override"), offer.get("categories")
+        )
         offer["promo"] = bool(offer.get("promo"))
         offer["coupon"] = None
         if price_mode == "current":
@@ -2745,7 +2778,7 @@ TEMPLATES = {
 </script>
 </body></html>""",
 
-    "coupon_controls.html": """{% macro coupon_controls(it) %}{% set shop_key = coupon_shop_key(it.site) %}{% set coupon_options = coupons_by_shop.get(shop_key, []) if shop_key else [] %}{% set categories = product_categories(it.name, it.category) %}{% set eligible_coupons = [] %}{% for coupon in coupon_options %}{% if (not coupon.category or coupon.category in categories) and (not coupon.excludes_promos or not it.promo) %}{% set _ = eligible_coupons.append(coupon) %}{% endif %}{% endfor %}{% if eligible_coupons and it.price is not none %}<div class="coupon-options"><span class="note">Kod rabatowy dla {{ it.site }}:</span>{% for coupon in eligible_coupons %}<label class="coupon-choice"><input type="checkbox" data-store-coupon data-shop="{{ shop_key }}" data-coupon-id="{{ coupon.id }}" data-coupon-code="{{ coupon.code }}" data-discount-kind="{{ coupon.discount_kind }}" data-discount-value="{{ coupon.discount_value }}" title="{{ coupon.terms or '' }}"> Uwzględnij {{ coupon.code }} (−{{ coupon.percent ~ '%' if coupon.discount_kind=='percent' else coupon.amount ~ ' zł' }})</label><button type="button" class="sec sm" data-copy-coupon data-coupon-code="{{ coupon.code }}">Kopiuj kod</button>{% endfor %}<div class="coupon-result-note note" data-coupon-result-note hidden>Cena jest szacunkowa dla jednej sztuki; sprawdź warunki kodu i wklej go w sklepie.</div><div class="coupon-storage-error note" data-coupon-storage-error aria-live="polite" hidden>Nie udało się zapamiętać wyboru kuponu; pozostanie aktywny tylko do odświeżenia strony.</div></div>{% endif %}{% endmacro %}""",
+    "coupon_controls.html": """{% macro coupon_controls(it) %}{% set shop_key = coupon_shop_key(it.site) %}{% set coupon_options = coupons_by_shop.get(shop_key, []) if shop_key else [] %}{% set categories = product_categories(it.name, it.category_override, it.categories) %}{% set eligible_coupons = [] %}{% for coupon in coupon_options %}{% if (not coupon.category or coupon.category in categories) and (not coupon.excludes_promos or not it.promo) %}{% set _ = eligible_coupons.append(coupon) %}{% endif %}{% endfor %}{% if eligible_coupons and it.price is not none %}<div class="coupon-options"><span class="note">Kod rabatowy dla {{ it.site }}:</span>{% for coupon in eligible_coupons %}<label class="coupon-choice"><input type="checkbox" data-store-coupon data-shop="{{ shop_key }}" data-coupon-id="{{ coupon.id }}" data-coupon-code="{{ coupon.code }}" data-discount-kind="{{ coupon.discount_kind }}" data-discount-value="{{ coupon.discount_value }}" title="{{ coupon.terms or '' }}"> Uwzględnij {{ coupon.code }} (−{{ coupon.percent ~ '%' if coupon.discount_kind=='percent' else coupon.amount ~ ' zł' }})</label><button type="button" class="sec sm" data-copy-coupon data-coupon-code="{{ coupon.code }}">Kopiuj kod</button>{% endfor %}<div class="coupon-result-note note" data-coupon-result-note hidden>Cena jest szacunkowa dla jednej sztuki; sprawdź warunki kodu i wklej go w sklepie.</div><div class="coupon-storage-error note" data-coupon-storage-error aria-live="polite" hidden>Nie udało się zapamiętać wyboru kuponu; pozostanie aktywny tylko do odświeżenia strony.</div></div>{% endif %}{% endmacro %}""",
 
     "card.html": """{% from 'coupon_controls.html' import coupon_controls with context %}{% macro card(it) %}{% set shop_key = coupon_shop_key(it.site) %}{% set coupon_options = coupons_by_shop.get(shop_key, []) if shop_key else [] %}<div class="card{{ ' dim' if it.hidden }}"{% if coupon_options and it.price is not none %} data-coupon-shop-group="{{ shop_key }}" data-coupon-base-price="{{ it.price }}"{% endif %}><div class="top"><span class="shop">{{ it.site }}</span>{% if it.code %}<span class="code">{{ it.code }}</span>{% endif %}{% if it.promo %}<span class="badge r">promocja wykryta</span>{% endif %}
 {% if it.rank is not none %}<span class="code">przypięty</span>{% endif %}{% if it.hidden %}<span class="code">ukryty</span>{% endif %}{% if it.note %}<span class="best">{{ it.note }}</span>{% endif %}

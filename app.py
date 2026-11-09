@@ -316,6 +316,50 @@ def _coupon_shop_key(shop):
     return "".join(part for part in parts if part not in ignored)
 
 
+_CATEGORY_RULES = (
+    ("Zestawy", r"zestaw|komplet|pakiet|bundle"),
+    ("Wyrzutnie", r"wyrzutni|bateri|compound|salw"),
+    ("Petardy", r"petard|hukow|emiter.?dzwieku"),
+    ("Rakiety", r"rakiet"),
+    ("Fontanny i wulkany", r"fontann|wulkan"),
+    ("Rzymskie ognie", r"rzymsk"),
+    ("Dymy", r"dym|smoke"),
+    ("Race i flary", r"rac[aei]|flar"),
+    ("Stroboskopy", r"strob|bengalsk"),
+    ("Zimne ognie", r"zimne.?ognie"),
+    ("Pirotechnika sceniczna", r"sceniczn|teatraln|wroclawsk"),
+    ("Akcesoria", r"lont|zapalnik|zapalniczk|odpal|akcesori|okular|ochronn"),
+)
+PRODUCT_CATEGORIES = tuple(category for category, _ in _CATEGORY_RULES) + ("Pozostałe",)
+
+
+def _product_categories(name):
+    text = fold(name or "")
+    matches = [category for category, pattern in _CATEGORY_RULES if re.search(pattern, text)]
+    return matches or ["Pozostałe"]
+
+
+def _best_coupon_for_offer(offer, coupons):
+    categories = offer["categories"]
+    candidates = []
+    for coupon in coupons:
+        if coupon["category"] and coupon["category"] not in categories:
+            continue
+        if coupon["excludes_promos"] and offer["promo"]:
+            continue
+        if coupon["discount_value"] is None:
+            continue
+        if coupon["discount_kind"] == "percent":
+            price = offer["base_price"] * (1 - coupon["discount_value"] / 100)
+        else:
+            price = offer["base_price"] - coupon["discount_value"]
+        candidates.append((max(0, round(price, 2)), coupon))
+    if not candidates:
+        return None
+    price, coupon = min(candidates, key=lambda match: (match[0], match[1]["code"]))
+    return {"code": coupon["code"], "price": price, "category": coupon["category"]}
+
+
 def _coupon_rows(data, active_only=False):
     today = datetime.now(timezone.utc).date().isoformat()
     rows = []
@@ -334,6 +378,7 @@ def _coupon_rows(data, active_only=False):
             "discount_kind": "percent" if percent is not None else "amount" if amount is not None else None,
             "discount_value": percent if percent is not None else amount,
             "shop_key": _coupon_shop_key(coupon.get("shop")),
+            "category": coupon.get("category") or "",
         })
     return sorted(rows, key=lambda row: (row["expired"], row.get("valid_until") or "9999-12-31",
                                          row.get("created", "")), reverse=False)
@@ -1317,10 +1362,12 @@ def _best_shop_offers(rows):
     )
 
 
-def _basket_product_by_url(c, url, price_mode="current", include_unavailable=False):
+def _basket_product_by_url(c, url, price_mode="current", include_unavailable=False,
+                           coupons_by_shop=None):
     selected = c.execute("SELECT * FROM items WHERE url = ? AND hidden = 0", (url,)).fetchone()
     if not selected:
         return {"url": url, "name": "Produkt nie jest już dostępny w bazie", "offers": [],
+                "category": "Pozostałe", "categories": ["Pozostałe"],
                 "cheapest": None, "error": "Odśwież koszyk, aby usunąć tę pozycję."}
     if selected["code_key"]:
         matches = c.execute("SELECT * FROM items WHERE code_key = ? AND hidden = 0",
@@ -1328,14 +1375,16 @@ def _basket_product_by_url(c, url, price_mode="current", include_unavailable=Fal
     else:
         matches = c.execute("SELECT * FROM items WHERE name_norm = ? AND hidden = 0",
                             (selected["name_norm"],)).fetchall()
-    offers = _basket_shop_offers(matches, price_mode, include_unavailable)
+    categories = _product_categories(selected["name"])
+    offers = _basket_shop_offers(matches, price_mode, include_unavailable, coupons_by_shop)
     cheapest = min(offers, key=lambda offer: (offer["basket_price"], offer["site"])) if offers else None
     return {"url": url, "code": selected["code"], "name": selected["name"],
+            "category": categories[0], "categories": categories,
             "offers": offers, "cheapest": cheapest,
             "error": None if cheapest else "Brak dostępnej oferty z ceną w wybranym trybie."}
 
 
-def _basket_shop_offers(rows, price_mode, include_unavailable):
+def _basket_shop_offers(rows, price_mode, include_unavailable, coupons_by_shop=None):
     best = {}
     price_field = "min_price" if price_mode == "historical" else "price"
     for row in rows:
@@ -1345,19 +1394,31 @@ def _basket_shop_offers(rows, price_mode, include_unavailable):
         if price is None:
             continue
         offer = dict(row)
+        offer["base_price"] = price
         offer["basket_price"] = price
         offer["historical_price"] = price_mode == "historical"
+        offer["categories"] = _product_categories(offer["name"])
+        offer["promo"] = bool(offer.get("promo"))
+        offer["coupon"] = None
+        if price_mode == "current":
+            coupon = _best_coupon_for_offer(
+                offer, (coupons_by_shop or {}).get(_coupon_shop_key(offer["site"]), ())
+            )
+            if coupon:
+                offer["coupon"] = coupon
+                offer["basket_price"] = coupon["price"]
         current = best.get(row["site"])
-        if current is None or price < current["basket_price"]:
+        if current is None or offer["basket_price"] < current["basket_price"]:
             best[row["site"]] = offer
     return sorted(best.values(), key=lambda offer: (
         offer["avail"] != "in_stock", offer["basket_price"], offer["site"]
     ))
 
 
-def _plan_basket(c, product_urls, selected_site, price_mode="current", include_unavailable=False):
+def _plan_basket(c, product_urls, selected_site, price_mode="current", include_unavailable=False,
+                 coupons_by_shop=None):
     shops = [row["site"] for row in c.execute("SELECT DISTINCT site FROM items WHERE hidden = 0 ORDER BY site")]
-    lines = [_basket_product_by_url(c, url, price_mode, include_unavailable)
+    lines = [_basket_product_by_url(c, url, price_mode, include_unavailable, coupons_by_shop)
              for url in product_urls]
 
     mix_total = sum(line["cheapest"]["basket_price"] for line in lines if line["cheapest"])
@@ -1369,7 +1430,9 @@ def _plan_basket(c, product_urls, selected_site, price_mode="current", include_u
             offer = next((offer for offer in line["offers"] if offer["site"] == shop), None)
             if offer:
                 products.append({"name": line["name"], "url": offer["url"],
-                                 "price": offer["basket_price"], "availability": offer["avail"]})
+                                 "price": offer["basket_price"], "base_price": offer["base_price"],
+                                 "coupon": offer["coupon"], "promo": offer["promo"],
+                                 "availability": offer["avail"]})
         shop_totals.append({"site": shop, "total": sum(product["price"] for product in products),
                             "count": len(products), "products": products,
                             "missing": len(lines) - len(products)})
@@ -1381,10 +1444,16 @@ def _plan_basket(c, product_urls, selected_site, price_mode="current", include_u
     if most_products_store and not most_products_store["count"]:
         most_products_store = None
     selected_total = next((total for total in shop_totals if total["site"] == selected_site), None)
+    category_groups = [
+        {"category": category, "lines": [line for line in lines if line["category"] == category]}
+        for category in PRODUCT_CATEGORIES
+        if any(line["category"] == category for line in lines)
+    ]
     return {"lines": lines, "mix_total": mix_total, "mix_missing": mix_missing,
             "shop_totals": sorted(shop_totals, key=lambda total: (total["missing"], total["total"])),
             "best_store": best_store, "most_products_store": most_products_store,
             "selected_total": selected_total,
+            "category_groups": category_groups,
             "price_mode": price_mode, "include_unavailable": include_unavailable}
 
 
@@ -1400,11 +1469,17 @@ def basket():
     if price_mode not in ("current", "historical"):
         price_mode = "current"
     include_unavailable = request.args.get("unavailable") == "1"
-    plan = _plan_basket(c, product_urls, selected_site, price_mode, include_unavailable) if product_urls else None
+    coupons = store.read(lambda data: _coupon_rows(data, active_only=True))
+    coupons_by_shop = {}
+    for coupon in coupons:
+        coupons_by_shop.setdefault(coupon["shop_key"], []).append(coupon)
+    plan = _plan_basket(c, product_urls, selected_site, price_mode,
+                        include_unavailable, coupons_by_shop) if product_urls else None
     template = "basket_results.html" if request.args.get("_partial") == "1" else "basket.html"
     return render_template(template, product_urls=product_urls,
                            selected_site=selected_site, price_mode=price_mode,
-                           include_unavailable=include_unavailable, plan=plan, tab="basket", shops=shops)
+                           include_unavailable=include_unavailable, plan=plan, tab="basket", shops=shops,
+                           coupons=coupons, categories=PRODUCT_CATEGORIES)
 
 
 @app.route("/changes")
@@ -1648,6 +1723,7 @@ def admin_coupons():
             code = request.form.get("code", "").strip().upper()
             discount = request.form.get("discount", "").strip()
             terms = request.form.get("terms", "").strip()
+            category = request.form.get("category", "").strip()
             valid_until = request.form.get("valid_until", "").strip()
             source = request.form.get("source", "").strip()
             image = _coupon_image(request.files.get("image"))
@@ -1655,6 +1731,8 @@ def admin_coupons():
                 raise ValueError("Podaj sklep i opis rabatu.")
             if len(shop) > 80 or len(discount) > 120 or len(terms) > 500:
                 raise ValueError("Przekroczono limit długości opisu, sklepu lub warunków.")
+            if category and category not in PRODUCT_CATEGORIES:
+                raise ValueError("Wybierz prawidłową kategorię produktów.")
             if not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{1,39}", code):
                 raise ValueError("Kod musi mieć 2-40 znaków: litery, cyfry, kropka, _ lub -.")
             if valid_until:
@@ -1672,6 +1750,7 @@ def admin_coupons():
             coupon_id = secrets.token_urlsafe(12)
             coupon = {
                 "shop": shop, "code": code, "discount": discount, "terms": terms,
+                "category": category,
                 "valid_until": valid_until, "source": source,
                 "excludes_promos": request.form.get("excludes_promos") == "1",
                 "image": base64.b64encode(image).decode()
@@ -1688,7 +1767,8 @@ def admin_coupons():
             flash(str(e), "err")
         return redirect(url_for("admin_coupons"))
     rows = store.read(lambda data: _coupon_rows(data))
-    return render_template("admin_coupons.html", rows=rows, tab="admin", sub="coupons", **_basic())
+    return render_template("admin_coupons.html", rows=rows, categories=PRODUCT_CATEGORIES,
+                           tab="admin", sub="coupons", **_basic())
 
 
 @app.route("/admin/coupons/ocr", methods=["POST"])
@@ -2654,7 +2734,7 @@ TEMPLATES = {
 </script>
 </body></html>""",
 
-    "coupon_controls.html": """{% macro coupon_controls(it) %}{% set shop_key = coupon_shop_key(it.site) %}{% set coupon_options = coupons_by_shop.get(shop_key, []) if shop_key else [] %}{% if coupon_options and it.price is not none %}<div class="coupon-options"><span class="note">Kod rabatowy dla {{ it.site }}:</span>{% for coupon in coupon_options %}<label class="coupon-choice"><input type="checkbox" data-store-coupon data-shop="{{ shop_key }}" data-coupon-id="{{ coupon.id }}" data-coupon-code="{{ coupon.code }}" data-discount-kind="{{ coupon.discount_kind }}" data-discount-value="{{ coupon.discount_value }}" title="{{ coupon.terms or '' }}" {% if coupon.excludes_promos and it.promo %}disabled{% endif %}> Uwzględnij {{ coupon.code }} (−{{ coupon.percent ~ '%' if coupon.discount_kind=='percent' else coupon.amount ~ ' zł' }}){% if coupon.excludes_promos and it.promo %} — wyklucza wykrytą promocję{% endif %}</label><button type="button" class="sec sm" data-copy-coupon data-coupon-code="{{ coupon.code }}">Kopiuj kod</button>{% endfor %}<div class="coupon-result-note note" data-coupon-result-note hidden>Cena jest szacunkowa dla jednej sztuki; sprawdź warunki kodu i wklej go w sklepie.</div><div class="coupon-storage-error note" data-coupon-storage-error aria-live="polite" hidden>Nie udało się zapamiętać wyboru kuponu; pozostanie aktywny tylko do odświeżenia strony.</div></div>{% endif %}{% endmacro %}""",
+    "coupon_controls.html": """{% macro coupon_controls(it) %}{% set shop_key = coupon_shop_key(it.site) %}{% set coupon_options = coupons_by_shop.get(shop_key, []) if shop_key else [] %}{% set eligible_coupons = [] %}{% for coupon in coupon_options %}{% if (not coupon.category or coupon.category in product_categories(it.name)) and (not coupon.excludes_promos or not it.promo) %}{% set _ = eligible_coupons.append(coupon) %}{% endif %}{% endfor %}{% if eligible_coupons and it.price is not none %}<div class="coupon-options"><span class="note">Kod rabatowy dla {{ it.site }}:</span>{% for coupon in eligible_coupons %}<label class="coupon-choice"><input type="checkbox" data-store-coupon data-shop="{{ shop_key }}" data-coupon-id="{{ coupon.id }}" data-coupon-code="{{ coupon.code }}" data-discount-kind="{{ coupon.discount_kind }}" data-discount-value="{{ coupon.discount_value }}" title="{{ coupon.terms or '' }}"> Uwzględnij {{ coupon.code }} (−{{ coupon.percent ~ '%' if coupon.discount_kind=='percent' else coupon.amount ~ ' zł' }})</label><button type="button" class="sec sm" data-copy-coupon data-coupon-code="{{ coupon.code }}">Kopiuj kod</button>{% endfor %}<div class="coupon-result-note note" data-coupon-result-note hidden>Cena jest szacunkowa dla jednej sztuki; sprawdź warunki kodu i wklej go w sklepie.</div><div class="coupon-storage-error note" data-coupon-storage-error aria-live="polite" hidden>Nie udało się zapamiętać wyboru kuponu; pozostanie aktywny tylko do odświeżenia strony.</div></div>{% endif %}{% endmacro %}""",
 
     "card.html": """{% from 'coupon_controls.html' import coupon_controls with context %}{% macro card(it) %}{% set shop_key = coupon_shop_key(it.site) %}{% set coupon_options = coupons_by_shop.get(shop_key, []) if shop_key else [] %}<div class="card{{ ' dim' if it.hidden }}"{% if coupon_options and it.price is not none %} data-coupon-shop-group="{{ shop_key }}" data-coupon-base-price="{{ it.price }}"{% endif %}><div class="top"><span class="shop">{{ it.site }}</span>{% if it.code %}<span class="code">{{ it.code }}</span>{% endif %}{% if it.promo %}<span class="badge r">promocja wykryta</span>{% endif %}
 {% if it.rank is not none %}<span class="code">przypięty</span>{% endif %}{% if it.hidden %}<span class="code">ukryty</span>{% endif %}{% if it.note %}<span class="best">{{ it.note }}</span>{% endif %}
@@ -2835,19 +2915,19 @@ document.addEventListener('DOMContentLoaded', () => {
     "coupons.html": """{% extends 'base.html' %}{% block body %}<h1>Kody rabatowe</h1><p class="note">Sprawdź warunki i ważność kodu przed zakupem. Sklepy mogą wykluczać produkty w promocji; scraper wykrywa tylko część takich oznaczeń, więc brak etykiety nie potwierdza, że kod zadziała.</p>
 {% for c in rows %}<div class="card"><div class="top"><span class="shop">{{ c.shop }}</span><span class="code">{{ c.code }}</span><span class="best">{{ c.discount }}</span></div>
 {% if c.image %}<img src="{{ url_for('coupon_image', coupon_id=c.id) }}" alt="Zdjęcie źródła kodu {{ c.code }}" loading="lazy" style="display:block;max-width:100%;max-height:360px;object-fit:contain;margin:10px 0">{% endif %}
-{% if c.terms %}<p>{{ c.terms }}</p>{% endif %}{% if c.excludes_promos %}<p class="note">Nie łączy się z innymi promocjami.</p>{% endif %}<div class="note">{% if c.valid_until %}ważny do {{ c.valid_until|dt('%d.%m.%Y') }}{% else %}brak podanej daty końca{% endif %}{% if c.source %} · <a href="{{ c.source }}" target="_blank" rel="noopener noreferrer" style="text-decoration:underline">źródło</a>{% endif %}</div></div>
+<div class="note">Zakres: {{ c.category or 'wszystkie produkty' }}</div>{% if c.terms %}<p>{{ c.terms }}</p>{% endif %}{% if c.excludes_promos %}<p class="note">Nie łączy się z innymi promocjami.</p>{% endif %}<div class="note">{% if c.valid_until %}ważny do {{ c.valid_until|dt('%d.%m.%Y') }}{% else %}brak podanej daty końca{% endif %}{% if c.source %} · <a href="{{ c.source }}" target="_blank" rel="noopener noreferrer" style="text-decoration:underline">źródło</a>{% endif %}</div></div>
 {% else %}<div class="card">Nie ma teraz aktywnych kodów rabatowych.</div>{% endfor %}{% endblock %}""",
 
     "basket_results.html": """<div id="basket-results">{% if plan %}<div class="stats"><div class="stat"><span class="note">Najtańszy miks sklepów</span><b>{{ plan.mix_total|pln }}</b><span class="note">{% if plan.mix_missing %}brak ofert dla {{ plan.mix_missing }} pozycji{% else %}wszystkie pozycje dostępne{% endif %}</span></div>
 <div class="stat"><span class="note">Najtaniej w jednym sklepie</span><b>{{ plan.best_store.total|pln if plan.best_store else 'brak pełnej oferty' }}</b><span class="note">{{ plan.best_store.site if plan.best_store else 'żaden sklep nie ma wszystkich dostępnych pozycji' }}</span></div></div>
 {% if plan.most_products_store %}<div class="card"><div class="top"><strong>Najwięcej pozycji ma {{ plan.most_products_store.site }}</strong><span class="best">{{ plan.most_products_store.count }} z {{ plan.lines|length }} produktów</span><span class="price">{{ plan.most_products_store.total|pln }}</span></div>
-{% for product in plan.most_products_store.products %}<div class="row"><a class="name" href="{{ product.url }}" target="_blank" rel="noopener noreferrer">{{ product.name }}</a><span class="price">{{ product.price|pln }}</span><span class="note">{{ 'dostępny' if product.availability=='in_stock' else 'niedostępny' }}</span></div>{% endfor %}</div>{% endif %}
-{% if plan.price_mode=='historical' %}<p class="note">Ceny historyczne nie oznaczają dostępności produktu w tej chwili.</p>{% endif %}
+{% for product in plan.most_products_store.products %}<div class="row"><a class="name" href="{{ product.url }}" target="_blank" rel="noopener noreferrer">{{ product.name }}</a>{% if product.coupon %}<span class="code">{{ product.coupon.code }}</span><span class="old">{{ product.base_price|pln }}</span>{% endif %}<span class="price">{{ product.price|pln }}</span><span class="note">{{ 'dostępny' if product.availability=='in_stock' else 'niedostępny' }}</span></div>{% endfor %}</div>{% endif %}
+{% if plan.price_mode=='historical' %}<p class="note">Ceny historyczne nie oznaczają dostępności produktu w tej chwili. Kody rabatowe stosujemy tylko do cen aktualnych.</p>{% else %}<p class="note">Koszyk automatycznie wybiera najlepszy zapisany kod dla sklepu, kategorii i wykrytej promocji. Progi zamówienia oraz pozostałe warunki kuponu sprawdź przed zakupem.</p>{% endif %}
 {% if selected_site %}<div class="card"><b>{{ selected_site }}:</b> {% if plan.selected_total and not plan.selected_total.missing %}{{ plan.selected_total.total|pln }} · pełny koszyk{% elif plan.selected_total %}brak ofert dla {{ plan.selected_total.missing }} pozycji{% else %}brak danych{% endif %}</div>{% endif %}
-{% for line in plan.lines %}<div class="card"><div class="top"><strong>{{ line.name }}</strong>{% if line.code %}<span class="code">{{ line.code }}</span>{% endif %}<button type="button" class="sec sm" data-cart-remove data-url="{{ line.url }}">Usuń</button></div>
+{% for group in plan.category_groups %}<h2>{{ group.category }} <span class="note">{{ group.lines|length }}</span></h2>{% for line in group.lines %}<div class="card"><div class="top"><strong>{{ line.name }}</strong>{% if line.code %}<span class="code">{{ line.code }}</span>{% endif %}<button type="button" class="sec sm" data-cart-remove data-url="{{ line.url }}">Usuń</button></div>
 {% if line.error %}<p class="note">{{ line.error }}</p>{% endif %}
-{% for offer in line.offers %}<div class="row"><span>{{ offer.site }} · {{ 'dostępny' if offer.avail=='in_stock' else 'niedostępny' }}</span><span class="price">{{ offer.basket_price|pln }}</span>{% if offer.url==line.cheapest.url %}<span class="best">najkorzystniej</span>{% endif %}<a class="mini" href="{{ offer.url }}" target="_blank" rel="noopener noreferrer">Otwórz ofertę</a></div>{% else %}<p class="note">Brak pasujących ofert z ceną w wybranym trybie.</p>{% endfor %}</div>{% endfor %}
-<details><summary>Produkty i sumy według sklepu</summary>{% for total in plan.shop_totals %}<section><div class="row"><strong>{{ total.site }} · {{ total.count }}/{{ plan.lines|length }} produktów</strong><span>{% if total.missing %}brak {{ total.missing }} · suma częściowa {{ total.total|pln }}{% else %}pełny koszyk · {{ total.total|pln }}{% endif %}</span></div>{% for product in total.products %}<div class="row"><a class="mini" href="{{ product.url }}" target="_blank" rel="noopener noreferrer">{{ product.name }}</a><span>{{ product.price|pln }}</span></div>{% endfor %}</section>{% else %}<p class="note">Brak sklepów z ofertami.</p>{% endfor %}</details>{% else %}<div class="card">Koszyk jest pusty. Dodaj produkty z listy produktów.</div>{% endif %}</div>""",
+{% for offer in line.offers %}<div class="row"><span>{{ offer.site }} · {{ 'dostępny' if offer.avail=='in_stock' else 'niedostępny' }}{% if offer.promo %} · <span class="badge r">promocja</span>{% endif %}</span>{% if offer.coupon %}<span class="old">{{ offer.base_price|pln }}</span><span class="code">{{ offer.coupon.code }}</span>{% endif %}<span class="price">{{ offer.basket_price|pln }}</span>{% if offer.url==line.cheapest.url %}<span class="best">najkorzystniej</span>{% endif %}<a class="mini" href="{{ offer.url }}" target="_blank" rel="noopener noreferrer">Otwórz ofertę</a></div>{% else %}<p class="note">Brak pasujących ofert z ceną w wybranym trybie.</p>{% endfor %}</div>{% endfor %}{% endfor %}
+<details><summary>Produkty i sumy według sklepu</summary>{% for total in plan.shop_totals %}<section><div class="row"><strong>{{ total.site }} · {{ total.count }}/{{ plan.lines|length }} produktów</strong><span>{% if total.missing %}brak {{ total.missing }} · suma częściowa {{ total.total|pln }}{% else %}pełny koszyk · {{ total.total|pln }}{% endif %}</span></div>{% for product in total.products %}<div class="row"><a class="mini" href="{{ product.url }}" target="_blank" rel="noopener noreferrer">{{ product.name }}</a>{% if product.promo %}<span class="badge r">promocja</span>{% endif %}{% if product.coupon %}<span class="code">{{ product.coupon.code }}</span><span class="old">{{ product.base_price|pln }}</span>{% endif %}<span>{{ product.price|pln }}</span></div>{% endfor %}</section>{% else %}<p class="note">Brak sklepów z ofertami.</p>{% endfor %}</details>{% else %}<div class="card">Koszyk jest pusty. Dodaj produkty z listy produktów.</div>{% endif %}</div>""",
 
     "deals.html": """{% extends 'base.html' %}
 {% block body %}<h1>Okazje</h1><p class="note">Porównanie dostępnych ofert między sklepami. Procent pokazuje oszczędność względem najwyższej ceny.</p>
@@ -2915,10 +2995,11 @@ document.addEventListener('DOMContentLoaded', () => {
 {% if r.state=='ok' %}<form method="post" action="{{ url_for('invite_revoke') }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="code" value="{{ r.code }}"><input type="hidden" name="back" value="/admin/invites"><button class="sec sm">Wycofaj</button></form>{% endif %}</div>
 {% else %}<div class="card">Brak zaproszeń.</div>{% endfor %}{% endblock %}""",
 
-    "admin_coupons.html": """{% extends 'admin_base.html' %}{% block body %}<h1>Kody rabatowe</h1><p class="note">Dodaj kod ze zdjęcia lub linku. OCR tylko podpowiada tekst — sprawdź kod i warunki przed publikacją.</p>
+    "admin_coupons.html": """{% extends 'admin_base.html' %}{% block body %}<h1>Kody rabatowe</h1><p class="note">Dodaj kod ze zdjęcia lub linku. OCR tylko podpowiada tekst — sprawdź kod i warunki przed publikacją. Kategoria produktu jest rozpoznawana na podstawie nazwy.</p>
 <form method="post" enctype="multipart/form-data" class="f"><input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Sklep<input name="shop" maxlength="80" required></label><label>Kod rabatowy<input name="code" maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,39}" required></label>
 <label style="grid-column:1/3">Rabat / promocja<input name="discount" maxlength="120" placeholder="np. 10% na całe zamówienie" required></label>
+<label style="grid-column:1/3">Obowiązuje na<select name="category"><option value="">Wszystkie produkty</option>{% for category in categories %}<option value="{{ category }}">{{ category }}</option>{% endfor %}</select></label>
 <label style="grid-column:1/3">Warunki<input name="terms" maxlength="500" placeholder="np. od 200 zł, tylko produkty nieprzecenione"></label>
 <label class="chk" style="grid-column:1/3"><input type="checkbox" name="excludes_promos" value="1"> nie łączy się z innymi promocjami</label>
 <label>Ważny do<input type="date" name="valid_until"></label><label>Link do źródła<input type="url" name="source" maxlength="500" placeholder="https://..."></label>
@@ -2927,6 +3008,7 @@ document.addEventListener('DOMContentLoaded', () => {
 <label style="display:block;margin-top:8px">Tekst odczytany ze zdjęcia<textarea rows="4" readonly data-coupon-ocr-text></textarea></label></div>
 <button style="grid-column:1/3">Dodaj kod</button></form>
 {% for c in rows %}<div class="card{{ ' dim' if not c.active or c.expired }}"><div class="top"><span class="shop">{{ c.shop }}</span><span class="code">{{ c.code }}</span><span class="best">{{ c.discount }}</span><span class="badge {{ 'a' if c.active and not c.expired else 'r' }}">{{ 'aktywny' if c.active and not c.expired else 'wycofany' if not c.active else 'wygasł' }}</span></div>
+<div class="note">{{ c.category or 'Wszystkie produkty' }}</div>
 {% if c.image %}<img src="{{ url_for('coupon_image', coupon_id=c.id) }}" alt="Zdjęcie kodu {{ c.code }}" loading="lazy" style="display:block;max-width:100%;max-height:240px;object-fit:contain;margin:10px 0">{% endif %}
 {% if c.terms %}<p>{{ c.terms }}</p>{% endif %}{% if c.excludes_promos %}<p class="note">Nie łączy się z innymi promocjami.</p>{% endif %}<div class="note">{% if c.valid_until %}ważny do {{ c.valid_until|dt('%d.%m.%Y') }}{% else %}bez daty końca{% endif %}{% if c.source %} · <a href="{{ c.source }}" target="_blank" rel="noopener noreferrer">źródło</a>{% endif %}</div>
 {% if c.active %}<form method="post" action="{{ url_for('admin_coupon_deactivate', coupon_id=c.id) }}" class="qa"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="sec sm">Wycofaj kupon</button></form>{% endif %}</div>
@@ -2994,6 +3076,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 app.jinja_env.loader = DictLoader(TEMPLATES)
 app.jinja_env.globals["css"] = CSS
+app.jinja_env.globals["product_categories"] = _product_categories
 
 
 if __name__ == "__main__":

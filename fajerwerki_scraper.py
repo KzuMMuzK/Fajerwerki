@@ -209,15 +209,14 @@ SITES = {
             "out_of_stock": "button.add-to-cart.tvproduct-out-of-stock, button.add-to-cart.disable, button.add-to-cart[disabled]"},
     },
     "piroman": {
-        # PrestaShop niestandardowy: item z .ajax_block_product, name z div.product-meta
         "base": "https://piroman.pl",
         "listing": {"next": "{url}?page={page}", "start": 1,
-            "item": "div.ajax_block_product.col-sp-12.col-xs-6",
-            "name": ["div.product-meta a[href]", "div.product-meta > a"],
-            "link": ["a.thumbnail.product-thumbnail@href", "a.product-thumbnail@href"],
-            "price": ["div.p-price", ".p-price"],
-            "out_of_stock": "button.add-to-cart.disabled, li.available_date",
-            "out_text": ["powiadom", "niedostępny", "brak w magazynie"],
+            "item": "div.item-product",
+            "name": ["h3 a.product_name", "h3 a"],
+            "link": ["a.thumbnail.product-thumbnail@href", "h3 a@href"],
+            "price": ["span.price"],
+            "out_of_stock": "ul.product-flag li.out_of_stock, .availability-list.out-of-stock",
+            "out_text": ["niedostępny", "obecnie brak na stanie", "powiadom"],
             "categories": [
                 "https://piroman.pl/10-strefa-kibica",
                 "https://piroman.pl/12-nowosci",
@@ -237,6 +236,7 @@ SITES = {
                 "https://piroman.pl/24-odstraszanie-zwierzyny",
                 "https://piroman.pl/21-odstraszacze-w-plynie",
                 "https://piroman.pl/11-sznury-hukowe",
+                "https://piroman.pl/23-fajerwerki",
             ]},
     },
     "hurtowniaas": {
